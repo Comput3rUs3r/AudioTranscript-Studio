@@ -1,8 +1,50 @@
-# files
+# Private config / secrets
 conf.yaml
+.env
 
-# folders
-personal/
+# Virtual environments
 venv/
 .venv/
+.venv*/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# User files and generated output
+data/input/*
+data/output/*
+data/wav_files/*
 output/
+wav_files/
+
+# Keep empty data folders
+!data/input/.gitkeep
+!data/output/.gitkeep
+!data/wav_files/.gitkeep
+
+# Local/generated helper files
+project_tree.txt
+clean_project_tree.txt
+directory_structure.txt
+structure.txt
+
+# Local backups
+*.bak
+*.bak*
+*.12032025
+.backup.py
+
+# Editor settings
+.vscode/
+
+# Local helper files
+make_project_tree.bat
+project_tree.txt
+requirements.before.txt
+requirements-working-lock.txt
+# Large FFmpeg binaries
+ffmpeg.exe
+ffplay.exe
+ffprobe.exe

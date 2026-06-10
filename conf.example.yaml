@@ -1,0 +1,24 @@
+language: en
+model: large-v3
+diarize: true
+
+slice_audio: true
+slice_video: false
+fast_cut_video: false
+
+video_player_path: ''
+parallel_workers: 4
+
+merge_all_segments_into_one_folder: false
+txt_speaker_tags: true
+one_folder: false
+
+output_format: both
+srt: true
+txt: true
+
+compute_type: float16
+tf32: 'on'
+padding_seconds: 0.0
+
+hf_token: "YOUR_HUGGING_FACE_TOKEN_HERE"
