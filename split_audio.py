@@ -260,11 +260,23 @@ def transcribe_whisperx(model, audio_path: Path, device: str, cfg: Conf) -> Dict
             print(">>Performing diarization...")
             try:
                 from whisperx.diarize import DiarizationPipeline  # type: ignore
-                diarize_model = DiarizationPipeline(use_auth_token=hf_token, device=device)
+                try:
+                    diarize_model = DiarizationPipeline(token=hf_token, device=device)
+                except TypeError:
+                    diarize_model = DiarizationPipeline(use_auth_token=hf_token, device=device)
                 diarize_segments = diarize_model(str(audio_path))
             except Exception:
                 from pyannote.audio import Pipeline  # type: ignore
-                diarize_model = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=hf_token)
+                try:
+                    diarize_model = Pipeline.from_pretrained(
+                        "pyannote/speaker-diarization-3.1",
+                        token=hf_token
+                    )
+                except TypeError:
+                    diarize_model = Pipeline.from_pretrained(
+                        "pyannote/speaker-diarization-3.1",
+                        use_auth_token=hf_token
+                    )
                 try:
                     diarize_model.to(device)
                 except Exception:
