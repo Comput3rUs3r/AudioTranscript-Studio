@@ -1413,7 +1413,7 @@ class App(ttk.Frame):
         self.txt.see("end")
 
     def _update_title_with_conf_path(self):
-        self.master.title(f"Audio Splitter — GPU Control Panel {APP_VER} (build {app_build_id()}) | conf: {conf_path()}")
+        self.master.title(f"AudioTranscript Studio - GPU Control Panel {APP_VER} (build {app_build_id()}) | conf: {conf_path()}")
         self.lbl_conf.configure(text=str(conf_path()))
 
     def _load_conf_to_ui(self):
@@ -1657,7 +1657,7 @@ class App(ttk.Frame):
             self.log(line)
         self.log("-------------")
         win = tk.Toplevel(self.master)
-        win.title("About — Audio Splitter")
+        win.title("About - AudioTranscript Studio")
         win.geometry("820x460")
         frm = ttk.Frame(win, padding=8)
         frm.pack(fill="both", expand=True)
@@ -1707,7 +1707,7 @@ def main():
         pass
     app = App(root)
     root.geometry("1140x620")
-    root.title(f"Audio Splitter — GPU Control Panel {APP_VER} (build {app_build_id()}) | conf: {conf_path()}")
+    root.title(f"AudioTranscript Studio - GPU Control Panel {APP_VER} (build {app_build_id()}) | conf: {conf_path()}")
     root.mainloop()
 
 if __name__ == "__main__":
