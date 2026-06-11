@@ -3,7 +3,7 @@ cd /d "%~dp0"
 
 if not exist "venv\Scripts\activate.bat" (
     echo Virtual environment not found.
-    echo Please run setup-cuda.bat or setup-cpu.bat first.
+    echo Please run install-cuda.bat first.
     echo.
     pause
     exit /b
