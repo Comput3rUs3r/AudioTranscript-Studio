@@ -26,6 +26,22 @@ AudioTranscript Studio can:
 
 ---
 
+---
+
+## Screenshots
+
+### Main GUI and System Check
+
+![Main GUI and About window](docs/images/main-gui-about.png)
+
+### Speaker Naming
+
+![Speaker naming window](docs/images/name-speakers.png)
+
+### Open Video at Subtitle Hit
+
+![SRT matches window](docs/images/srt-matches.png)
+
 ## Privacy Note
 
 AudioTranscript Studio runs the transcription workflow locally on your computer.
