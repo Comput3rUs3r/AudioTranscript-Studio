@@ -1,9 +1,11 @@
---find-links https://download.pytorch.org/whl/torch_stable.html
-git+https://github.com/m-bain/whisperx.git
+--extra-index-url https://download.pytorch.org/whl/cu128
 
-#torch==2.0.0+cu118
-#torchvision==0.15.1+cu118
-#torchaudio==2.0.1
+torch==2.8.0+cu128
+torchvision==0.23.0+cu128
+torchaudio==2.8.0+cu128
+
+git+https://github.com/m-bain/whisperx.git@5f2f9d4320dd93a7d12f5ba2495eef7e0a5af963
+
 pysrt
 pydub
 pyyaml
