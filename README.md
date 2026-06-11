@@ -1,180 +1,263 @@
 # AudioTranscript Studio
 
-AudioTranscript Studio is a Windows GUI tool for WhisperX transcription, speaker diarization, speaker naming, subtitle export, and audio segment extraction.
+AudioTranscript Studio is a Windows GUI app for local audio/video transcription, speaker diarization, speaker naming, subtitle export, and audio segment extraction.
 
-It is designed for users who want to turn audio or video files into organized transcripts, subtitles, speaker-labeled text, and separated audio clips.
+It uses WhisperX, PyTorch CUDA, pyannote, FFmpeg, and a local NVIDIA GPU when available.
 
-This project began as a fork of `JarodMica/audiosplitter_whisper` and has been expanded with a larger GUI workflow, Hugging Face token handling, speaker naming tools, subtitle export options, and improved setup utilities.
-
----
-
-## Features
-
-* GUI control panel for running the transcription pipeline
-* WhisperX transcription
-* Speaker diarization with Hugging Face / pyannote
-* Speaker naming after transcription
-* SRT subtitle export
-* TXT transcript export
-* Audio segment extraction by speaker
-* Optional video segment cutting
-* Word-level export options
-* Hugging Face environment check tool
-* CUDA and CPU setup scripts
-* Local configuration through `conf.yaml`
+This project began as a fork of `JarodMica/audiosplitter_whisper` and has been expanded with a larger GUI workflow, Hugging Face token handling, speaker naming tools, subtitle export options, word-level exports, and easier setup utilities.
 
 ---
 
-## Current Status
+## What It Does
 
-This project is currently in early public-release preparation.
+AudioTranscript Studio can:
 
-The program works on the developer's Windows/NVIDIA setup, but installation instructions and compatibility testing are still being improved.
+* Transcribe audio and video files
+* Create speaker-labeled transcripts
+* Create SRT subtitle files
+* Create TXT transcript files
+* Run speaker diarization
+* Rename speakers after processing
+* Export speaker audio clips
+* Optionally cut video/audio segments
+* Export word-level subtitle formats
+* Open video at transcript/SRT matches
+* Run locally on your own PC
 
-Tested working environment:
+---
+
+## Privacy Note
+
+AudioTranscript Studio runs the transcription workflow locally on your computer.
+
+Your audio/video is not sent to a paid cloud transcription API by this app.
+
+The app may contact the internet to download models from Hugging Face the first time you use them. A Hugging Face token may be required for speaker diarization models.
+
+---
+
+## Recommended System
+
+Recommended:
+
+* Windows 10 or Windows 11
+* NVIDIA GPU
+* Updated NVIDIA driver
+* Python 3.11
+* FFmpeg
+* Hugging Face account and access token for diarization
+
+Tested new-stack environment:
 
 ```text
 Windows 11
-Python 3.11
+Python 3.11.2
 NVIDIA RTX GPU
-PyTorch 2.5.1+cu124
-WhisperX 3.4.2
-pyannote.audio 3.3.2
-ctranslate2 4.4.0
+PyTorch 2.8.0+cu128
+WhisperX 3.8.6
+pyannote.audio 4.0.4
+ctranslate2 4.8.0
+FFmpeg installed
 ```
 
 CPU mode may work, but it will be much slower and is not the main target.
 
 ---
 
-## Requirements
+## Beginner Install, CUDA/NVIDIA
 
-Recommended:
+This is the recommended install method.
 
-* Windows 10 or Windows 11
-* Python 3.11
-* NVIDIA GPU with CUDA support
-* FFmpeg
-* Git
-* Hugging Face account
-* Hugging Face access token
-* Accepted pyannote model terms on Hugging Face
+### Step 1: Install Python 3.11
 
-Optional but recommended:
+Install Python 3.11 for Windows.
 
-* Visual Studio Code
-
----
-
-## Important Hugging Face Notice
-
-Speaker diarization requires access to Hugging Face models.
-
-You need your own Hugging Face token. Do **not** use someone else's token, and do **not** upload your token to GitHub.
-
-Before running diarization, you must:
-
-1. Create a Hugging Face account.
-2. Accept the model terms for `pyannote/speaker-diarization-3.1`.
-3. Accept the model terms for `pyannote/segmentation-3.0`.
-4. Create a Hugging Face access token.
-5. Add that token to your local `conf.yaml` file.
-
-Your private `conf.yaml` file should never be uploaded to GitHub.
-
----
-
-## Installation
-
-Clone the repository:
-
-```powershell
-git clone https://github.com/Comput3rUs3r/AudioTranscript-Studio.git
-cd AudioTranscript-Studio
-```
-
-Create or install the environment.
-
-For NVIDIA CUDA users:
-
-```powershell
-python setup-cuda.py
-```
-
-For CPU users:
-
-```powershell
-python setup-cpu.py
-```
-
-Activate the virtual environment:
-
-```powershell
-venv\Scripts\activate
-```
-
-Install requirements manually if needed:
-
-```powershell
-pip install -r requirements-cuda.txt
-```
-
-or:
-
-```powershell
-pip install -r requirements-cpu.txt
-```
-
----
-
-## Configuration
-
-The repo includes:
+During installation, check:
 
 ```text
-conf.example.yaml
+Add python.exe to PATH
 ```
 
-Copy it and rename the copy to:
+After installing Python, close and reopen your terminal or File Explorer windows if needed.
+
+### Step 2: Install FFmpeg
+
+FFmpeg is required for audio/video conversion.
+
+If you use Windows Package Manager, you can install it with:
+
+```powershell
+winget install Gyan.FFmpeg
+```
+
+After installing FFmpeg, close and reopen your terminal or restart Windows if the app still cannot find `ffmpeg`.
+
+### Step 3: Download AudioTranscript Studio
+
+On GitHub, click:
+
+```text
+Code -> Download ZIP
+```
+
+Extract the ZIP somewhere simple, such as:
+
+```text
+Desktop
+Documents
+```
+
+Avoid deeply nested folders or protected system folders.
+
+### Step 4: Run the installer
+
+Open the extracted project folder and double-click:
+
+```text
+install-cuda.bat
+```
+
+The installer will:
+
+* Create a local `venv`
+* Install CUDA PyTorch
+* Install WhisperX and dependencies
+* Create required data folders
+* Create `conf.yaml` if missing
+* Check CUDA
+* Check package versions
+* Check FFmpeg
+
+The first install can take a while because it downloads large packages.
+
+### Step 5: Add your Hugging Face token
+
+Open:
 
 ```text
 conf.yaml
 ```
 
-Then open `conf.yaml` and add your Hugging Face token:
+Find the Hugging Face token line and add your token.
+
+Example:
 
 ```yaml
 hf_token: "YOUR_HUGGING_FACE_TOKEN_HERE"
 ```
 
-Do not upload `conf.yaml` to GitHub.
+Do not share your token.
+
+Do not upload your `conf.yaml` to GitHub.
+
+### Step 6: Run the app
+
+Double-click:
+
+```text
+run-gui.bat
+```
+
+The GUI should open.
+
+Click:
+
+```text
+About
+```
+
+You want to see something like:
+
+```text
+CUDA available: True
+GPU: your NVIDIA GPU
+```
 
 ---
 
-## Folder Structure
+## Hugging Face Token and Diarization
 
-Expected working folders:
+Speaker diarization may require a Hugging Face account and token.
+
+You may also need to accept model terms on Hugging Face before diarization works.
+
+General steps:
+
+1. Create a Hugging Face account.
+2. Create an access token.
+3. Accept any pyannote model terms required by Hugging Face.
+4. Put your token in `conf.yaml`.
+5. Use the app's `Check HF token` button.
+
+If diarization fails, check:
+
+* Your token is correct
+* The token is saved in `conf.yaml`
+* You accepted the required model terms
+* You have internet access the first time models are downloaded
+
+---
+
+## Basic Workflow
+
+1. Open the app with `run-gui.bat`.
+2. Click `Select Files`.
+3. Choose an audio or video file.
+4. Choose a model.
+
+Recommended fast model:
 
 ```text
-data/
-├── input/
-├── output/
-└── wav_files/
+large-v3-turbo
 ```
 
-Put your audio or video files in:
+5. Choose settings such as diarization, output format, TF32, and workers.
+6. Click `Run`.
+7. After processing, click `Open output folder`.
+8. Click `Name speakers` if you want to replace labels like `SPEAKER_00` with real names.
+9. Click `Apply` to update transcripts/subtitles with speaker names.
+
+---
+
+## Speaker Naming
+
+After processing, the app can open a speaker naming window.
+
+You can:
+
+* Type speaker names manually
+* Pick names from a candidate name pool
+* Assign a candidate name to a selected speaker
+* Clear a speaker name
+* Search speaker tags in the transcript
+* Open the video at matching subtitle hits
+* Rewrite SRT/TXT files with the chosen names
+
+The candidate name pool is only a helper. The app cannot always know who is speaking, especially when the transcript mentions historical figures, authors, or topic names.
+
+---
+
+## Output Files
+
+For each processed file, the app may create files such as:
 
 ```text
-data/input/
+segments.json
+speakers.json
+.srt subtitle file
+.txt transcript file
+speaker folders
+audio clips
+word-level subtitle exports
 ```
 
-Generated files will be saved in:
+Most output is saved under:
 
 ```text
 data/output/
 ```
 
-Temporary converted WAV files may be stored in:
+Converted WAV files may be saved under:
 
 ```text
 data/wav_files/
@@ -182,130 +265,84 @@ data/wav_files/
 
 ---
 
-## Running the GUI
+## Folder Structure
 
-After activating the virtual environment, run:
-
-```powershell
-python split_audio_gui.py
-```
-
-The GUI allows you to:
-
-* Choose a WhisperX model
-* Select language
-* Enable or disable diarization
-* Select output type
-* Choose compute type
-* Set TF32 behavior
-* Select files manually
-* Open the output folder
-* Name speakers after processing
-
----
-
-## Basic Workflow
-
-1. Place an audio or video file in `data/input`, or use the GUI's file selection button.
-2. Start the GUI:
-
-```powershell
-python split_audio_gui.py
-```
-
-3. Choose your model and settings.
-4. Click `Run`.
-5. Wait for transcription, alignment, and diarization.
-6. Open the output folder.
-7. Use `Name speakers` to replace speaker labels like `SPEAKER_00` with real names.
-8. Export or use the generated `.srt`, `.txt`, `.json`, and audio segment files.
-
----
-
-## Output Files
-
-For each processed file, AudioTranscript Studio may create:
+Expected folders:
 
 ```text
-segments.json
-speakers.json
-names.yaml
-transcript.txt
-subtitles.srt
-speaker folders
-audio clips
+data/
+  input/
+  output/
+  wav_files/
 ```
 
-The exact output depends on the settings you choose.
-
----
-
-## Notes About SRT and Styled Subtitles
-
-SRT subtitles are plain and widely supported.
-
-Future versions may include improved ASS subtitle export for styled subtitles, including colored speaker names.
+You can use `Select Files` in the GUI instead of copying files into `data/input`.
 
 ---
 
 ## Troubleshooting
 
-### The program says no files were found
-
-Make sure your audio or video file is inside:
-
-```text
-data/input/
-```
-
-or select the file manually through the GUI.
-
----
-
-### Diarization does not work
+### The GUI says CUDA is not available
 
 Check that:
 
-* Your Hugging Face token is valid.
-* Your token is saved in `conf.yaml`.
-* You accepted the pyannote model terms.
-* You have internet access the first time models are downloaded.
+* You have an NVIDIA GPU
+* Your NVIDIA driver is installed and updated
+* You ran `install-cuda.bat`
+* The app is using the project `venv`
 
----
-
-### CUDA or cuDNN errors
-
-Make sure:
-
-* You are using the correct virtual environment.
-* PyTorch CUDA is installed correctly.
-* Your NVIDIA drivers are installed.
-* You are running from the activated `venv`.
-
-Activate the environment:
+You can test CUDA with:
 
 ```powershell
-venv\Scripts\activate
+.\venv\Scripts\python.exe -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.version.cuda); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'no cuda')"
 ```
 
-Then run:
+Expected result:
+
+```text
+CUDA available: True
+```
+
+### FFmpeg is missing
+
+Install FFmpeg:
 
 ```powershell
-python split_audio_gui.py
+winget install Gyan.FFmpeg
 ```
 
----
+Then restart your terminal or restart Windows.
 
-### VS Code Play button does not work correctly
+### Python was not found
 
-The safest way to run the project is from an activated terminal:
+Install Python 3.11 and make sure `Add python.exe to PATH` is checked.
 
-```powershell
-venv\Scripts\activate
-python split_audio_gui.py
+If Windows opens the Microsoft Store instead, disable Python App Execution Aliases in Windows settings or install Python from the official Python installer.
+
+### Diarization does not work
+
+Check:
+
+* Hugging Face token is saved in `conf.yaml`
+* Token is valid
+* Required model terms are accepted
+* Internet is available for first model download
+
+### Smart App Control blocks Python files
+
+Some Windows systems may block Python `.pyd` files inside the virtual environment.
+
+If you see an error such as:
+
+```text
+An Application Control policy has blocked this file
 ```
 
-A dedicated launcher script may be added in a future version.
+check Windows Smart App Control / security settings. This is a Windows security policy issue, not a transcription model issue.
+
+### The installer takes a long time
+
+This is normal on the first install. CUDA PyTorch and model dependencies are large.
 
 ---
 
@@ -316,31 +353,64 @@ Do not upload:
 ```text
 conf.yaml
 venv/
+venv_old_working/
 __pycache__/
 data/input/*
 data/output/*
 data/wav_files/*
 *.bak
-old local backup files
+private backup folders
 ```
 
-The repo should include `conf.example.yaml`, not your private `conf.yaml`.
+The repo should include:
+
+```text
+conf.example.yaml
+```
+
+but not your private:
+
+```text
+conf.yaml
+```
+
+---
+
+## Developer Notes
+
+Useful commands:
+
+```powershell
+python -m py_compile .\split_audio_gui.py
+python -m py_compile .\setup-cuda.py
+git status
+```
+
+Run the GUI directly:
+
+```powershell
+.\venv\Scripts\python.exe split_audio_gui.py
+```
 
 ---
 
 ## Credits
 
-AudioTranscript Studio began as a fork of JarodMica/audiosplitter_whisper.
+AudioTranscript Studio began as a fork of `JarodMica/audiosplitter_whisper`.
 
 Original project copyright:
+
+```text
 Copyright (c) 2023 Jarod Mica
+```
 
 Modifications copyright:
+
+```text
 Copyright (c) 2026 Comput3rUs3r
+```
 
 This project is licensed under the MIT License.
-
-This version has been expanded with a larger GUI workflow, Hugging Face token handling, speaker naming tools, SRT/TXT output, word-level export options, and improved setup utilities.
 
 ---
 
