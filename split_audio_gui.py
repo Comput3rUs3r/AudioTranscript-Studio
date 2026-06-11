@@ -443,7 +443,7 @@ _DEFAULTS = {
     "output_format": "both","srt": True,"txt": True,"compute_type": "float16","tf32": "on",
     "padding_seconds": 0.25,"hf_token": "",
 }
-_MODEL_CHOICES = ["distil-large-v3","large-v3","medium","small"]
+_MODEL_CHOICES = ["tiny","base","small","medium","large-v2","large-v3","large-v3-turbo","distil-large-v3"]
 _COMPUTE_CHOICES = ["float16","float32"]
 _TF32_CHOICES = ["on","off"]
 
@@ -468,18 +468,153 @@ def _chunk_text(txt: str, max_chars: int = 1200) -> list[str]:
     if not txt: return []
     return [txt[i:i+max_chars] for i in range(0, len(txt), max_chars)]
 
+_NAME_REJECT_WORDS = {
+    "a", "an", "and", "are", "as", "at", "but", "by", "for", "from", "in", "into",
+    "is", "it", "its", "of", "on", "or", "so", "that", "the", "this", "to", "we",
+    "you", "your", "okay", "ok", "right", "all", "well", "yes", "no", "there",
+    "here", "oops", "um", "uh",
+
+    # common project/topic words that are not speaker names
+    "k", "means", "kmeans", "k-means", "algorithm", "cluster", "clusters",
+    "centroid", "centroids", "data", "dataset", "set", "patch", "patches",
+    "scrap", "scraps", "image", "images", "pixel", "pixels", "face", "faces",
+    "olivetti", "figure", "cell", "code", "library", "libraries", "matplotlib",
+    "visual", "dictionary", "presentation", "slide", "slides", "model",
+}
+
+_NAME_REJECT_PHRASES = {
+    "and okay", "okay so", "patches so", "all right", "and then", "okay yes",
+    "thank you", "you stopped", "where is", "there we", "here we",
+}
+
+_DIRECT_ADDRESS_RE = re.compile(
+    r"\b(?:thank you|thanks|okay|ok|alright|all right|your turn|go ahead|welcome)\s*,?\s+"
+    r"([A-Z][a-z]{1,24}(?:\s+[A-Z][a-z]{1,24})?)\b"
+)
+
+_SELF_INTRO_RE = re.compile(
+    r"\b(?:i am|i'm|my name is|this is)\s+"
+    r"([A-Z][a-z]{1,24}(?:\s+[A-Z][a-z]{1,24})?)\b",
+    re.IGNORECASE
+)
+
+def _clean_name_candidate(name: str) -> str:
+    name = str(name or "")
+    name = name.replace(" ##", "").replace("##", "")
+    name = re.sub(r"\bSPEAKER_\d+\b", "", name)
+    name = re.sub(r"^[^A-Za-z]+|[^A-Za-z]+$", "", name.strip())
+    name = re.sub(r"\s+", " ", name)
+    return name.strip()
+
+def _is_likely_person_name(name: str) -> bool:
+    name = _clean_name_candidate(name)
+    if not name:
+        return False
+    if len(name) < 3 or len(name) > 40:
+        return False
+    if any(ch.isdigit() for ch in name):
+        return False
+
+    low = name.lower().strip()
+    if low in _NAME_REJECT_PHRASES:
+        return False
+    for bad in _NAME_REJECT_PHRASES:
+        if bad in low:
+            return False
+
+    parts = name.split()
+    if len(parts) > 3:
+        return False
+
+    lows = [p.lower().strip(".,:;!?()[]{}") for p in parts]
+    if any(w in _NAME_REJECT_WORDS for w in lows):
+        return False
+
+    # Avoid random sentence fragments like "And Okay"
+    if lows[0] in {"and", "okay", "ok", "so", "the", "this", "that", "all", "well"}:
+        return False
+
+    # Keep normal names title-cased. This accepts "Olivia" and "John Smith".
+    for part in parts:
+        if not re.fullmatch(r"[A-Z][a-z]+", part):
+            return False
+
+    return True
+
+def _filtered_name_list(items, limit: int = 50) -> list[str]:
+    out = []
+    seen = set()
+    for item in items:
+        nm = _clean_name_candidate(item)
+        if not _is_likely_person_name(nm):
+            continue
+        low = nm.lower()
+        if low in seen:
+            continue
+        seen.add(low)
+        out.append(nm)
+        if len(out) >= limit:
+            break
+    return out
+
+def _extract_direct_address_names(text: str, limit: int = 20) -> list[str]:
+    names = []
+    for m in _DIRECT_ADDRESS_RE.finditer(text or ""):
+        names.append(m.group(1))
+    return _filtered_name_list(names, limit=limit)
+
+def _extract_self_intro_names(text: str, limit: int = 20) -> list[str]:
+    names = []
+    for m in _SELF_INTRO_RE.finditer(text or ""):
+        names.append(m.group(1))
+    return _filtered_name_list(names, limit=limit)
+
+def _addressed_name_counts_for_speakers(segments) -> dict:
+    """
+    If SPEAKER_01 says 'Thank you, Olivia' right after SPEAKER_00 was talking,
+    Olivia is probably SPEAKER_00, not SPEAKER_01.
+    """
+    counts = {}
+    prev_spk = None
+
+    for seg in segments or []:
+        spk = seg.get("speaker")
+        text = str(seg.get("text", ""))
+
+        # Self-introductions belong to the current speaker.
+        if spk:
+            for nm in _extract_self_intro_names(text):
+                counts.setdefault(spk, Counter())[nm] += 12
+
+        # Direct-address names usually refer to the previous different speaker.
+        names = _extract_direct_address_names(text)
+        if names and prev_spk and spk and prev_spk != spk:
+            for nm in names:
+                counts.setdefault(prev_spk, Counter())[nm] += 15
+
+        if spk:
+            prev_spk = spk
+
+    return counts
+
 def _extract_candidates_from_text(text: str, limit: int|None=None):
-    if not text: return []
+    if not text:
+        return []
+
     engine = _NER_SETTINGS.get("engine","auto")
     topk = int(_NER_SETTINGS.get("topk", 50))
     min_score = float(_NER_SETTINGS.get("min_score", 0.85))
-    if limit is not None: topk = min(topk, int(limit))
+    if limit is not None:
+        topk = min(topk, int(limit))
+
+    direct_names = _extract_direct_address_names(text, limit=topk)
+    self_intro_names = _extract_self_intro_names(text, limit=topk)
 
     def _heuristic(txt: str):
-        import re as _re
-        words = _re.findall(r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+", txt)
-        cnt = Counter(w.strip() for w in words if 2 <= len(w) <= 40)
-        return [w for w,_ in cnt.most_common(topk)]
+        words = re.findall(r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}", txt)
+        cnt = Counter(_clean_name_candidate(w) for w in words)
+        ordered = [w for w, _ in cnt.most_common(topk * 2)]
+        return _filtered_name_list(direct_names + self_intro_names + ordered, limit=topk)
 
     try:
         if engine in ("auto","hf"):
@@ -487,21 +622,34 @@ def _extract_candidates_from_text(text: str, limit: int|None=None):
                 from transformers import pipeline
                 import torch
                 dev = 0 if torch.cuda.is_available() else -1
-                _NER_CACHE["hf"] = pipeline("ner", model="dbmdz/bert-large-cased-finetuned-conll03-english", aggregation_strategy="simple", device=dev)
+                _NER_CACHE["hf"] = pipeline(
+                    "ner",
+                    model="dbmdz/bert-large-cased-finetuned-conll03-english",
+                    aggregation_strategy="simple",
+                    device=dev
+                )
             pipe = _NER_CACHE["hf"]
             chunks = _chunk_text(text, 1200)
-            if not chunks: chunks = [text]
+            if not chunks:
+                chunks = [text]
             results = pipe(chunks) if len(chunks) > 1 else [pipe(chunks[0])]
-            persons = []; seen = set()
+            persons = []
+            seen = set()
             for ents in results:
                 for x in ents:
                     if x.get("entity_group") in ("PER","PERSON") and float(x.get("score",0)) >= min_score:
-                        name = x.get("word","").strip(); low = name.lower()
-                        if name and low not in seen: 
+                        name = _clean_name_candidate(x.get("word",""))
+                        low = name.lower()
+                        if _is_likely_person_name(name) and low not in seen:
                             seen.add(low)
                             persons.append(name)
-                            if len(persons) >= topk: return persons
-            if persons: return persons
+                            if len(persons) >= topk:
+                                break
+                if len(persons) >= topk:
+                    break
+            persons = _filtered_name_list(direct_names + self_intro_names + persons, limit=topk)
+            if persons:
+                return persons
 
         if engine in ("auto","spacy_trf","spacy_md"):
             import spacy as _sp
@@ -509,7 +657,7 @@ def _extract_candidates_from_text(text: str, limit: int|None=None):
                 try:
                     _sp.prefer_gpu()
                     nlp = _NER_CACHE.get("spacy_trf")
-                    if nlp is None: 
+                    if nlp is None:
                         nlp = _sp.load("en_core_web_trf")
                         _NER_CACHE["spacy_trf"] = nlp
                     doc = nlp(text)
@@ -517,17 +665,23 @@ def _extract_candidates_from_text(text: str, limit: int|None=None):
                     seen = set()
                     for e in doc.ents:
                         if e.label_ == "PERSON":
-                            nm = e.text.strip(); low = nm.lower()
-                            if nm and low not in seen: 
+                            nm = _clean_name_candidate(e.text)
+                            low = nm.lower()
+                            if _is_likely_person_name(nm) and low not in seen:
                                 seen.add(low)
                                 out.append(nm)
-                                if len(out) >= topk: break
-                    if out: return out
-                except Exception: pass
+                                if len(out) >= topk:
+                                    break
+                    out = _filtered_name_list(direct_names + self_intro_names + out, limit=topk)
+                    if out:
+                        return out
+                except Exception:
+                    pass
+
             if engine in ("spacy_md","auto"):
                 try:
                     nlp = _NER_CACHE.get("spacy_md")
-                    if nlp is None: 
+                    if nlp is None:
                         nlp = _sp.load("en_core_web_md")
                         _NER_CACHE["spacy_md"] = nlp
                     doc = nlp(text)
@@ -535,26 +689,41 @@ def _extract_candidates_from_text(text: str, limit: int|None=None):
                     seen = set()
                     for e in doc.ents:
                         if e.label_ == "PERSON":
-                            nm = e.text.strip(); low = nm.lower()
-                            if nm and low not in seen: 
+                            nm = _clean_name_candidate(e.text)
+                            low = nm.lower()
+                            if _is_likely_person_name(nm) and low not in seen:
                                 seen.add(low)
                                 out.append(nm)
-                                if len(out) >= topk: break
-                    if out: return out
-                except Exception: pass
-    except Exception: pass
+                                if len(out) >= topk:
+                                    break
+                    out = _filtered_name_list(direct_names + self_intro_names + out, limit=topk)
+                    if out:
+                        return out
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
     return _heuristic(text)[:topk]
 
 def _best_names_list(*counters: Counter, limit: int = 8) -> list:
-    total = Counter() 
-    for c in counters: total.update(c)
-    ordered = [name for name, _ in total.most_common()]
-    seen = set(); out = []
-    for n in ordered:
-        low = n.lower() 
-        if low in seen: continue
-        seen.add(low); out.append(n)
-        if len(out) >= limit: break
+    total = Counter()
+    for c in counters:
+        total.update(c)
+
+    seen = set()
+    out = []
+    for name, _ in total.most_common():
+        nm = _clean_name_candidate(name)
+        if not _is_likely_person_name(nm):
+            continue
+        low = nm.lower()
+        if low in seen:
+            continue
+        seen.add(low)
+        out.append(nm)
+        if len(out) >= limit:
+            break
     return out
 
 def safe_base(name: str) -> str:
@@ -691,11 +860,15 @@ class NamingDialog(tk.Toplevel):
         self.speakers = list(spk_data.get("speakers") or [])
         self.saved_names = dict(spk_data.get("names") or spk_data.get("name_map") or {})
         self.segments = seg_data.get("segments") or []
-        global_counts = _extract_candidates_from_text(" ".join(str(s.get("text","")) for s in self.segments))
-        title_counts  = _extract_candidates_from_text(self.title_name)
+        global_counts = Counter(_extract_candidates_from_text(" ".join(str(s.get("text","")) for s in self.segments)))
+        # Do not use the file title as a strong name source. Titles are usually topics, not speakers.
+        title_counts = Counter()
+        addressed_counts = _addressed_name_counts_for_speakers(self.segments)
         per_spk_counts = {}
         for spk in self.speakers:
-            per_spk_counts[spk] = _extract_candidates_from_text(" ".join(str(s.get("text","")) for s in self.segments if (s.get("speaker") == spk)))
+            c = Counter(_extract_candidates_from_text(" ".join(str(s.get("text","")) for s in self.segments if (s.get("speaker") == spk))))
+            c.update(addressed_counts.get(spk, Counter()))
+            per_spk_counts[spk] = c
         main = ttk.Frame(self, padding=8)
         main.pack(fill="both", expand=True)
         ttk.Label(main, text=f"File: {self.title_name}").pack(anchor="w")
@@ -707,29 +880,105 @@ class NamingDialog(tk.Toplevel):
         paned.add(left, weight=1)
         paned.add(right, weight=2)
         self.inputs = {}
+        self.selected_speaker = tk.StringVar(value=self.speakers[0] if self.speakers else "")
+
         grid = ttk.Frame(left)
         grid.pack(fill="x", expand=False, pady=(0,6))
+
         for r, spk in enumerate(self.speakers):
-            ttk.Label(grid, text=spk, width=16).grid(row=r, column=0, sticky="e", padx=(0,6), pady=3)
+            rb = ttk.Radiobutton(grid, variable=self.selected_speaker, value=spk)
+            rb.grid(row=r, column=0, sticky="w", pady=3)
+
+            ttk.Label(grid, text=spk, width=16).grid(row=r, column=1, sticky="e", padx=(0,6), pady=3)
+
+            # Keep this as an editable combobox so the user can still type any name manually.
+            # The dropdown values are hints only. We do not auto-fill weak guesses anymore.
             suggestions = _best_names_list(per_spk_counts.get(spk, Counter()), global_counts, title_counts, limit=8)
             saved = self.saved_names.get(spk)
+
             if saved and saved not in suggestions:
                 suggestions = [saved] + suggestions
+
             cb = ttk.Combobox(grid, values=suggestions, width=40, state="normal")
-            cb.grid(row=r, column=1, sticky="we", pady=3)
+            cb.grid(row=r, column=2, sticky="we", pady=3)
+
+            cb.bind("<FocusIn>", lambda e, spk=spk: self.selected_speaker.set(spk))
+            cb.bind("<Button-1>", lambda e, spk=spk: self.selected_speaker.set(spk))
+
             if saved:
                 cb.set(saved)
-            elif suggestions:
-                cb.set(suggestions[0])
+
             self.inputs[spk] = cb
-        grid.columnconfigure(1, weight=1)
+
+        grid.columnconfigure(2, weight=1)
+        # Candidate name pool: names/entities found in the transcript.
+        # These are NOT automatically assigned. The user assigns them manually.
+        pool_frame = ttk.LabelFrame(left, text="Candidate name pool")
+        pool_frame.pack(fill="both", expand=False, pady=(8,0))
+
+        pool_names = _best_names_list(
+            global_counts,
+            *[per_spk_counts.get(spk, Counter()) for spk in self.speakers],
+            title_counts,
+            limit=40
+        )
+
+        pool_inner = ttk.Frame(pool_frame)
+        pool_inner.pack(fill="both", expand=True, padx=6, pady=6)
+
+        self.name_pool = tk.Listbox(pool_inner, height=8, exportselection=False)
+        pool_scroll = ttk.Scrollbar(pool_inner, orient="vertical", command=self.name_pool.yview)
+        self.name_pool.configure(yscrollcommand=pool_scroll.set)
+
+        self.name_pool.pack(side="left", fill="both", expand=True)
+        pool_scroll.pack(side="right", fill="y")
+
+        for nm in pool_names:
+            self.name_pool.insert("end", nm)
+
+        def assign_selected_name(event=None):
+            sel = self.name_pool.curselection()
+            if not sel:
+                return
+            spk = self.selected_speaker.get()
+            cb = self.inputs.get(spk)
+            if not cb:
+                return
+            cb.set(self.name_pool.get(sel[0]))
+
+        def clear_selected_speaker():
+            spk = self.selected_speaker.get()
+            cb = self.inputs.get(spk)
+            if cb:
+                cb.set("")
+
+        def add_typed_name_to_pool():
+            spk = self.selected_speaker.get()
+            cb = self.inputs.get(spk)
+            if not cb:
+                return
+            nm = cb.get().strip()
+            if not nm:
+                return
+            existing = [self.name_pool.get(i) for i in range(self.name_pool.size())]
+            if nm not in existing:
+                self.name_pool.insert("end", nm)
+
+        self.name_pool.bind("<Double-1>", assign_selected_name)
+
+        pool_btns = ttk.Frame(pool_frame)
+        pool_btns.pack(fill="x", padx=6, pady=(0,6))
+        ttk.Button(pool_btns, text="Assign to selected speaker", command=assign_selected_name).pack(side="left")
+        ttk.Button(pool_btns, text="Clear selected speaker", command=clear_selected_speaker).pack(side="left", padx=(6,0))
+        ttk.Button(pool_btns, text="Add typed name to pool", command=add_typed_name_to_pool).pack(side="left", padx=(6,0))
+
         opts = ttk.Frame(left)
         opts.pack(fill="x", pady=(8,0))
         self.var_overwrite = tk.BooleanVar(value=True)
         ttk.Checkbutton(opts, text="Overwrite existing SRT/TXT (recommended)", variable=self.var_overwrite).pack(anchor="w")
         self.var_rename_audio = tk.BooleanVar(value=True)
         ttk.Checkbutton(opts, text="Rename folders and .wav files with names", variable=self.var_rename_audio).pack(anchor="w")
-        self.var_autofill2 = tk.BooleanVar(value=True)
+        self.var_autofill2 = tk.BooleanVar(value=False)
         ttk.Checkbutton(opts, text="Prefill first two speakers by earliest appearance", variable=self.var_autofill2).pack(anchor="w")
         try:
             _cfg = read_yaml(conf_path())
