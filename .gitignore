@@ -48,3 +48,4 @@ requirements-working-lock.txt
 ffmpeg.exe
 ffplay.exe
 ffprobe.exe
+venv_old_working/
