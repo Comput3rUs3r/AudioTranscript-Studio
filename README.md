@@ -193,24 +193,40 @@ GPU: your NVIDIA GPU
 
 ## Hugging Face Token and Diarization
 
-Speaker diarization may require a Hugging Face account and token.
+Speaker diarization may require a Hugging Face account, an access token, and accepted model conditions.
 
-You may also need to accept model terms on Hugging Face before diarization works.
+For the current CUDA stack, accept access for this model:
+
+* [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1)
 
 General steps:
 
-1. Create a Hugging Face account.
-2. Create an access token.
-3. Accept any pyannote model terms required by Hugging Face.
-4. Put your token in `conf.yaml`.
-5. Use the app's `Check HF token` button.
+1. Create or sign in to a [Hugging Face account](https://huggingface.co/join).
+2. Open the [pyannote speaker diarization Community-1 model page](https://huggingface.co/pyannote/speaker-diarization-community-1).
+3. Accept the model conditions on Hugging Face.
+4. Create a Hugging Face access token here: [Hugging Face tokens](https://huggingface.co/settings/tokens).
+5. Open your local `conf.yaml`.
+6. Paste your token into the `hf_token` field.
+7. Use the app's `Check HF token` button.
+
+Example:
+
+```yaml
+hf_token: "YOUR_HUGGING_FACE_TOKEN_HERE"
+```
+
+Do not share your token.
+
+Do not upload your `conf.yaml` to GitHub.
 
 If diarization fails, check:
 
 * Your token is correct
 * The token is saved in `conf.yaml`
-* You accepted the required model terms
+* You accepted the required pyannote model conditions
 * You have internet access the first time models are downloaded
+
+---
 
 ---
 
