@@ -10,3 +10,6 @@ pysrt
 pydub
 pyyaml
 wheel
+transformers==4.57.6
+tokenizers==0.22.2
+hf_xet
