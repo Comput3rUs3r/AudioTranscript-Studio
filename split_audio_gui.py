@@ -440,12 +440,20 @@ _DEFAULTS = {
     "slice_video": False, "fast_cut_video": False,
     "video_player_path": "", "parallel_workers": 4, # <--- NEW
     "merge_all_segments_into_one_folder": False,"txt_speaker_tags": True,"one_folder": False,
-    "output_format": "both","srt": True,"txt": True,"compute_type": "float16","tf32": "on",
+    "output_format": "both","srt": True,"txt": True,"compute_type": "float16","tf32": "off",
     "padding_seconds": 0.25,"hf_token": "",
 }
 _MODEL_CHOICES = ["tiny","base","small","medium","large-v2","large-v3","large-v3-turbo","distil-large-v3"]
 _COMPUTE_CHOICES = ["float16","float32"]
 _TF32_CHOICES = ["on","off"]
+
+def merge_gui_conf(existing: dict, gui_values: dict) -> dict:
+    """Merge GUI-owned settings without discarding other configuration keys."""
+    merged = dict(existing) if isinstance(existing, dict) else {}
+    merged.update(gui_values)
+    merged["compute_type"] = "float16"
+    merged["tf32"] = "off"
+    return merged
 
 def srt_timestamp(t: float) -> str:
     if t < 0: t = 0.0
@@ -1430,14 +1438,16 @@ class App(ttk.Frame):
         self.var_output.set(cfg.get("output_format", self.var_output.get()))
         self.var_srt.set(bool(cfg.get("srt", self.var_srt.get())))
         self.var_txt.set(bool(cfg.get("txt", self.var_txt.get())))
-        self.var_compute.set(cfg.get("compute_type", self.var_compute.get()))
-        self.var_tf32.set(cfg.get("tf32", self.var_tf32.get()))
+        self.var_compute.set("float16")
+        self.var_tf32.set("off")
         self.var_pad.set(float(cfg.get("padding_seconds", self.var_pad.get())))
         self.var_hf.set(cfg.get("hf_token", self.var_hf.get()))
         self.var_player.set(cfg.get("video_player_path", self.var_player.get()))
         self.var_workers.set(int(cfg.get("parallel_workers", self.var_workers.get()))) # <--- LOAD
 
     def _collect_ui_to_conf(self) -> dict:
+        self.var_compute.set("float16")
+        self.var_tf32.set("off")
         ofmt = self.var_output.get()
         srt = self.var_srt.get() if ofmt in ("both","srt") else False
         txt = self.var_txt.get() if ofmt in ("both","txt") else False
@@ -1455,15 +1465,15 @@ class App(ttk.Frame):
             "txt_speaker_tags": bool(self.var_tags.get()),
             "one_folder": bool(self.var_onefolder.get()),
             "output_format": ofmt, "srt": bool(srt), "txt": bool(txt),
-            "compute_type": self.var_compute.get().strip(),
-            "tf32": self.var_tf32.get().strip(),
+            "compute_type": "float16",
+            "tf32": "off",
             "padding_seconds": float(self.var_pad.get()),
             "hf_token": self.var_hf.get().strip(),
         }
 
     def on_save(self):
-        cfg = self._collect_ui_to_conf()
         try:
+            cfg = merge_gui_conf(read_yaml(conf_path()), self._collect_ui_to_conf())
             atomic_write_yaml(conf_path(), cfg)
             self.log(f"Saved {conf_path()}")
         except Exception as e:
@@ -1475,9 +1485,7 @@ class App(ttk.Frame):
         model = self.var_model.get().strip()
         self.log(f"[cfg] Model set to: {model}")
         try:
-            cfg = read_yaml(conf_path())
-            cfg = cfg or {}
-            cfg["model"] = model
+            cfg = merge_gui_conf(read_yaml(conf_path()), {"model": model})
             atomic_write_yaml(conf_path(), cfg)
         except Exception:
             pass
