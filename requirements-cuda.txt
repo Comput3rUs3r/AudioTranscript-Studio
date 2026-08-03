@@ -3,7 +3,7 @@
 torch==2.8.0+cu128
 torchvision==0.23.0+cu128
 torchaudio==2.8.0+cu128
-
+ttkbootstrap==2.1.1
 git+https://github.com/m-bain/whisperx.git@5f2f9d4320dd93a7d12f5ba2495eef7e0a5af963
 
 pysrt

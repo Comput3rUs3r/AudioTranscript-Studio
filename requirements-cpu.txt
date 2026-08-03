@@ -1,5 +1,6 @@
 git+https://github.com/m-bain/whisperx.git
 
+ttkbootstrap==2.1.1
 torch
 torchvision
 torchaudio
