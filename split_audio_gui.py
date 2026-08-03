@@ -1623,6 +1623,8 @@ class App(ttk.Frame):
             except Exception as e:
                 errors.append(f"{path}: {e}")
         for child in out.iterdir():
+            if child.name == ".gitkeep":
+                continue
             try:
                 if child.is_dir():
                     shutil.rmtree(child, onerror=make_writable_then_retry)
