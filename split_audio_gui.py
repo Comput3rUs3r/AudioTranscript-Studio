@@ -1728,22 +1728,48 @@ class App(ttk.Frame):
 
     def _reader(self):
         proc = self.proc
-        if proc and proc.stdout:
-            for line in proc.stdout:
-                msg = line.rstrip()
-                self.queue.put(("log", msg))
-                if msg.startswith("[speakers-json]"):
+        returncode = None
+        reader_failed = False
+        try:
+            if proc and proc.stdout:
+                for line in proc.stdout:
+                    msg = line.rstrip()
+                    self.queue.put(("log", msg))
+                    if msg.startswith("[speakers-json]"):
+                        try:
+                            path_str = msg.split("]", 1)[1].strip()
+                            spk_path = self._resolve_path(path_str)
+                            seg_path = spk_path.parent / "segments.json"
+                            if spk_path.exists() and seg_path.exists():
+                                self.queue.put(("speakers", spk_path, seg_path))
+                        except Exception:
+                            pass
+            elif proc is None:
+                raise RuntimeError("No active process is available to read.")
+        except Exception as e:
+            reader_failed = True
+            self.queue.put(("log", f"[reader error] Unexpected process output error: {e}"))
+        finally:
+            if proc and proc.stdout:
+                try:
+                    proc.stdout.close()
+                except Exception as e:
+                    reader_failed = True
+                    self.queue.put(("log", f"[reader error] Could not close process output: {e}"))
+            if proc:
+                try:
+                    returncode = proc.wait()
+                except Exception as e:
+                    reader_failed = True
+                    self.queue.put(("log", f"[reader error] Could not wait for process completion: {e}"))
                     try:
-                        path_str = msg.split("]", 1)[1].strip()
-                        spk_path = self._resolve_path(path_str)
-                        seg_path = spk_path.parent / "segments.json"
-                        if spk_path.exists() and seg_path.exists():
-                            self.queue.put(("speakers", spk_path, seg_path))
+                        returncode = proc.poll()
                     except Exception:
-                        pass
-        returncode = proc.wait() if proc else 1
-        self.queue.put(("log", "[process finished]"))
-        self.queue.put(("process_finished", returncode))
+                        returncode = None
+            if returncode is None or (reader_failed and returncode == 0):
+                returncode = 1
+            self.queue.put(("log", "[process finished]"))
+            self.queue.put(("process_finished", returncode))
 
     def _poll_queue(self):
         try:
