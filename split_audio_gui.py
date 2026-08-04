@@ -1,5 +1,6 @@
 # split_audio_gui.py — v1.11.0 (Stop Button + Worker Control)
 import os, sys, stat, json, yaml, queue, shutil, threading, subprocess, tkinter as tk, hashlib, datetime, re, signal
+import ttkbootstrap as tb
 from tkinter import ttk, messagebox, filedialog
 from pathlib import Path
 from collections import Counter
@@ -1710,11 +1711,7 @@ class App(ttk.Frame):
         NamingDialog(self.master, latest / "speakers.json", latest / "segments.json")
 
 def main():
-    root = tk.Tk()
-    try:
-        ttk.Style().theme_use("clam")
-    except Exception:
-        pass
+    root = tb.Window(themename="litera")
     app = App(root)
     root.geometry("1140x620")
     root.title(f"AudioTranscript Studio - GPU Control Panel {APP_VER} (build {app_build_id()}) | conf: {conf_path()}")
