@@ -1359,63 +1359,109 @@ class App(ttk.Frame):
         self.after(120, self._poll_queue)
 
     def _build_ui(self):
-        r = 0
-        ttk.Button(self, text="Run", command=self.on_run).grid(row=r, column=0, sticky="w")
-        ttk.Button(self, text="Stop", command=self.on_stop).grid(row=r, column=1, sticky="w", padx=2) # <--- STOP BUTTON
-        ttk.Button(self, text="Save config", command=self.on_save).grid(row=r, column=2, sticky="w", padx=6)
-        ttk.Button(self, text="Select Files...", command=self.select_input_files).grid(row=r, column=3, sticky="w", padx=6)
-        ttk.Button(self, text="Open output folder", command=self.open_output_folder).grid(row=r, column=4, sticky="w", padx=6)
-        ttk.Button(self, text="Clear output folder", command=self.on_clear_output).grid(row=r, column=5, sticky="w", padx=6)
-        ttk.Button(self, text="Check HF token", command=self.on_check_hf).grid(row=r, column=6, sticky="w", padx=6)
-        ttk.Button(self, text="Copy log", command=self.copy_log).grid(row=r, column=7, sticky="w", padx=6)
-        ttk.Button(self, text="Clear log", command=self.clear_log).grid(row=r, column=8, sticky="w", padx=6)
-        ttk.Button(self, text="About", command=self.on_about).grid(row=r, column=9, sticky="w", padx=6)
-        ttk.Button(self, text="Name speakers…", command=self.on_name_speakers).grid(row=r, column=10, sticky="w", padx=6)
-        r += 1
-        ttk.Label(self, text="Model:").grid(row=r, column=0, sticky="e")
-        self.cmb_model = ttk.Combobox(self, textvariable=self.var_model, values=_MODEL_CHOICES, width=16, state="readonly")
-        self.cmb_model.grid(row=r, column=1, sticky="w")
-        self.cmb_model.bind("<<ComboboxSelected>>", self._on_model_changed)
-        ttk.Label(self, text="Language:").grid(row=r, column=2, sticky="e")
-        ttk.Entry(self, textvariable=self.var_lang, width=8).grid(row=r, column=3, sticky="w", padx=6)
-        ttk.Label(self, text="Output:").grid(row=r, column=4, sticky="e")
-        ttk.Radiobutton(self, text="Both", variable=self.var_output, value="both").grid(row=r, column=5, sticky="w")
-        ttk.Radiobutton(self, text="SRT", variable=self.var_output, value="srt").grid(row=r, column=6, sticky="w")
-        ttk.Radiobutton(self, text="TXT", variable=self.var_output, value="txt").grid(row=r, column=7, sticky="w")
-        r += 1
-        ttk.Checkbutton(self, text="Diarize", variable=self.var_diar).grid(row=r, column=0, sticky="w")
-        ttk.Checkbutton(self, text="Slice audio", variable=self.var_slice).grid(row=r, column=1, sticky="w")
-        ttk.Checkbutton(self, text="Slice video", variable=self.var_slice_video).grid(row=r, column=2, sticky="w")
-        ttk.Checkbutton(self, text="Fast cut (stream copy)", variable=self.var_fast_cut).grid(row=r, column=3, sticky="w")
-        ttk.Checkbutton(self, text="One folder (merge)", variable=self.var_onefolder).grid(row=r, column=4, sticky="w")
-        ttk.Checkbutton(self, text="Speaker tags in .txt", variable=self.var_tags).grid(row=r, column=5, sticky="w")
-        ttk.Label(self, text="Compute type:").grid(row=r, column=6, sticky="e")
-        self.cmb_comp = ttk.Combobox(self, textvariable=self.var_compute, values=_COMPUTE_CHOICES, width=10, state="readonly")
-        self.cmb_comp.grid(row=r, column=7, sticky="w")
-        ttk.Label(self, text="TF32:").grid(row=r, column=8, sticky="e")
-        self.cmb_tf32 = ttk.Combobox(self, textvariable=self.var_tf32, values=_TF32_CHOICES, width=6, state="readonly")
-        self.cmb_tf32.grid(row=r, column=9, sticky="w")
-        r += 1
-        ttk.Label(self, text="Padding (s)").grid(row=r, column=0, sticky="e")
-        ttk.Spinbox(self, from_=0.0, to=3.0, increment=0.05, textvariable=self.var_pad, width=6).grid(row=r, column=1, sticky="w")
-        ttk.Label(self, text="HF token").grid(row=r, column=2, sticky="e")
-        ttk.Entry(self, textvariable=self.var_hf, width=30, show="*").grid(row=r, column=3, columnspan=2, sticky="we", padx=6)
-        
-        ttk.Label(self, text="Workers:").grid(row=r, column=5, sticky="e") # <--- WORKER LABEL
-        ttk.Spinbox(self, from_=1, to=16, textvariable=self.var_workers, width=4).grid(row=r, column=6, sticky="w") # <--- WORKER SPINBOX
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(6, weight=1)
 
-        ttk.Label(self, text="Video Player:").grid(row=r, column=7, sticky="e")
-        ttk.Entry(self, textvariable=self.var_player, width=20).grid(row=r, column=8, columnspan=2, sticky="we")
-        ttk.Button(self, text="Browse", command=self.browse_player).grid(row=r, column=10, sticky="w", padx=6)
-        
-        r += 1
-        self.lbl_conf = ttk.Label(self, text=str(conf_path()), foreground="#666")
-        self.lbl_conf.grid(row=r, column=0, columnspan=11, sticky="w", pady=(6, 2))
-        r += 1
-        self.txt = tk.Text(self, height=16, wrap="word")
-        self.txt.grid(row=r, column=0, columnspan=11, sticky="nsew", pady=(6, 0))
-        self.rowconfigure(r, weight=1)
-        for c in range(11): self.columnconfigure(c, weight=1)
+        header = ttk.Frame(self, padding=(8, 4, 8, 8))
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, text="AudioTranscript Studio", font=("Segoe UI", 18, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Label(header, text="Local transcription and speaker tools").grid(row=1, column=0, sticky="w", pady=(2, 0))
+        self.lbl_status = tb.Label(header, text="Ready", bootstyle="secondary")
+        self.lbl_status.grid(row=0, column=1, rowspan=2, sticky="e", padx=(12, 0))
+
+        files = ttk.LabelFrame(self, text="Files", padding=12)
+        files.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        tb.Button(files, text="Select Files", command=self.select_input_files, bootstyle="primary-outline").grid(row=0, column=0, sticky="w")
+        tb.Button(files, text="Open Output", command=self.open_output_folder, bootstyle="secondary-outline").grid(row=0, column=1, sticky="w", padx=(8, 0))
+        tb.Button(files, text="Clear Output", command=self.on_clear_output, bootstyle="danger-outline").grid(row=0, column=2, sticky="w", padx=(8, 0))
+
+        settings = ttk.LabelFrame(self, text="Transcription Settings", padding=12)
+        settings.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        settings.columnconfigure(7, weight=1)
+        ttk.Label(settings, text="Model").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.cmb_model = ttk.Combobox(settings, textvariable=self.var_model, values=_MODEL_CHOICES, width=18, state="readonly")
+        self.cmb_model.grid(row=0, column=1, sticky="w", padx=(0, 16))
+        self.cmb_model.bind("<<ComboboxSelected>>", self._on_model_changed)
+        ttk.Label(settings, text="Language").grid(row=0, column=2, sticky="w", padx=(0, 6))
+        ttk.Entry(settings, textvariable=self.var_lang, width=10).grid(row=0, column=3, sticky="w", padx=(0, 16))
+        ttk.Checkbutton(settings, text="Identify speakers", variable=self.var_diar).grid(row=0, column=4, sticky="w", padx=(0, 16))
+        ttk.Label(settings, text="Output").grid(row=0, column=5, sticky="w", padx=(0, 6))
+        output_options = ttk.Frame(settings)
+        output_options.grid(row=0, column=6, sticky="w")
+        ttk.Radiobutton(output_options, text="Both", variable=self.var_output, value="both").pack(side="left")
+        ttk.Radiobutton(output_options, text="SRT", variable=self.var_output, value="srt").pack(side="left", padx=(8, 0))
+        ttk.Radiobutton(output_options, text="TXT", variable=self.var_output, value="txt").pack(side="left", padx=(8, 0))
+        ttk.Frame(settings).grid(row=0, column=7, sticky="ew")
+
+        actions = ttk.Frame(self, padding=(0, 2, 0, 10))
+        actions.grid(row=3, column=0, sticky="ew")
+        tb.Button(actions, text="Start Transcription", command=self.on_run, bootstyle="success", padding=(20, 8)).pack(side="left")
+        tb.Button(actions, text="Cancel", command=self.on_stop, bootstyle="danger-outline", padding=(16, 8)).pack(side="left", padx=(8, 0))
+
+        advanced = ttk.Frame(self)
+        advanced.grid(row=4, column=0, sticky="ew", pady=(0, 8))
+        advanced.columnconfigure(0, weight=1)
+        self._advanced_expanded = False
+        self.btn_advanced = tb.Button(
+            advanced,
+            text="Advanced Settings  ▸",
+            command=self._toggle_advanced_settings,
+            bootstyle="secondary-outline",
+        )
+        self.btn_advanced.grid(row=0, column=0, sticky="ew")
+
+        self.advanced_content = ttk.Frame(advanced, padding=(12, 10, 12, 4))
+        self.advanced_content.grid(row=1, column=0, sticky="ew")
+        self.advanced_content.columnconfigure(7, weight=1)
+        ttk.Checkbutton(self.advanced_content, text="Slice audio", variable=self.var_slice).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(self.advanced_content, text="Slice video", variable=self.var_slice_video).grid(row=0, column=1, sticky="w", padx=(16, 0))
+        ttk.Checkbutton(self.advanced_content, text="Fast cut", variable=self.var_fast_cut).grid(row=0, column=2, sticky="w", padx=(16, 0))
+        ttk.Checkbutton(self.advanced_content, text="Merge into one folder", variable=self.var_onefolder).grid(row=0, column=3, sticky="w", padx=(16, 0))
+        ttk.Checkbutton(self.advanced_content, text="Speaker tags in TXT", variable=self.var_tags).grid(row=0, column=4, columnspan=3, sticky="w", padx=(16, 0))
+
+        ttk.Label(self.advanced_content, text="Padding (s)").grid(row=1, column=0, sticky="w", pady=(12, 0))
+        ttk.Spinbox(self.advanced_content, from_=0.0, to=3.0, increment=0.05, textvariable=self.var_pad, width=7).grid(row=1, column=1, sticky="w", padx=(6, 16), pady=(12, 0))
+        ttk.Label(self.advanced_content, text="Workers").grid(row=1, column=2, sticky="w", pady=(12, 0))
+        ttk.Spinbox(self.advanced_content, from_=1, to=16, textvariable=self.var_workers, width=5).grid(row=1, column=3, sticky="w", padx=(6, 16), pady=(12, 0))
+        ttk.Label(self.advanced_content, text="Hugging Face token").grid(row=1, column=4, sticky="w", pady=(12, 0))
+        ttk.Entry(self.advanced_content, textvariable=self.var_hf, width=30, show="*").grid(row=1, column=5, sticky="w", padx=(6, 8), pady=(12, 0))
+        tb.Button(self.advanced_content, text="Check HF token", command=self.on_check_hf, bootstyle="secondary-outline").grid(row=1, column=6, sticky="w", pady=(12, 0))
+
+        ttk.Label(self.advanced_content, text="Video player path").grid(row=2, column=0, sticky="w", pady=(10, 0))
+        ttk.Entry(self.advanced_content, textvariable=self.var_player, width=48).grid(row=2, column=1, columnspan=5, sticky="w", padx=(6, 8), pady=(10, 0))
+        tb.Button(self.advanced_content, text="Browse", command=self.browse_player, bootstyle="secondary-outline").grid(row=2, column=6, sticky="w", pady=(10, 0))
+        ttk.Frame(self.advanced_content).grid(row=0, column=7, rowspan=3, sticky="ew")
+        self.advanced_content.grid_remove()
+
+        utilities = ttk.LabelFrame(self, text="Utilities", padding=10)
+        utilities.grid(row=5, column=0, sticky="ew", pady=(0, 8))
+        ttk.Button(utilities, text="Save config", command=self.on_save).grid(row=0, column=0, sticky="w")
+        ttk.Button(utilities, text="Copy log", command=self.copy_log).grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Button(utilities, text="Clear log", command=self.clear_log).grid(row=0, column=2, sticky="w", padx=(8, 0))
+        ttk.Button(utilities, text="About", command=self.on_about).grid(row=0, column=3, sticky="w", padx=(8, 0))
+        ttk.Button(utilities, text="Name speakers…", command=self.on_name_speakers).grid(row=0, column=4, sticky="w", padx=(8, 0))
+        self.lbl_conf = ttk.Label(utilities, text=str(conf_path()), foreground="#666")
+        self.lbl_conf.grid(row=1, column=0, columnspan=5, sticky="w", pady=(8, 0))
+
+        activity = ttk.LabelFrame(self, text="Activity", padding=8)
+        activity.grid(row=6, column=0, sticky="nsew")
+        activity.rowconfigure(0, weight=1)
+        activity.columnconfigure(0, weight=1)
+        self.txt = tk.Text(activity, height=16, wrap="word")
+        self.txt.grid(row=0, column=0, sticky="nsew")
+        log_scrollbar = ttk.Scrollbar(activity, orient="vertical", command=self.txt.yview)
+        log_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.txt.configure(yscrollcommand=log_scrollbar.set)
+
+    def _toggle_advanced_settings(self):
+        self._advanced_expanded = not self._advanced_expanded
+        if self._advanced_expanded:
+            self.advanced_content.grid()
+            self.btn_advanced.configure(text="Advanced Settings  ▾")
+        else:
+            self.advanced_content.grid_remove()
+            self.btn_advanced.configure(text="Advanced Settings  ▸")
 
     def log(self, s: str):
         self.txt.insert("end", s.rstrip() + "\n")
