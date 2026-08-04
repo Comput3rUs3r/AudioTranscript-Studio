@@ -1,8 +1,10 @@
 # split_audio_gui.py — v1.11.0 (Stop Button + Worker Control)
 import os, sys, stat, json, yaml, queue, shutil, threading, subprocess, tkinter as tk, hashlib, datetime, re, signal
+import ttkbootstrap as tb
 from tkinter import ttk, messagebox, filedialog
 from pathlib import Path
 from collections import Counter
+from split_audio import AUDIO_EXTS as _PIPELINE_AUDIO_EXTS, VIDEO_EXTS as _PIPELINE_VIDEO_EXTS, discover_sources
 
 # === word-level exporters (VTT, ASS, and HTML player) ========================
 def _has_word_level(segments):
@@ -440,12 +442,20 @@ _DEFAULTS = {
     "slice_video": False, "fast_cut_video": False,
     "video_player_path": "", "parallel_workers": 4, # <--- NEW
     "merge_all_segments_into_one_folder": False,"txt_speaker_tags": True,"one_folder": False,
-    "output_format": "both","srt": True,"txt": True,"compute_type": "float16","tf32": "on",
+    "output_format": "both","srt": True,"txt": True,"compute_type": "float16","tf32": "off",
     "padding_seconds": 0.25,"hf_token": "",
 }
 _MODEL_CHOICES = ["tiny","base","small","medium","large-v2","large-v3","large-v3-turbo","distil-large-v3"]
 _COMPUTE_CHOICES = ["float16","float32"]
 _TF32_CHOICES = ["on","off"]
+
+def merge_gui_conf(existing: dict, gui_values: dict) -> dict:
+    """Merge GUI-owned settings without discarding other configuration keys."""
+    merged = dict(existing) if isinstance(existing, dict) else {}
+    merged.update(gui_values)
+    merged["compute_type"] = "float16"
+    merged["tf32"] = "off"
+    return merged
 
 def srt_timestamp(t: float) -> str:
     if t < 0: t = 0.0
@@ -806,7 +816,28 @@ class _SrtHitsDialog(tk.Toplevel):
         frame.grid(row=0, column=0, sticky="nsew")
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
-        self.tree = ttk.Treeview(frame, columns=("time","text"), show="headings", selectmode="browse", height=12)
+        tree_style_name = "SrtMatches.Treeview"
+        tree_style = tb.Style.get_instance() or tb.Style()
+        colors = tree_style.colors
+        tree_style.configure(
+            tree_style_name,
+            background=colors.inputbg,
+            foreground=colors.inputfg,
+            fieldbackground=colors.inputbg,
+        )
+        tree_style.map(
+            tree_style_name,
+            background=[("selected", colors.primary)],
+            foreground=[("selected", colors.get_foreground("primary"))],
+        )
+        self.tree = ttk.Treeview(
+            frame,
+            columns=("time","text"),
+            show="headings",
+            selectmode="browse",
+            height=12,
+            style=tree_style_name,
+        )
         self.tree.heading("time", text="Start")
         self.tree.heading("text", text="Caption")
         self.tree.column("time", width=110, anchor="w")
@@ -820,11 +851,17 @@ class _SrtHitsDialog(tk.Toplevel):
             if len(txt) > 160:
                 txt = txt[:157] + "…"
             self.tree.insert("", "end", iid=str(i), values=(_fmt_time_hhmmss(h.get("start")), txt))
+        first_item = self.tree.get_children()
+        if first_item:
+            self.tree.selection_set(first_item[0])
+            self.tree.focus(first_item[0])
+            self.tree.see(first_item[0])
         btns = ttk.Frame(frame)
         btns.grid(row=1, column=0, columnspan=2, sticky="e", pady=(8,0))
         self.btn_open = ttk.Button(btns, text="Open at time", command=self._on_open)
         self.btn_open.pack(side="right", padx=(0,8))
         ttk.Button(btns, text="Cancel", command=self._on_cancel).pack(side="right")
+        self.tree.bind("<ButtonRelease-1>", self._select_clicked_row, add="+")
         self.tree.bind("<Double-1>", lambda e: self._on_open())
         self.bind("<Return>", lambda e: self._on_open())
         self.bind("<Escape>", lambda e: self._on_cancel())
@@ -835,6 +872,13 @@ class _SrtHitsDialog(tk.Toplevel):
         self.after(50, lambda: self.attributes("-topmost", False))
         self.grab_set()
         self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+        self.after_idle(self.tree.focus_set)
+
+    def _select_clicked_row(self, event):
+        item = self.tree.identify_row(event.y)
+        if item:
+            self.tree.selection_set(item)
+            self.tree.focus(item)
 
     def _on_open(self):
         sel = self.tree.selection()
@@ -850,7 +894,8 @@ class NamingDialog(tk.Toplevel):
     def __init__(self, master, speakers_json: Path, segments_json: Path):
         super().__init__(master)
         self.title("Name Speakers")
-        self.geometry("980x600")
+        self.geometry("1180x700")
+        self.minsize(960, 600)
         self.resizable(True, True)
         self.speakers_json = speakers_json
         self.segments_json = segments_json
@@ -869,27 +914,51 @@ class NamingDialog(tk.Toplevel):
             c = Counter(_extract_candidates_from_text(" ".join(str(s.get("text","")) for s in self.segments if (s.get("speaker") == spk))))
             c.update(addressed_counts.get(spk, Counter()))
             per_spk_counts[spk] = c
-        main = ttk.Frame(self, padding=8)
+        main = ttk.Frame(self, padding=14)
         main.pack(fill="both", expand=True)
-        ttk.Label(main, text=f"File: {self.title_name}").pack(anchor="w")
-        ttk.Label(main, text="Pick a suggested name or type a custom one for each speaker:").pack(anchor="w", pady=(2,8))
+        main.columnconfigure(0, weight=1)
+        main.rowconfigure(2, weight=1)
+        ttk.Label(main, text="Name Speakers", font=("Segoe UI", 16, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Label(main, text=f"{self.title_name} — assign names and review the transcript").grid(row=1, column=0, sticky="w", pady=(2, 10))
         paned = ttk.PanedWindow(main, orient="horizontal")
-        paned.pack(fill="both", expand=True)
-        left = ttk.Frame(paned, padding=(0,0,8,0))
-        right = ttk.Frame(paned, padding=0)
-        paned.add(left, weight=1)
-        paned.add(right, weight=2)
+        paned.grid(row=2, column=0, sticky="nsew")
+        left = ttk.Frame(paned, padding=(0, 0, 6, 0))
+        right = ttk.Frame(paned, padding=(6, 0, 0, 0))
+        paned.add(left, weight=2)
+        paned.add(right, weight=3)
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(0, weight=1, minsize=150)
+        left.rowconfigure(1, weight=1, minsize=125)
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(1, weight=1)
         self.inputs = {}
         self.selected_speaker = tk.StringVar(value=self.speakers[0] if self.speakers else "")
 
-        grid = ttk.Frame(left)
-        grid.pack(fill="x", expand=False, pady=(0,6))
+        assignments = ttk.LabelFrame(left, text="Speaker Assignments", padding=8)
+        assignments.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
+        assignments.columnconfigure(0, weight=1)
+        assignments.rowconfigure(1, weight=1)
+
+        assignment_headings = ttk.Frame(assignments)
+        assignment_headings.grid(row=0, column=0, sticky="ew", padx=(2, 18), pady=(0, 4))
+        assignment_headings.columnconfigure(2, weight=1)
+        ttk.Label(assignment_headings, text="Speaker", font=("Segoe UI", 9, "bold")).grid(row=0, column=1, sticky="w", padx=(0, 8))
+        ttk.Label(assignment_headings, text="Assigned name", font=("Segoe UI", 9, "bold")).grid(row=0, column=2, sticky="w")
+
+        speaker_canvas = tk.Canvas(assignments, height=155, highlightthickness=0, borderwidth=0)
+        speaker_scroll = ttk.Scrollbar(assignments, orient="vertical", command=speaker_canvas.yview)
+        speaker_canvas.configure(yscrollcommand=speaker_scroll.set)
+        speaker_canvas.grid(row=1, column=0, sticky="nsew")
+        speaker_scroll.grid(row=1, column=1, sticky="ns")
+
+        grid = ttk.Frame(speaker_canvas, padding=(2, 0, 4, 0))
+        speaker_window = speaker_canvas.create_window((0, 0), window=grid, anchor="nw")
 
         for r, spk in enumerate(self.speakers):
             rb = ttk.Radiobutton(grid, variable=self.selected_speaker, value=spk)
-            rb.grid(row=r, column=0, sticky="w", pady=3)
+            rb.grid(row=r, column=0, sticky="w", pady=4)
 
-            ttk.Label(grid, text=spk, width=16).grid(row=r, column=1, sticky="e", padx=(0,6), pady=3)
+            ttk.Label(grid, text=spk, width=16).grid(row=r, column=1, sticky="w", padx=(0, 8), pady=4)
 
             # Keep this as an editable combobox so the user can still type any name manually.
             # The dropdown values are hints only. We do not auto-fill weak guesses anymore.
@@ -899,8 +968,8 @@ class NamingDialog(tk.Toplevel):
             if saved and saved not in suggestions:
                 suggestions = [saved] + suggestions
 
-            cb = ttk.Combobox(grid, values=suggestions, width=40, state="normal")
-            cb.grid(row=r, column=2, sticky="we", pady=3)
+            cb = ttk.Combobox(grid, values=suggestions, width=30, state="normal")
+            cb.grid(row=r, column=2, sticky="ew", pady=4)
 
             cb.bind("<FocusIn>", lambda e, spk=spk: self.selected_speaker.set(spk))
             cb.bind("<Button-1>", lambda e, spk=spk: self.selected_speaker.set(spk))
@@ -911,10 +980,15 @@ class NamingDialog(tk.Toplevel):
             self.inputs[spk] = cb
 
         grid.columnconfigure(2, weight=1)
+        grid.bind("<Configure>", lambda event: speaker_canvas.configure(scrollregion=speaker_canvas.bbox("all")))
+        speaker_canvas.bind("<Configure>", lambda event: speaker_canvas.itemconfigure(speaker_window, width=event.width))
+
         # Candidate name pool: names/entities found in the transcript.
         # These are NOT automatically assigned. The user assigns them manually.
-        pool_frame = ttk.LabelFrame(left, text="Candidate name pool")
-        pool_frame.pack(fill="both", expand=False, pady=(8,0))
+        pool_frame = ttk.LabelFrame(left, text="Candidate Name Pool", padding=8)
+        pool_frame.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
+        pool_frame.columnconfigure(0, weight=1)
+        pool_frame.rowconfigure(0, weight=1)
 
         pool_names = _best_names_list(
             global_counts,
@@ -924,14 +998,16 @@ class NamingDialog(tk.Toplevel):
         )
 
         pool_inner = ttk.Frame(pool_frame)
-        pool_inner.pack(fill="both", expand=True, padx=6, pady=6)
+        pool_inner.grid(row=0, column=0, sticky="nsew")
+        pool_inner.columnconfigure(0, weight=1)
+        pool_inner.rowconfigure(0, weight=1)
 
-        self.name_pool = tk.Listbox(pool_inner, height=8, exportselection=False)
+        self.name_pool = tk.Listbox(pool_inner, height=6, exportselection=False)
         pool_scroll = ttk.Scrollbar(pool_inner, orient="vertical", command=self.name_pool.yview)
         self.name_pool.configure(yscrollcommand=pool_scroll.set)
 
-        self.name_pool.pack(side="left", fill="both", expand=True)
-        pool_scroll.pack(side="right", fill="y")
+        self.name_pool.grid(row=0, column=0, sticky="nsew")
+        pool_scroll.grid(row=0, column=1, sticky="ns")
 
         for nm in pool_names:
             self.name_pool.insert("end", nm)
@@ -967,19 +1043,21 @@ class NamingDialog(tk.Toplevel):
         self.name_pool.bind("<Double-1>", assign_selected_name)
 
         pool_btns = ttk.Frame(pool_frame)
-        pool_btns.pack(fill="x", padx=6, pady=(0,6))
-        ttk.Button(pool_btns, text="Assign to selected speaker", command=assign_selected_name).pack(side="left")
-        ttk.Button(pool_btns, text="Clear selected speaker", command=clear_selected_speaker).pack(side="left", padx=(6,0))
-        ttk.Button(pool_btns, text="Add typed name to pool", command=add_typed_name_to_pool).pack(side="left", padx=(6,0))
+        pool_btns.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        pool_btns.columnconfigure(0, weight=1)
+        pool_btns.columnconfigure(1, weight=1)
+        tb.Button(pool_btns, text="Assign to selected speaker", command=assign_selected_name, bootstyle="primary-outline").grid(row=0, column=0, columnspan=2, sticky="ew")
+        ttk.Button(pool_btns, text="Clear selected speaker", command=clear_selected_speaker).grid(row=1, column=0, sticky="ew", pady=(6, 0), padx=(0, 3))
+        ttk.Button(pool_btns, text="Add typed name to pool", command=add_typed_name_to_pool).grid(row=1, column=1, sticky="ew", pady=(6, 0), padx=(3, 0))
 
-        opts = ttk.Frame(left)
-        opts.pack(fill="x", pady=(8,0))
+        opts = ttk.LabelFrame(left, text="Output Options", padding=8)
+        opts.grid(row=2, column=0, sticky="ew", pady=(0, 8))
         self.var_overwrite = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opts, text="Overwrite existing SRT/TXT (recommended)", variable=self.var_overwrite).pack(anchor="w")
+        ttk.Checkbutton(opts, text="Overwrite existing SRT/TXT (recommended)", variable=self.var_overwrite).grid(row=0, column=0, sticky="w")
         self.var_rename_audio = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opts, text="Rename folders and .wav files with names", variable=self.var_rename_audio).pack(anchor="w")
+        ttk.Checkbutton(opts, text="Rename folders and .wav files with names", variable=self.var_rename_audio).grid(row=1, column=0, sticky="w", pady=(2, 0))
         self.var_autofill2 = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opts, text="Prefill first two speakers by earliest appearance", variable=self.var_autofill2).pack(anchor="w")
+        ttk.Checkbutton(opts, text="Prefill first two speakers by earliest appearance", variable=self.var_autofill2).grid(row=2, column=0, sticky="w", pady=(2, 0))
         try:
             _cfg = read_yaml(conf_path())
         except:
@@ -989,36 +1067,46 @@ class NamingDialog(tk.Toplevel):
         self.var_export_html = tk.BooleanVar(value=bool(_cfg.get("export_word_html", False)))
         self.var_export_lrc  = tk.BooleanVar(value=bool(_cfg.get("export_word_lrc", False)))
         self.var_export_ass_plain = tk.BooleanVar(value=bool(_cfg.get("export_ass_plain", False)))
-        ttk.Label(opts, text="Word-level exports:").pack(anchor="w", pady=(6,0))
-        ttk.Checkbutton(opts, text="Word-level VTT", variable=self.var_export_vtt).pack(anchor="w")
-        ttk.Checkbutton(opts, text="Word-level ASS (VLC)", variable=self.var_export_ass).pack(anchor="w")
-        ttk.Checkbutton(opts, text="Write HTML word player", variable=self.var_export_html).pack(anchor="w")
-        ttk.Checkbutton(opts, text="Word-level LRC (CapCut)", variable=self.var_export_lrc).pack(anchor="w")
-        ttk.Checkbutton(opts, text="ASS (plain, no karaoke)", variable=self.var_export_ass_plain).pack(anchor="w")
+        ttk.Label(opts, text="Word-level exports", font=("Segoe UI", 9, "bold")).grid(row=3, column=0, sticky="w", pady=(8, 2))
+        ttk.Checkbutton(opts, text="Word-level VTT", variable=self.var_export_vtt).grid(row=4, column=0, sticky="w")
+        ttk.Checkbutton(opts, text="Word-level ASS (VLC)", variable=self.var_export_ass).grid(row=5, column=0, sticky="w", pady=(2, 0))
+        ttk.Checkbutton(opts, text="Write HTML word player", variable=self.var_export_html).grid(row=6, column=0, sticky="w", pady=(2, 0))
+        ttk.Checkbutton(opts, text="Word-level LRC (CapCut)", variable=self.var_export_lrc).grid(row=7, column=0, sticky="w", pady=(2, 0))
+        ttk.Checkbutton(opts, text="ASS (plain, no karaoke)", variable=self.var_export_ass_plain).grid(row=8, column=0, sticky="w", pady=(2, 0))
+
         btns = ttk.Frame(left)
-        btns.pack(fill="x", pady=(8,0))
-        ttk.Button(btns, text="Apply", command=self.on_apply).pack(side="right")
-        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right", padx=6)
-        viewer = ttk.Frame(right)
-        viewer.pack(fill="both", expand=True)
-        toolbar = ttk.Frame(viewer)
-        toolbar.pack(fill="x", pady=(0,4))
-        ttk.Label(toolbar, text="Find:").pack(side="left")
+        btns.grid(row=3, column=0, sticky="ew")
+        tb.Button(btns, text="Apply", command=self.on_apply, bootstyle="success", padding=(16, 6)).pack(side="right")
+        tb.Button(btns, text="Cancel", command=self.destroy, bootstyle="secondary-outline", padding=(14, 6)).pack(side="right", padx=(0, 8))
+
+        toolbar = ttk.LabelFrame(right, text="Search", padding=10)
+        toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        toolbar.columnconfigure(4, weight=1)
+        ttk.Label(toolbar, text="Find text").grid(row=0, column=0, sticky="w", padx=(0, 6))
         self.find_var = tk.StringVar(value="SPEAKER_00")
         find_entry = ttk.Entry(toolbar, textvariable=self.find_var, width=24)
-        find_entry.pack(side="left", padx=(4,6))
+        find_entry.grid(row=0, column=1, sticky="w", padx=(0, 14))
+        ttk.Label(toolbar, text="Speaker filter").grid(row=0, column=2, sticky="w", padx=(0, 6))
         self.find_speaker_var = tk.StringVar(value=self.speakers[0] if self.speakers else "")
         find_spk = ttk.Combobox(toolbar, textvariable=self.find_speaker_var, values=self.speakers, width=14, state="readonly")
-        find_spk.pack(side="left", padx=(0,6))
-        ttk.Button(toolbar, text="Find next", command=self.find_next).pack(side="left")
-        ttk.Button(toolbar, text="Find speaker tag", command=self.find_speaker_tag).pack(side="left", padx=(6,0))
-        ttk.Button(toolbar, text="Open video at hit", command=self.open_video_at_query).pack(side="left", padx=(6,0))
-        ttk.Button(toolbar, text="Open externally", command=self.open_txt_external).pack(side="right")
+        find_spk.grid(row=0, column=3, sticky="w")
+
+        search_actions = ttk.Frame(toolbar)
+        search_actions.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(8, 0))
+        tb.Button(search_actions, text="Find next", command=self.find_next, bootstyle="primary-outline").pack(side="left")
+        ttk.Button(search_actions, text="Find speaker tag", command=self.find_speaker_tag).pack(side="left", padx=(6, 0))
+        ttk.Button(search_actions, text="Open video at hit", command=self.open_video_at_query).pack(side="left", padx=(6, 0))
+        ttk.Button(search_actions, text="Open externally", command=self.open_txt_external).pack(side="left", padx=(6, 0))
+
+        viewer = ttk.LabelFrame(right, text="Transcript Preview", padding=8)
+        viewer.grid(row=1, column=0, sticky="nsew")
+        viewer.columnconfigure(0, weight=1)
+        viewer.rowconfigure(0, weight=1)
         self.text = tk.Text(viewer, wrap="word")
         yscroll = ttk.Scrollbar(viewer, orient="vertical", command=self.text.yview)
         self.text.configure(yscrollcommand=yscroll.set)
-        self.text.pack(side="left", fill="both", expand=True)
-        yscroll.pack(side="right", fill="y")
+        self.text.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
         self.txt_path, txt_content = self._load_transcript()
         self.text.insert("1.0", txt_content)
         self.text.edit_reset()
@@ -1325,6 +1413,7 @@ class App(ttk.Frame):
         self.master.rowconfigure(0, weight=1)
         self.master.columnconfigure(0, weight=1)
         self.proc = None
+        self.cancel_requested = False
         self.queue = queue.Queue()
         self.input_files = []
         self.var_model = tk.StringVar(value=_DEFAULTS["model"])
@@ -1350,71 +1439,144 @@ class App(ttk.Frame):
         self.after(120, self._poll_queue)
 
     def _build_ui(self):
-        r = 0
-        ttk.Button(self, text="Run", command=self.on_run).grid(row=r, column=0, sticky="w")
-        ttk.Button(self, text="Stop", command=self.on_stop).grid(row=r, column=1, sticky="w", padx=2) # <--- STOP BUTTON
-        ttk.Button(self, text="Save config", command=self.on_save).grid(row=r, column=2, sticky="w", padx=6)
-        ttk.Button(self, text="Select Files...", command=self.select_input_files).grid(row=r, column=3, sticky="w", padx=6)
-        ttk.Button(self, text="Open output folder", command=self.open_output_folder).grid(row=r, column=4, sticky="w", padx=6)
-        ttk.Button(self, text="Clear output folder", command=self.on_clear_output).grid(row=r, column=5, sticky="w", padx=6)
-        ttk.Button(self, text="Check HF token", command=self.on_check_hf).grid(row=r, column=6, sticky="w", padx=6)
-        ttk.Button(self, text="Copy log", command=self.copy_log).grid(row=r, column=7, sticky="w", padx=6)
-        ttk.Button(self, text="Clear log", command=self.clear_log).grid(row=r, column=8, sticky="w", padx=6)
-        ttk.Button(self, text="About", command=self.on_about).grid(row=r, column=9, sticky="w", padx=6)
-        ttk.Button(self, text="Name speakers…", command=self.on_name_speakers).grid(row=r, column=10, sticky="w", padx=6)
-        r += 1
-        ttk.Label(self, text="Model:").grid(row=r, column=0, sticky="e")
-        self.cmb_model = ttk.Combobox(self, textvariable=self.var_model, values=_MODEL_CHOICES, width=16, state="readonly")
-        self.cmb_model.grid(row=r, column=1, sticky="w")
-        self.cmb_model.bind("<<ComboboxSelected>>", self._on_model_changed)
-        ttk.Label(self, text="Language:").grid(row=r, column=2, sticky="e")
-        ttk.Entry(self, textvariable=self.var_lang, width=8).grid(row=r, column=3, sticky="w", padx=6)
-        ttk.Label(self, text="Output:").grid(row=r, column=4, sticky="e")
-        ttk.Radiobutton(self, text="Both", variable=self.var_output, value="both").grid(row=r, column=5, sticky="w")
-        ttk.Radiobutton(self, text="SRT", variable=self.var_output, value="srt").grid(row=r, column=6, sticky="w")
-        ttk.Radiobutton(self, text="TXT", variable=self.var_output, value="txt").grid(row=r, column=7, sticky="w")
-        r += 1
-        ttk.Checkbutton(self, text="Diarize", variable=self.var_diar).grid(row=r, column=0, sticky="w")
-        ttk.Checkbutton(self, text="Slice audio", variable=self.var_slice).grid(row=r, column=1, sticky="w")
-        ttk.Checkbutton(self, text="Slice video", variable=self.var_slice_video).grid(row=r, column=2, sticky="w")
-        ttk.Checkbutton(self, text="Fast cut (stream copy)", variable=self.var_fast_cut).grid(row=r, column=3, sticky="w")
-        ttk.Checkbutton(self, text="One folder (merge)", variable=self.var_onefolder).grid(row=r, column=4, sticky="w")
-        ttk.Checkbutton(self, text="Speaker tags in .txt", variable=self.var_tags).grid(row=r, column=5, sticky="w")
-        ttk.Label(self, text="Compute type:").grid(row=r, column=6, sticky="e")
-        self.cmb_comp = ttk.Combobox(self, textvariable=self.var_compute, values=_COMPUTE_CHOICES, width=10, state="readonly")
-        self.cmb_comp.grid(row=r, column=7, sticky="w")
-        ttk.Label(self, text="TF32:").grid(row=r, column=8, sticky="e")
-        self.cmb_tf32 = ttk.Combobox(self, textvariable=self.var_tf32, values=_TF32_CHOICES, width=6, state="readonly")
-        self.cmb_tf32.grid(row=r, column=9, sticky="w")
-        r += 1
-        ttk.Label(self, text="Padding (s)").grid(row=r, column=0, sticky="e")
-        ttk.Spinbox(self, from_=0.0, to=3.0, increment=0.05, textvariable=self.var_pad, width=6).grid(row=r, column=1, sticky="w")
-        ttk.Label(self, text="HF token").grid(row=r, column=2, sticky="e")
-        ttk.Entry(self, textvariable=self.var_hf, width=30, show="*").grid(row=r, column=3, columnspan=2, sticky="we", padx=6)
-        
-        ttk.Label(self, text="Workers:").grid(row=r, column=5, sticky="e") # <--- WORKER LABEL
-        ttk.Spinbox(self, from_=1, to=16, textvariable=self.var_workers, width=4).grid(row=r, column=6, sticky="w") # <--- WORKER SPINBOX
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(6, weight=1)
 
-        ttk.Label(self, text="Video Player:").grid(row=r, column=7, sticky="e")
-        ttk.Entry(self, textvariable=self.var_player, width=20).grid(row=r, column=8, columnspan=2, sticky="we")
-        ttk.Button(self, text="Browse", command=self.browse_player).grid(row=r, column=10, sticky="w", padx=6)
-        
-        r += 1
-        self.lbl_conf = ttk.Label(self, text=str(conf_path()), foreground="#666")
-        self.lbl_conf.grid(row=r, column=0, columnspan=11, sticky="w", pady=(6, 2))
-        r += 1
-        self.txt = tk.Text(self, height=16, wrap="word")
-        self.txt.grid(row=r, column=0, columnspan=11, sticky="nsew", pady=(6, 0))
-        self.rowconfigure(r, weight=1)
-        for c in range(11): self.columnconfigure(c, weight=1)
+        header = ttk.Frame(self, padding=(8, 4, 8, 8))
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, text="AudioTranscript Studio", font=("Segoe UI", 18, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Label(header, text="Local transcription and speaker tools").grid(row=1, column=0, sticky="w", pady=(2, 0))
+        self.lbl_status = tb.Label(header, text="Ready", bootstyle="secondary")
+        self.lbl_status.grid(row=0, column=1, rowspan=2, sticky="e", padx=(12, 0))
+
+        files = ttk.LabelFrame(self, text="Files", padding=12)
+        files.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        tb.Button(files, text="Select Files", command=self.select_input_files, bootstyle="primary-outline").grid(row=0, column=0, sticky="w")
+        tb.Button(files, text="Open Output", command=self.open_output_folder, bootstyle="secondary-outline").grid(row=0, column=1, sticky="w", padx=(8, 0))
+        tb.Button(files, text="Clear Output", command=self.on_clear_output, bootstyle="danger-outline").grid(row=0, column=2, sticky="w", padx=(8, 0))
+
+        settings = ttk.LabelFrame(self, text="Transcription Settings", padding=12)
+        settings.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        settings.columnconfigure(7, weight=1)
+        ttk.Label(settings, text="Model").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.cmb_model = ttk.Combobox(settings, textvariable=self.var_model, values=_MODEL_CHOICES, width=18, state="readonly")
+        self.cmb_model.grid(row=0, column=1, sticky="w", padx=(0, 16))
+        self.cmb_model.bind("<<ComboboxSelected>>", self._on_model_changed)
+        ttk.Label(settings, text="Language").grid(row=0, column=2, sticky="w", padx=(0, 6))
+        ttk.Entry(settings, textvariable=self.var_lang, width=10).grid(row=0, column=3, sticky="w", padx=(0, 16))
+        ttk.Checkbutton(settings, text="Identify speakers", variable=self.var_diar).grid(row=0, column=4, sticky="w", padx=(0, 16))
+        ttk.Label(settings, text="Output").grid(row=0, column=5, sticky="w", padx=(0, 6))
+        output_options = ttk.Frame(settings)
+        output_options.grid(row=0, column=6, sticky="w")
+        ttk.Radiobutton(output_options, text="Both", variable=self.var_output, value="both").pack(side="left")
+        ttk.Radiobutton(output_options, text="SRT", variable=self.var_output, value="srt").pack(side="left", padx=(8, 0))
+        ttk.Radiobutton(output_options, text="TXT", variable=self.var_output, value="txt").pack(side="left", padx=(8, 0))
+        ttk.Frame(settings).grid(row=0, column=7, sticky="ew")
+
+        actions = ttk.Frame(self, padding=(0, 2, 0, 10))
+        actions.grid(row=3, column=0, sticky="ew")
+        self.btn_start = tb.Button(actions, text="Start Transcription", command=self.on_run, bootstyle="success", padding=(20, 8))
+        self.btn_start.pack(side="left")
+        self.btn_cancel = tb.Button(actions, text="Cancel", command=self.on_stop, bootstyle="danger-outline", padding=(16, 8))
+        self.btn_cancel.pack(side="left", padx=(8, 0))
+        self.progress = tb.Progressbar(actions, mode="indeterminate", length=180, bootstyle="info-striped")
+        self.progress.pack(side="left", padx=(14, 0))
+        self._set_runtime_state("Ready")
+
+        advanced = ttk.Frame(self)
+        advanced.grid(row=4, column=0, sticky="ew", pady=(0, 8))
+        advanced.columnconfigure(0, weight=1)
+        self._advanced_expanded = False
+        self.btn_advanced = tb.Button(
+            advanced,
+            text="Advanced Settings  ▸",
+            command=self._toggle_advanced_settings,
+            bootstyle="secondary-outline",
+        )
+        self.btn_advanced.grid(row=0, column=0, sticky="ew")
+
+        self.advanced_content = ttk.Frame(advanced, padding=(12, 10, 12, 4))
+        self.advanced_content.grid(row=1, column=0, sticky="ew")
+        self.advanced_content.columnconfigure(7, weight=1)
+        ttk.Checkbutton(self.advanced_content, text="Slice audio", variable=self.var_slice).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(self.advanced_content, text="Slice video", variable=self.var_slice_video).grid(row=0, column=1, sticky="w", padx=(16, 0))
+        ttk.Checkbutton(self.advanced_content, text="Fast cut", variable=self.var_fast_cut).grid(row=0, column=2, sticky="w", padx=(16, 0))
+        ttk.Checkbutton(self.advanced_content, text="Merge into one folder", variable=self.var_onefolder).grid(row=0, column=3, sticky="w", padx=(16, 0))
+        ttk.Checkbutton(self.advanced_content, text="Speaker tags in TXT", variable=self.var_tags).grid(row=0, column=4, columnspan=3, sticky="w", padx=(16, 0))
+
+        ttk.Label(self.advanced_content, text="Padding (s)").grid(row=1, column=0, sticky="w", pady=(12, 0))
+        ttk.Spinbox(self.advanced_content, from_=0.0, to=3.0, increment=0.05, textvariable=self.var_pad, width=7).grid(row=1, column=1, sticky="w", padx=(6, 16), pady=(12, 0))
+        ttk.Label(self.advanced_content, text="Workers").grid(row=1, column=2, sticky="w", pady=(12, 0))
+        ttk.Spinbox(self.advanced_content, from_=1, to=16, textvariable=self.var_workers, width=5).grid(row=1, column=3, sticky="w", padx=(6, 16), pady=(12, 0))
+        ttk.Label(self.advanced_content, text="Hugging Face token").grid(row=1, column=4, sticky="w", pady=(12, 0))
+        ttk.Entry(self.advanced_content, textvariable=self.var_hf, width=30, show="*").grid(row=1, column=5, sticky="w", padx=(6, 8), pady=(12, 0))
+        tb.Button(self.advanced_content, text="Check HF token", command=self.on_check_hf, bootstyle="secondary-outline").grid(row=1, column=6, sticky="w", pady=(12, 0))
+
+        ttk.Label(self.advanced_content, text="Video player path").grid(row=2, column=0, sticky="w", pady=(10, 0))
+        ttk.Entry(self.advanced_content, textvariable=self.var_player, width=48).grid(row=2, column=1, columnspan=5, sticky="w", padx=(6, 8), pady=(10, 0))
+        tb.Button(self.advanced_content, text="Browse", command=self.browse_player, bootstyle="secondary-outline").grid(row=2, column=6, sticky="w", pady=(10, 0))
+        ttk.Frame(self.advanced_content).grid(row=0, column=7, rowspan=3, sticky="ew")
+        self.advanced_content.grid_remove()
+
+        utilities = ttk.LabelFrame(self, text="Utilities", padding=10)
+        utilities.grid(row=5, column=0, sticky="ew", pady=(0, 8))
+        ttk.Button(utilities, text="Save config", command=self.on_save).grid(row=0, column=0, sticky="w")
+        ttk.Button(utilities, text="Copy log", command=self.copy_log).grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Button(utilities, text="Clear log", command=self.clear_log).grid(row=0, column=2, sticky="w", padx=(8, 0))
+        ttk.Button(utilities, text="About", command=self.on_about).grid(row=0, column=3, sticky="w", padx=(8, 0))
+        ttk.Button(utilities, text="Name speakers…", command=self.on_name_speakers).grid(row=0, column=4, sticky="w", padx=(8, 0))
+        self.lbl_conf = ttk.Label(utilities, text="Configuration: conf.yaml", foreground="#666")
+        self.lbl_conf.grid(row=1, column=0, columnspan=5, sticky="w", pady=(8, 0))
+
+        activity = ttk.LabelFrame(self, text="Activity", padding=8)
+        activity.grid(row=6, column=0, sticky="nsew")
+        activity.rowconfigure(0, weight=1)
+        activity.columnconfigure(0, weight=1)
+        self.txt = tk.Text(activity, height=16, wrap="word")
+        self.txt.grid(row=0, column=0, sticky="nsew")
+        log_scrollbar = ttk.Scrollbar(activity, orient="vertical", command=self.txt.yview)
+        log_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.txt.configure(yscrollcommand=log_scrollbar.set)
+
+    def _toggle_advanced_settings(self):
+        self._advanced_expanded = not self._advanced_expanded
+        if self._advanced_expanded:
+            self.advanced_content.grid()
+            self.btn_advanced.configure(text="Advanced Settings  ▾")
+        else:
+            self.advanced_content.grid_remove()
+            self.btn_advanced.configure(text="Advanced Settings  ▸")
+
+    def _set_runtime_state(self, status: str):
+        styles = {
+            "Ready": "secondary",
+            "Running": "info",
+            "Cancelling": "warning",
+            "Cancelled": "secondary",
+            "Complete": "success",
+            "Failed": "danger",
+        }
+        self.lbl_status.configure(text=status, bootstyle=styles[status])
+        if status == "Running":
+            self.btn_start.configure(state="disabled")
+            self.btn_cancel.configure(state="normal")
+            self.progress.start(12)
+        elif status == "Cancelling":
+            self.btn_start.configure(state="disabled")
+            self.btn_cancel.configure(state="disabled")
+        else:
+            self.btn_start.configure(state="normal")
+            self.btn_cancel.configure(state="disabled")
+            self.progress.stop()
 
     def log(self, s: str):
         self.txt.insert("end", s.rstrip() + "\n")
         self.txt.see("end")
 
     def _update_title_with_conf_path(self):
-        self.master.title(f"AudioTranscript Studio - GPU Control Panel {APP_VER} (build {app_build_id()}) | conf: {conf_path()}")
-        self.lbl_conf.configure(text=str(conf_path()))
+        self.master.title("AudioTranscript Studio")
+        self.lbl_conf.configure(text="Configuration: conf.yaml")
 
     def _load_conf_to_ui(self):
         cfg = read_yaml(conf_path())
@@ -1430,14 +1592,16 @@ class App(ttk.Frame):
         self.var_output.set(cfg.get("output_format", self.var_output.get()))
         self.var_srt.set(bool(cfg.get("srt", self.var_srt.get())))
         self.var_txt.set(bool(cfg.get("txt", self.var_txt.get())))
-        self.var_compute.set(cfg.get("compute_type", self.var_compute.get()))
-        self.var_tf32.set(cfg.get("tf32", self.var_tf32.get()))
+        self.var_compute.set("float16")
+        self.var_tf32.set("off")
         self.var_pad.set(float(cfg.get("padding_seconds", self.var_pad.get())))
         self.var_hf.set(cfg.get("hf_token", self.var_hf.get()))
         self.var_player.set(cfg.get("video_player_path", self.var_player.get()))
         self.var_workers.set(int(cfg.get("parallel_workers", self.var_workers.get()))) # <--- LOAD
 
     def _collect_ui_to_conf(self) -> dict:
+        self.var_compute.set("float16")
+        self.var_tf32.set("off")
         ofmt = self.var_output.get()
         srt = self.var_srt.get() if ofmt in ("both","srt") else False
         txt = self.var_txt.get() if ofmt in ("both","txt") else False
@@ -1455,15 +1619,15 @@ class App(ttk.Frame):
             "txt_speaker_tags": bool(self.var_tags.get()),
             "one_folder": bool(self.var_onefolder.get()),
             "output_format": ofmt, "srt": bool(srt), "txt": bool(txt),
-            "compute_type": self.var_compute.get().strip(),
-            "tf32": self.var_tf32.get().strip(),
+            "compute_type": "float16",
+            "tf32": "off",
             "padding_seconds": float(self.var_pad.get()),
             "hf_token": self.var_hf.get().strip(),
         }
 
     def on_save(self):
-        cfg = self._collect_ui_to_conf()
         try:
+            cfg = merge_gui_conf(read_yaml(conf_path()), self._collect_ui_to_conf())
             atomic_write_yaml(conf_path(), cfg)
             self.log(f"Saved {conf_path()}")
         except Exception as e:
@@ -1475,9 +1639,7 @@ class App(ttk.Frame):
         model = self.var_model.get().strip()
         self.log(f"[cfg] Model set to: {model}")
         try:
-            cfg = read_yaml(conf_path())
-            cfg = cfg or {}
-            cfg["model"] = model
+            cfg = merge_gui_conf(read_yaml(conf_path()), {"model": model})
             atomic_write_yaml(conf_path(), cfg)
         except Exception:
             pass
@@ -1500,6 +1662,8 @@ class App(ttk.Frame):
 
     def on_stop(self):
         if self.proc and self.proc.poll() is None:
+            self.cancel_requested = True
+            self._set_runtime_state("Cancelling")
             self.log("[stop] Terminating process...")
             # On Windows, terminate() is usually enough, but sometimes we need stronger measures
             try:
@@ -1519,8 +1683,49 @@ class App(ttk.Frame):
         else:
             self.log("[stop] No active process to stop.")
 
+    def _effective_input_files(self):
+        return discover_sources(self.input_files or None)
+
+    def _validate_slice_video_inputs(self):
+        if not self.var_slice_video.get():
+            return True
+
+        effective_inputs = self._effective_input_files()
+        if not effective_inputs:
+            return True
+
+        video_inputs = [p for p in effective_inputs if p.suffix.lower() in _PIPELINE_VIDEO_EXTS]
+        audio_inputs = [p for p in effective_inputs if p.suffix.lower() in _PIPELINE_AUDIO_EXTS]
+
+        if audio_inputs and len(audio_inputs) == len(effective_inputs):
+            self._set_runtime_state("Ready")
+            self.log("[validation] Slice video requires a video input; all effective inputs are audio-only.")
+            messagebox.showwarning(
+                "Slice video requires video",
+                "Slice video requires a video file. The current input contains audio only. "
+                "Select an MP4 or other supported video, or turn off Slice video.",
+            )
+            return False
+
+        if audio_inputs and video_inputs:
+            proceed = messagebox.askyesno(
+                "Mixed audio and video inputs",
+                "Some inputs contain audio only and cannot produce video clips. Video clips will be "
+                "created only for the supported video files.\n\nContinue processing all files?",
+            )
+            if not proceed:
+                self._set_runtime_state("Ready")
+                self.log("[validation] Run cancelled; audio-only inputs cannot produce video clips.")
+                return False
+            self.log("[validation] Continuing with mixed inputs; audio-only files will not produce video clips.")
+
+        return True
+
     def on_run(self):
+        self.cancel_requested = False
         self.on_save()
+        if not self._validate_slice_video_inputs():
+            return
         model = self.var_model.get().strip()
         workers = self.var_workers.get()
         try:
@@ -1546,8 +1751,16 @@ class App(ttk.Frame):
             self.proc = subprocess.Popen(cmd, cwd=str(program_root()),
                                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         except FileNotFoundError:
+            self.proc = None
+            self._set_runtime_state("Failed")
             messagebox.showerror("Run failed", "split_audio.py not found in program folder.")
             return
+        except OSError as e:
+            self.proc = None
+            self._set_runtime_state("Failed")
+            messagebox.showerror("Run failed", str(e))
+            return
+        self._set_runtime_state("Running")
         threading.Thread(target=self._reader, daemon=True).start()
 
     def _resolve_path(self, path_str: str) -> Path:
@@ -1555,25 +1768,70 @@ class App(ttk.Frame):
         return p if p.is_absolute() else (program_root() / p)
 
     def _reader(self):
-        if self.proc and self.proc.stdout:
-            for line in self.proc.stdout:
-                msg = line.rstrip()
-                self.log(msg)
-                if msg.startswith("[speakers-json]"):
+        proc = self.proc
+        returncode = None
+        reader_failed = False
+        try:
+            if proc and proc.stdout:
+                for line in proc.stdout:
+                    msg = line.rstrip()
+                    self.queue.put(("log", msg))
+                    if msg.startswith("[speakers-json]"):
+                        try:
+                            path_str = msg.split("]", 1)[1].strip()
+                            spk_path = self._resolve_path(path_str)
+                            seg_path = spk_path.parent / "segments.json"
+                            if spk_path.exists() and seg_path.exists():
+                                self.queue.put(("speakers", spk_path, seg_path))
+                        except Exception:
+                            pass
+            elif proc is None:
+                raise RuntimeError("No active process is available to read.")
+        except Exception as e:
+            reader_failed = True
+            self.queue.put(("log", f"[reader error] Unexpected process output error: {e}"))
+        finally:
+            if proc and proc.stdout:
+                try:
+                    proc.stdout.close()
+                except Exception as e:
+                    reader_failed = True
+                    self.queue.put(("log", f"[reader error] Could not close process output: {e}"))
+            if proc:
+                try:
+                    returncode = proc.wait()
+                except Exception as e:
+                    reader_failed = True
+                    self.queue.put(("log", f"[reader error] Could not wait for process completion: {e}"))
                     try:
-                        path_str = msg.split("]", 1)[1].strip()
-                        spk_path = self._resolve_path(path_str)
-                        seg_path = spk_path.parent / "segments.json"
-                        if spk_path.exists() and seg_path.exists():
-                            self.after(0, lambda p=spk_path, s=seg_path: NamingDialog(self.master, p, s))
+                        returncode = proc.poll()
                     except Exception:
-                        pass
-        self.log("[process finished]")
+                        returncode = None
+            if returncode is None or (reader_failed and returncode == 0):
+                returncode = 1
+            self.queue.put(("log", "[process finished]"))
+            self.queue.put(("process_finished", returncode))
 
     def _poll_queue(self):
         try:
             while True:
-                self.log(self.queue.get_nowait().rstrip())
+                event = self.queue.get_nowait()
+                if isinstance(event, tuple):
+                    kind = event[0]
+                    if kind == "log":
+                        self.log(event[1])
+                    elif kind == "speakers":
+                        NamingDialog(self.master, event[1], event[2])
+                    elif kind == "process_finished":
+                        self.proc = None
+                        if self.cancel_requested:
+                            self._set_runtime_state("Cancelled")
+                        elif event[1] == 0:
+                            self._set_runtime_state("Complete")
+                        else:
+                            self._set_runtime_state("Failed")
+                else:
+                    self.log(str(event).rstrip())
         except queue.Empty:
             pass
         self.after(200, self._poll_queue)
@@ -1623,6 +1881,8 @@ class App(ttk.Frame):
             except Exception as e:
                 errors.append(f"{path}: {e}")
         for child in out.iterdir():
+            if child.name == ".gitkeep":
+                continue
             try:
                 if child.is_dir():
                     shutil.rmtree(child, onerror=make_writable_then_retry)
@@ -1700,14 +1960,10 @@ class App(ttk.Frame):
         NamingDialog(self.master, latest / "speakers.json", latest / "segments.json")
 
 def main():
-    root = tk.Tk()
-    try:
-        ttk.Style().theme_use("clam")
-    except Exception:
-        pass
+    root = tb.Window(themename="litera")
     app = App(root)
     root.geometry("1140x620")
-    root.title(f"AudioTranscript Studio - GPU Control Panel {APP_VER} (build {app_build_id()}) | conf: {conf_path()}")
+    root.title("AudioTranscript Studio")
     root.mainloop()
 
 if __name__ == "__main__":
