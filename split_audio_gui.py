@@ -4,6 +4,7 @@ import ttkbootstrap as tb
 from tkinter import ttk, messagebox, filedialog
 from pathlib import Path
 from collections import Counter
+from split_audio import AUDIO_EXTS as _PIPELINE_AUDIO_EXTS, VIDEO_EXTS as _PIPELINE_VIDEO_EXTS, discover_sources
 
 # === word-level exporters (VTT, ASS, and HTML player) ========================
 def _has_word_level(segments):
@@ -1525,7 +1526,7 @@ class App(ttk.Frame):
         ttk.Button(utilities, text="Clear log", command=self.clear_log).grid(row=0, column=2, sticky="w", padx=(8, 0))
         ttk.Button(utilities, text="About", command=self.on_about).grid(row=0, column=3, sticky="w", padx=(8, 0))
         ttk.Button(utilities, text="Name speakers…", command=self.on_name_speakers).grid(row=0, column=4, sticky="w", padx=(8, 0))
-        self.lbl_conf = ttk.Label(utilities, text=str(conf_path()), foreground="#666")
+        self.lbl_conf = ttk.Label(utilities, text="Configuration: conf.yaml", foreground="#666")
         self.lbl_conf.grid(row=1, column=0, columnspan=5, sticky="w", pady=(8, 0))
 
         activity = ttk.LabelFrame(self, text="Activity", padding=8)
@@ -1574,8 +1575,8 @@ class App(ttk.Frame):
         self.txt.see("end")
 
     def _update_title_with_conf_path(self):
-        self.master.title(f"AudioTranscript Studio - GPU Control Panel {APP_VER} (build {app_build_id()}) | conf: {conf_path()}")
-        self.lbl_conf.configure(text=str(conf_path()))
+        self.master.title("AudioTranscript Studio")
+        self.lbl_conf.configure(text="Configuration: conf.yaml")
 
     def _load_conf_to_ui(self):
         cfg = read_yaml(conf_path())
@@ -1682,9 +1683,49 @@ class App(ttk.Frame):
         else:
             self.log("[stop] No active process to stop.")
 
+    def _effective_input_files(self):
+        return discover_sources(self.input_files or None)
+
+    def _validate_slice_video_inputs(self):
+        if not self.var_slice_video.get():
+            return True
+
+        effective_inputs = self._effective_input_files()
+        if not effective_inputs:
+            return True
+
+        video_inputs = [p for p in effective_inputs if p.suffix.lower() in _PIPELINE_VIDEO_EXTS]
+        audio_inputs = [p for p in effective_inputs if p.suffix.lower() in _PIPELINE_AUDIO_EXTS]
+
+        if audio_inputs and len(audio_inputs) == len(effective_inputs):
+            self._set_runtime_state("Ready")
+            self.log("[validation] Slice video requires a video input; all effective inputs are audio-only.")
+            messagebox.showwarning(
+                "Slice video requires video",
+                "Slice video requires a video file. The current input contains audio only. "
+                "Select an MP4 or other supported video, or turn off Slice video.",
+            )
+            return False
+
+        if audio_inputs and video_inputs:
+            proceed = messagebox.askyesno(
+                "Mixed audio and video inputs",
+                "Some inputs contain audio only and cannot produce video clips. Video clips will be "
+                "created only for the supported video files.\n\nContinue processing all files?",
+            )
+            if not proceed:
+                self._set_runtime_state("Ready")
+                self.log("[validation] Run cancelled; audio-only inputs cannot produce video clips.")
+                return False
+            self.log("[validation] Continuing with mixed inputs; audio-only files will not produce video clips.")
+
+        return True
+
     def on_run(self):
         self.cancel_requested = False
         self.on_save()
+        if not self._validate_slice_video_inputs():
+            return
         model = self.var_model.get().strip()
         workers = self.var_workers.get()
         try:
@@ -1922,7 +1963,7 @@ def main():
     root = tb.Window(themename="litera")
     app = App(root)
     root.geometry("1140x620")
-    root.title(f"AudioTranscript Studio - GPU Control Panel {APP_VER} (build {app_build_id()}) | conf: {conf_path()}")
+    root.title("AudioTranscript Studio")
     root.mainloop()
 
 if __name__ == "__main__":
