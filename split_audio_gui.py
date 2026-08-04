@@ -815,7 +815,28 @@ class _SrtHitsDialog(tk.Toplevel):
         frame.grid(row=0, column=0, sticky="nsew")
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
-        self.tree = ttk.Treeview(frame, columns=("time","text"), show="headings", selectmode="browse", height=12)
+        tree_style_name = "SrtMatches.Treeview"
+        tree_style = tb.Style.get_instance() or tb.Style()
+        colors = tree_style.colors
+        tree_style.configure(
+            tree_style_name,
+            background=colors.inputbg,
+            foreground=colors.inputfg,
+            fieldbackground=colors.inputbg,
+        )
+        tree_style.map(
+            tree_style_name,
+            background=[("selected", colors.primary)],
+            foreground=[("selected", colors.get_foreground("primary"))],
+        )
+        self.tree = ttk.Treeview(
+            frame,
+            columns=("time","text"),
+            show="headings",
+            selectmode="browse",
+            height=12,
+            style=tree_style_name,
+        )
         self.tree.heading("time", text="Start")
         self.tree.heading("text", text="Caption")
         self.tree.column("time", width=110, anchor="w")
@@ -829,11 +850,17 @@ class _SrtHitsDialog(tk.Toplevel):
             if len(txt) > 160:
                 txt = txt[:157] + "…"
             self.tree.insert("", "end", iid=str(i), values=(_fmt_time_hhmmss(h.get("start")), txt))
+        first_item = self.tree.get_children()
+        if first_item:
+            self.tree.selection_set(first_item[0])
+            self.tree.focus(first_item[0])
+            self.tree.see(first_item[0])
         btns = ttk.Frame(frame)
         btns.grid(row=1, column=0, columnspan=2, sticky="e", pady=(8,0))
         self.btn_open = ttk.Button(btns, text="Open at time", command=self._on_open)
         self.btn_open.pack(side="right", padx=(0,8))
         ttk.Button(btns, text="Cancel", command=self._on_cancel).pack(side="right")
+        self.tree.bind("<ButtonRelease-1>", self._select_clicked_row, add="+")
         self.tree.bind("<Double-1>", lambda e: self._on_open())
         self.bind("<Return>", lambda e: self._on_open())
         self.bind("<Escape>", lambda e: self._on_cancel())
@@ -844,6 +871,13 @@ class _SrtHitsDialog(tk.Toplevel):
         self.after(50, lambda: self.attributes("-topmost", False))
         self.grab_set()
         self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+        self.after_idle(self.tree.focus_set)
+
+    def _select_clicked_row(self, event):
+        item = self.tree.identify_row(event.y)
+        if item:
+            self.tree.selection_set(item)
+            self.tree.focus(item)
 
     def _on_open(self):
         sel = self.tree.selection()
@@ -859,7 +893,8 @@ class NamingDialog(tk.Toplevel):
     def __init__(self, master, speakers_json: Path, segments_json: Path):
         super().__init__(master)
         self.title("Name Speakers")
-        self.geometry("980x600")
+        self.geometry("1180x700")
+        self.minsize(960, 600)
         self.resizable(True, True)
         self.speakers_json = speakers_json
         self.segments_json = segments_json
@@ -878,27 +913,51 @@ class NamingDialog(tk.Toplevel):
             c = Counter(_extract_candidates_from_text(" ".join(str(s.get("text","")) for s in self.segments if (s.get("speaker") == spk))))
             c.update(addressed_counts.get(spk, Counter()))
             per_spk_counts[spk] = c
-        main = ttk.Frame(self, padding=8)
+        main = ttk.Frame(self, padding=14)
         main.pack(fill="both", expand=True)
-        ttk.Label(main, text=f"File: {self.title_name}").pack(anchor="w")
-        ttk.Label(main, text="Pick a suggested name or type a custom one for each speaker:").pack(anchor="w", pady=(2,8))
+        main.columnconfigure(0, weight=1)
+        main.rowconfigure(2, weight=1)
+        ttk.Label(main, text="Name Speakers", font=("Segoe UI", 16, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Label(main, text=f"{self.title_name} — assign names and review the transcript").grid(row=1, column=0, sticky="w", pady=(2, 10))
         paned = ttk.PanedWindow(main, orient="horizontal")
-        paned.pack(fill="both", expand=True)
-        left = ttk.Frame(paned, padding=(0,0,8,0))
-        right = ttk.Frame(paned, padding=0)
-        paned.add(left, weight=1)
-        paned.add(right, weight=2)
+        paned.grid(row=2, column=0, sticky="nsew")
+        left = ttk.Frame(paned, padding=(0, 0, 6, 0))
+        right = ttk.Frame(paned, padding=(6, 0, 0, 0))
+        paned.add(left, weight=2)
+        paned.add(right, weight=3)
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(0, weight=1, minsize=150)
+        left.rowconfigure(1, weight=1, minsize=125)
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(1, weight=1)
         self.inputs = {}
         self.selected_speaker = tk.StringVar(value=self.speakers[0] if self.speakers else "")
 
-        grid = ttk.Frame(left)
-        grid.pack(fill="x", expand=False, pady=(0,6))
+        assignments = ttk.LabelFrame(left, text="Speaker Assignments", padding=8)
+        assignments.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
+        assignments.columnconfigure(0, weight=1)
+        assignments.rowconfigure(1, weight=1)
+
+        assignment_headings = ttk.Frame(assignments)
+        assignment_headings.grid(row=0, column=0, sticky="ew", padx=(2, 18), pady=(0, 4))
+        assignment_headings.columnconfigure(2, weight=1)
+        ttk.Label(assignment_headings, text="Speaker", font=("Segoe UI", 9, "bold")).grid(row=0, column=1, sticky="w", padx=(0, 8))
+        ttk.Label(assignment_headings, text="Assigned name", font=("Segoe UI", 9, "bold")).grid(row=0, column=2, sticky="w")
+
+        speaker_canvas = tk.Canvas(assignments, height=155, highlightthickness=0, borderwidth=0)
+        speaker_scroll = ttk.Scrollbar(assignments, orient="vertical", command=speaker_canvas.yview)
+        speaker_canvas.configure(yscrollcommand=speaker_scroll.set)
+        speaker_canvas.grid(row=1, column=0, sticky="nsew")
+        speaker_scroll.grid(row=1, column=1, sticky="ns")
+
+        grid = ttk.Frame(speaker_canvas, padding=(2, 0, 4, 0))
+        speaker_window = speaker_canvas.create_window((0, 0), window=grid, anchor="nw")
 
         for r, spk in enumerate(self.speakers):
             rb = ttk.Radiobutton(grid, variable=self.selected_speaker, value=spk)
-            rb.grid(row=r, column=0, sticky="w", pady=3)
+            rb.grid(row=r, column=0, sticky="w", pady=4)
 
-            ttk.Label(grid, text=spk, width=16).grid(row=r, column=1, sticky="e", padx=(0,6), pady=3)
+            ttk.Label(grid, text=spk, width=16).grid(row=r, column=1, sticky="w", padx=(0, 8), pady=4)
 
             # Keep this as an editable combobox so the user can still type any name manually.
             # The dropdown values are hints only. We do not auto-fill weak guesses anymore.
@@ -908,8 +967,8 @@ class NamingDialog(tk.Toplevel):
             if saved and saved not in suggestions:
                 suggestions = [saved] + suggestions
 
-            cb = ttk.Combobox(grid, values=suggestions, width=40, state="normal")
-            cb.grid(row=r, column=2, sticky="we", pady=3)
+            cb = ttk.Combobox(grid, values=suggestions, width=30, state="normal")
+            cb.grid(row=r, column=2, sticky="ew", pady=4)
 
             cb.bind("<FocusIn>", lambda e, spk=spk: self.selected_speaker.set(spk))
             cb.bind("<Button-1>", lambda e, spk=spk: self.selected_speaker.set(spk))
@@ -920,10 +979,15 @@ class NamingDialog(tk.Toplevel):
             self.inputs[spk] = cb
 
         grid.columnconfigure(2, weight=1)
+        grid.bind("<Configure>", lambda event: speaker_canvas.configure(scrollregion=speaker_canvas.bbox("all")))
+        speaker_canvas.bind("<Configure>", lambda event: speaker_canvas.itemconfigure(speaker_window, width=event.width))
+
         # Candidate name pool: names/entities found in the transcript.
         # These are NOT automatically assigned. The user assigns them manually.
-        pool_frame = ttk.LabelFrame(left, text="Candidate name pool")
-        pool_frame.pack(fill="both", expand=False, pady=(8,0))
+        pool_frame = ttk.LabelFrame(left, text="Candidate Name Pool", padding=8)
+        pool_frame.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
+        pool_frame.columnconfigure(0, weight=1)
+        pool_frame.rowconfigure(0, weight=1)
 
         pool_names = _best_names_list(
             global_counts,
@@ -933,14 +997,16 @@ class NamingDialog(tk.Toplevel):
         )
 
         pool_inner = ttk.Frame(pool_frame)
-        pool_inner.pack(fill="both", expand=True, padx=6, pady=6)
+        pool_inner.grid(row=0, column=0, sticky="nsew")
+        pool_inner.columnconfigure(0, weight=1)
+        pool_inner.rowconfigure(0, weight=1)
 
-        self.name_pool = tk.Listbox(pool_inner, height=8, exportselection=False)
+        self.name_pool = tk.Listbox(pool_inner, height=6, exportselection=False)
         pool_scroll = ttk.Scrollbar(pool_inner, orient="vertical", command=self.name_pool.yview)
         self.name_pool.configure(yscrollcommand=pool_scroll.set)
 
-        self.name_pool.pack(side="left", fill="both", expand=True)
-        pool_scroll.pack(side="right", fill="y")
+        self.name_pool.grid(row=0, column=0, sticky="nsew")
+        pool_scroll.grid(row=0, column=1, sticky="ns")
 
         for nm in pool_names:
             self.name_pool.insert("end", nm)
@@ -976,19 +1042,21 @@ class NamingDialog(tk.Toplevel):
         self.name_pool.bind("<Double-1>", assign_selected_name)
 
         pool_btns = ttk.Frame(pool_frame)
-        pool_btns.pack(fill="x", padx=6, pady=(0,6))
-        ttk.Button(pool_btns, text="Assign to selected speaker", command=assign_selected_name).pack(side="left")
-        ttk.Button(pool_btns, text="Clear selected speaker", command=clear_selected_speaker).pack(side="left", padx=(6,0))
-        ttk.Button(pool_btns, text="Add typed name to pool", command=add_typed_name_to_pool).pack(side="left", padx=(6,0))
+        pool_btns.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        pool_btns.columnconfigure(0, weight=1)
+        pool_btns.columnconfigure(1, weight=1)
+        tb.Button(pool_btns, text="Assign to selected speaker", command=assign_selected_name, bootstyle="primary-outline").grid(row=0, column=0, columnspan=2, sticky="ew")
+        ttk.Button(pool_btns, text="Clear selected speaker", command=clear_selected_speaker).grid(row=1, column=0, sticky="ew", pady=(6, 0), padx=(0, 3))
+        ttk.Button(pool_btns, text="Add typed name to pool", command=add_typed_name_to_pool).grid(row=1, column=1, sticky="ew", pady=(6, 0), padx=(3, 0))
 
-        opts = ttk.Frame(left)
-        opts.pack(fill="x", pady=(8,0))
+        opts = ttk.LabelFrame(left, text="Output Options", padding=8)
+        opts.grid(row=2, column=0, sticky="ew", pady=(0, 8))
         self.var_overwrite = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opts, text="Overwrite existing SRT/TXT (recommended)", variable=self.var_overwrite).pack(anchor="w")
+        ttk.Checkbutton(opts, text="Overwrite existing SRT/TXT (recommended)", variable=self.var_overwrite).grid(row=0, column=0, sticky="w")
         self.var_rename_audio = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opts, text="Rename folders and .wav files with names", variable=self.var_rename_audio).pack(anchor="w")
+        ttk.Checkbutton(opts, text="Rename folders and .wav files with names", variable=self.var_rename_audio).grid(row=1, column=0, sticky="w", pady=(2, 0))
         self.var_autofill2 = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opts, text="Prefill first two speakers by earliest appearance", variable=self.var_autofill2).pack(anchor="w")
+        ttk.Checkbutton(opts, text="Prefill first two speakers by earliest appearance", variable=self.var_autofill2).grid(row=2, column=0, sticky="w", pady=(2, 0))
         try:
             _cfg = read_yaml(conf_path())
         except:
@@ -998,36 +1066,46 @@ class NamingDialog(tk.Toplevel):
         self.var_export_html = tk.BooleanVar(value=bool(_cfg.get("export_word_html", False)))
         self.var_export_lrc  = tk.BooleanVar(value=bool(_cfg.get("export_word_lrc", False)))
         self.var_export_ass_plain = tk.BooleanVar(value=bool(_cfg.get("export_ass_plain", False)))
-        ttk.Label(opts, text="Word-level exports:").pack(anchor="w", pady=(6,0))
-        ttk.Checkbutton(opts, text="Word-level VTT", variable=self.var_export_vtt).pack(anchor="w")
-        ttk.Checkbutton(opts, text="Word-level ASS (VLC)", variable=self.var_export_ass).pack(anchor="w")
-        ttk.Checkbutton(opts, text="Write HTML word player", variable=self.var_export_html).pack(anchor="w")
-        ttk.Checkbutton(opts, text="Word-level LRC (CapCut)", variable=self.var_export_lrc).pack(anchor="w")
-        ttk.Checkbutton(opts, text="ASS (plain, no karaoke)", variable=self.var_export_ass_plain).pack(anchor="w")
+        ttk.Label(opts, text="Word-level exports", font=("Segoe UI", 9, "bold")).grid(row=3, column=0, sticky="w", pady=(8, 2))
+        ttk.Checkbutton(opts, text="Word-level VTT", variable=self.var_export_vtt).grid(row=4, column=0, sticky="w")
+        ttk.Checkbutton(opts, text="Word-level ASS (VLC)", variable=self.var_export_ass).grid(row=5, column=0, sticky="w", pady=(2, 0))
+        ttk.Checkbutton(opts, text="Write HTML word player", variable=self.var_export_html).grid(row=6, column=0, sticky="w", pady=(2, 0))
+        ttk.Checkbutton(opts, text="Word-level LRC (CapCut)", variable=self.var_export_lrc).grid(row=7, column=0, sticky="w", pady=(2, 0))
+        ttk.Checkbutton(opts, text="ASS (plain, no karaoke)", variable=self.var_export_ass_plain).grid(row=8, column=0, sticky="w", pady=(2, 0))
+
         btns = ttk.Frame(left)
-        btns.pack(fill="x", pady=(8,0))
-        ttk.Button(btns, text="Apply", command=self.on_apply).pack(side="right")
-        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right", padx=6)
-        viewer = ttk.Frame(right)
-        viewer.pack(fill="both", expand=True)
-        toolbar = ttk.Frame(viewer)
-        toolbar.pack(fill="x", pady=(0,4))
-        ttk.Label(toolbar, text="Find:").pack(side="left")
+        btns.grid(row=3, column=0, sticky="ew")
+        tb.Button(btns, text="Apply", command=self.on_apply, bootstyle="success", padding=(16, 6)).pack(side="right")
+        tb.Button(btns, text="Cancel", command=self.destroy, bootstyle="secondary-outline", padding=(14, 6)).pack(side="right", padx=(0, 8))
+
+        toolbar = ttk.LabelFrame(right, text="Search", padding=10)
+        toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        toolbar.columnconfigure(4, weight=1)
+        ttk.Label(toolbar, text="Find text").grid(row=0, column=0, sticky="w", padx=(0, 6))
         self.find_var = tk.StringVar(value="SPEAKER_00")
         find_entry = ttk.Entry(toolbar, textvariable=self.find_var, width=24)
-        find_entry.pack(side="left", padx=(4,6))
+        find_entry.grid(row=0, column=1, sticky="w", padx=(0, 14))
+        ttk.Label(toolbar, text="Speaker filter").grid(row=0, column=2, sticky="w", padx=(0, 6))
         self.find_speaker_var = tk.StringVar(value=self.speakers[0] if self.speakers else "")
         find_spk = ttk.Combobox(toolbar, textvariable=self.find_speaker_var, values=self.speakers, width=14, state="readonly")
-        find_spk.pack(side="left", padx=(0,6))
-        ttk.Button(toolbar, text="Find next", command=self.find_next).pack(side="left")
-        ttk.Button(toolbar, text="Find speaker tag", command=self.find_speaker_tag).pack(side="left", padx=(6,0))
-        ttk.Button(toolbar, text="Open video at hit", command=self.open_video_at_query).pack(side="left", padx=(6,0))
-        ttk.Button(toolbar, text="Open externally", command=self.open_txt_external).pack(side="right")
+        find_spk.grid(row=0, column=3, sticky="w")
+
+        search_actions = ttk.Frame(toolbar)
+        search_actions.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(8, 0))
+        tb.Button(search_actions, text="Find next", command=self.find_next, bootstyle="primary-outline").pack(side="left")
+        ttk.Button(search_actions, text="Find speaker tag", command=self.find_speaker_tag).pack(side="left", padx=(6, 0))
+        ttk.Button(search_actions, text="Open video at hit", command=self.open_video_at_query).pack(side="left", padx=(6, 0))
+        ttk.Button(search_actions, text="Open externally", command=self.open_txt_external).pack(side="left", padx=(6, 0))
+
+        viewer = ttk.LabelFrame(right, text="Transcript Preview", padding=8)
+        viewer.grid(row=1, column=0, sticky="nsew")
+        viewer.columnconfigure(0, weight=1)
+        viewer.rowconfigure(0, weight=1)
         self.text = tk.Text(viewer, wrap="word")
         yscroll = ttk.Scrollbar(viewer, orient="vertical", command=self.text.yview)
         self.text.configure(yscrollcommand=yscroll.set)
-        self.text.pack(side="left", fill="both", expand=True)
-        yscroll.pack(side="right", fill="y")
+        self.text.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
         self.txt_path, txt_content = self._load_transcript()
         self.text.insert("1.0", txt_content)
         self.text.edit_reset()
