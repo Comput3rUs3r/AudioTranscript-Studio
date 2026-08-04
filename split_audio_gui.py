@@ -1334,6 +1334,7 @@ class App(ttk.Frame):
         self.master.rowconfigure(0, weight=1)
         self.master.columnconfigure(0, weight=1)
         self.proc = None
+        self.cancel_requested = False
         self.queue = queue.Queue()
         self.input_files = []
         self.var_model = tk.StringVar(value=_DEFAULTS["model"])
@@ -1396,8 +1397,13 @@ class App(ttk.Frame):
 
         actions = ttk.Frame(self, padding=(0, 2, 0, 10))
         actions.grid(row=3, column=0, sticky="ew")
-        tb.Button(actions, text="Start Transcription", command=self.on_run, bootstyle="success", padding=(20, 8)).pack(side="left")
-        tb.Button(actions, text="Cancel", command=self.on_stop, bootstyle="danger-outline", padding=(16, 8)).pack(side="left", padx=(8, 0))
+        self.btn_start = tb.Button(actions, text="Start Transcription", command=self.on_run, bootstyle="success", padding=(20, 8))
+        self.btn_start.pack(side="left")
+        self.btn_cancel = tb.Button(actions, text="Cancel", command=self.on_stop, bootstyle="danger-outline", padding=(16, 8))
+        self.btn_cancel.pack(side="left", padx=(8, 0))
+        self.progress = tb.Progressbar(actions, mode="indeterminate", length=180, bootstyle="info-striped")
+        self.progress.pack(side="left", padx=(14, 0))
+        self._set_runtime_state("Ready")
 
         advanced = ttk.Frame(self)
         advanced.grid(row=4, column=0, sticky="ew", pady=(0, 8))
@@ -1462,6 +1468,28 @@ class App(ttk.Frame):
         else:
             self.advanced_content.grid_remove()
             self.btn_advanced.configure(text="Advanced Settings  ▸")
+
+    def _set_runtime_state(self, status: str):
+        styles = {
+            "Ready": "secondary",
+            "Running": "info",
+            "Cancelling": "warning",
+            "Cancelled": "secondary",
+            "Complete": "success",
+            "Failed": "danger",
+        }
+        self.lbl_status.configure(text=status, bootstyle=styles[status])
+        if status == "Running":
+            self.btn_start.configure(state="disabled")
+            self.btn_cancel.configure(state="normal")
+            self.progress.start(12)
+        elif status == "Cancelling":
+            self.btn_start.configure(state="disabled")
+            self.btn_cancel.configure(state="disabled")
+        else:
+            self.btn_start.configure(state="normal")
+            self.btn_cancel.configure(state="disabled")
+            self.progress.stop()
 
     def log(self, s: str):
         self.txt.insert("end", s.rstrip() + "\n")
@@ -1555,6 +1583,8 @@ class App(ttk.Frame):
 
     def on_stop(self):
         if self.proc and self.proc.poll() is None:
+            self.cancel_requested = True
+            self._set_runtime_state("Cancelling")
             self.log("[stop] Terminating process...")
             # On Windows, terminate() is usually enough, but sometimes we need stronger measures
             try:
@@ -1575,6 +1605,7 @@ class App(ttk.Frame):
             self.log("[stop] No active process to stop.")
 
     def on_run(self):
+        self.cancel_requested = False
         self.on_save()
         model = self.var_model.get().strip()
         workers = self.var_workers.get()
@@ -1601,8 +1632,16 @@ class App(ttk.Frame):
             self.proc = subprocess.Popen(cmd, cwd=str(program_root()),
                                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         except FileNotFoundError:
+            self.proc = None
+            self._set_runtime_state("Failed")
             messagebox.showerror("Run failed", "split_audio.py not found in program folder.")
             return
+        except OSError as e:
+            self.proc = None
+            self._set_runtime_state("Failed")
+            messagebox.showerror("Run failed", str(e))
+            return
+        self._set_runtime_state("Running")
         threading.Thread(target=self._reader, daemon=True).start()
 
     def _resolve_path(self, path_str: str) -> Path:
@@ -1610,25 +1649,44 @@ class App(ttk.Frame):
         return p if p.is_absolute() else (program_root() / p)
 
     def _reader(self):
-        if self.proc and self.proc.stdout:
-            for line in self.proc.stdout:
+        proc = self.proc
+        if proc and proc.stdout:
+            for line in proc.stdout:
                 msg = line.rstrip()
-                self.log(msg)
+                self.queue.put(("log", msg))
                 if msg.startswith("[speakers-json]"):
                     try:
                         path_str = msg.split("]", 1)[1].strip()
                         spk_path = self._resolve_path(path_str)
                         seg_path = spk_path.parent / "segments.json"
                         if spk_path.exists() and seg_path.exists():
-                            self.after(0, lambda p=spk_path, s=seg_path: NamingDialog(self.master, p, s))
+                            self.queue.put(("speakers", spk_path, seg_path))
                     except Exception:
                         pass
-        self.log("[process finished]")
+        returncode = proc.wait() if proc else 1
+        self.queue.put(("log", "[process finished]"))
+        self.queue.put(("process_finished", returncode))
 
     def _poll_queue(self):
         try:
             while True:
-                self.log(self.queue.get_nowait().rstrip())
+                event = self.queue.get_nowait()
+                if isinstance(event, tuple):
+                    kind = event[0]
+                    if kind == "log":
+                        self.log(event[1])
+                    elif kind == "speakers":
+                        NamingDialog(self.master, event[1], event[2])
+                    elif kind == "process_finished":
+                        self.proc = None
+                        if self.cancel_requested:
+                            self._set_runtime_state("Cancelled")
+                        elif event[1] == 0:
+                            self._set_runtime_state("Complete")
+                        else:
+                            self._set_runtime_state("Failed")
+                else:
+                    self.log(str(event).rstrip())
         except queue.Empty:
             pass
         self.after(200, self._poll_queue)
