@@ -1,6 +1,7 @@
 git+https://github.com/m-bain/whisperx.git
 
 ttkbootstrap==2.1.1
+python-vlc==3.0.21203
 torch
 torchvision
 torchaudio

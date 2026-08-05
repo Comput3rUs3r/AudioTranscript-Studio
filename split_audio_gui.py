@@ -278,6 +278,123 @@ def find_segments_matching_query(segments, query: str):
 
 _VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".avi", ".m4v")
 
+_EMBEDDED_VLC_CHECKED = False
+_EMBEDDED_VLC_INSTANCE = None
+_EMBEDDED_VLC_VERSION = None
+_EMBEDDED_VLC_RUNTIME_PATH = None
+_EMBEDDED_VLC_FAILURE_REASON = "Embedded VLC availability has not been checked."
+_VLC_DLL_DIRECTORY_HANDLES = {}
+
+
+def _standard_windows_vlc_directories():
+    """Return the standard Windows VLC installation directories, in priority order."""
+    candidates = []
+    for env_name in ("ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"):
+        program_files = os.environ.get(env_name)
+        if program_files:
+            candidates.append(_PathMod(program_files) / "VideoLAN" / "VLC")
+    candidates.extend((
+        _PathMod(r"C:\Program Files\VideoLAN\VLC"),
+        _PathMod(r"C:\Program Files (x86)\VideoLAN\VLC"),
+    ))
+
+    unique = []
+    seen = set()
+    for candidate in candidates:
+        key = str(candidate).rstrip("\\/").casefold()
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+    return unique
+
+
+def _discover_windows_vlc_runtime():
+    if os.name != "nt":
+        return None, "Embedded VLC playback is currently available only on Windows."
+
+    checked = []
+    incomplete = []
+    for directory in _standard_windows_vlc_directories():
+        checked.append(str(directory))
+        missing = []
+        for required_name in ("libvlc.dll", "libvlccore.dll"):
+            if not (directory / required_name).is_file():
+                missing.append(required_name)
+        if not (directory / "plugins").is_dir():
+            missing.append("plugins")
+        if not missing:
+            return directory, ""
+        if directory.exists():
+            incomplete.append(f"{directory} (missing {', '.join(missing)})")
+
+    if incomplete:
+        return None, "VLC installation is incomplete: " + "; ".join(incomplete)
+    return None, "VLC was not found in the standard Program Files locations: " + "; ".join(checked)
+
+
+def _embedded_vlc_status_result():
+    return {
+        "available": _EMBEDDED_VLC_INSTANCE is not None,
+        "instance": _EMBEDDED_VLC_INSTANCE,
+        "version": _EMBEDDED_VLC_VERSION,
+        "runtime_path": _EMBEDDED_VLC_RUNTIME_PATH,
+        "reason": _EMBEDDED_VLC_FAILURE_REASON,
+    }
+
+
+def get_embedded_vlc_status(force_retry=False):
+    """Initialize LibVLC lazily and report whether embedded playback is available."""
+    global _EMBEDDED_VLC_CHECKED
+    global _EMBEDDED_VLC_INSTANCE
+    global _EMBEDDED_VLC_VERSION
+    global _EMBEDDED_VLC_RUNTIME_PATH
+    global _EMBEDDED_VLC_FAILURE_REASON
+
+    if _EMBEDDED_VLC_CHECKED and not force_retry:
+        return _embedded_vlc_status_result()
+
+    _EMBEDDED_VLC_CHECKED = True
+    _EMBEDDED_VLC_INSTANCE = None
+    _EMBEDDED_VLC_VERSION = None
+    _EMBEDDED_VLC_RUNTIME_PATH = None
+
+    runtime_path, failure_reason = _discover_windows_vlc_runtime()
+    if runtime_path is None:
+        _EMBEDDED_VLC_FAILURE_REASON = failure_reason
+        return _embedded_vlc_status_result()
+
+    plugins_path = runtime_path / "plugins"
+    os.environ["VLC_PLUGIN_PATH"] = str(plugins_path)
+
+    try:
+        add_dll_directory = getattr(os, "add_dll_directory", None)
+        if add_dll_directory is None:
+            raise RuntimeError("this Python version does not provide os.add_dll_directory()")
+        handle_key = str(runtime_path).casefold()
+        if handle_key not in _VLC_DLL_DIRECTORY_HANDLES:
+            _VLC_DLL_DIRECTORY_HANDLES[handle_key] = add_dll_directory(str(runtime_path))
+
+        import vlc
+
+        instance = vlc.Instance("--quiet", "--no-video-title-show")
+        if instance is None:
+            raise RuntimeError("LibVLC returned no instance")
+        raw_version = vlc.libvlc_get_version()
+        if isinstance(raw_version, bytes):
+            version = raw_version.decode("utf-8", errors="replace")
+        else:
+            version = str(raw_version)
+    except (Exception, SystemExit) as exc:
+        detail = str(exc).strip() or type(exc).__name__
+        _EMBEDDED_VLC_FAILURE_REASON = f"LibVLC could not initialize from {runtime_path}: {detail}"
+        return _embedded_vlc_status_result()
+
+    _EMBEDDED_VLC_INSTANCE = instance
+    _EMBEDDED_VLC_VERSION = version
+    _EMBEDDED_VLC_RUNTIME_PATH = str(runtime_path)
+    _EMBEDDED_VLC_FAILURE_REASON = ""
+    return _embedded_vlc_status_result()
+
 def guess_video_for_srt(srt_path: _PathMod, project_root: _PathMod):
     try:
         seg_json = srt_path.parent / "segments.json"
@@ -1350,7 +1467,7 @@ class NamingDialog(tk.Toplevel):
         tb.Button(search_actions, text="Find next", command=self.find_next, bootstyle="primary-outline").pack(side="left")
         ttk.Button(search_actions, text="Find speaker tag", command=self.find_speaker_tag).pack(side="left", padx=(6, 0))
         ttk.Button(search_actions, text="Open video at hit", command=self.open_video_at_query).pack(side="left", padx=(6, 0))
-        ttk.Button(search_actions, text="Open externally", command=self.open_txt_external).pack(side="left", padx=(6, 0))
+        ttk.Button(search_actions, text="Open transcript file", command=self.open_txt_external).pack(side="left", padx=(6, 0))
 
         viewer = ttk.LabelFrame(right, text="Transcript Preview", padding=8)
         viewer.grid(row=1, column=0, sticky="nsew")
