@@ -1,5 +1,5 @@
 # split_audio_gui.py — v1.11.0 (Stop Button + Worker Control)
-import os, sys, stat, json, yaml, queue, shutil, threading, subprocess, tkinter as tk, hashlib, datetime, re, signal
+import os, sys, stat, json, yaml, queue, shutil, threading, subprocess, tkinter as tk, hashlib, datetime, re, signal, copy
 import ttkbootstrap as tb
 from tkinter import ttk, messagebox, filedialog
 from pathlib import Path
@@ -893,6 +893,249 @@ class _SrtHitsDialog(tk.Toplevel):
         self.result = None
         self.destroy()
 
+def _assign_segment_speaker(segments, indices, target_speaker: str) -> bool:
+    changed = False
+    for index in indices:
+        if index < 0 or index >= len(segments):
+            continue
+        segment = segments[index]
+        if not isinstance(segment, dict):
+            continue
+        if segment.get("speaker") != target_speaker:
+            segment["speaker"] = target_speaker
+            changed = True
+        words = segment.get("words")
+        if not isinstance(words, list):
+            continue
+        for word in words:
+            if not isinstance(word, dict):
+                continue
+            speech_text = word.get("word")
+            if not str(speech_text or "").strip():
+                speech_text = word.get("text", "")
+            if not str(speech_text or "").strip():
+                continue
+            if word.get("speaker") != target_speaker:
+                word["speaker"] = target_speaker
+                changed = True
+    return changed
+
+def _write_corrected_segments_json(
+    segments_json: Path,
+    original_data: dict,
+    corrected_segments: list,
+    create_backup: bool,
+) -> dict:
+    if create_backup:
+        backup_path = segments_json.with_name("segments.before_manual_corrections.json")
+        if not backup_path.exists():
+            original_bytes = segments_json.read_bytes()
+            try:
+                with backup_path.open("xb") as backup_file:
+                    backup_file.write(original_bytes)
+            except FileExistsError:
+                pass
+    updated_data = copy.deepcopy(original_data) if isinstance(original_data, dict) else {}
+    updated_data["segments"] = copy.deepcopy(corrected_segments)
+    segments_json.write_text(json.dumps(updated_data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return updated_data
+
+class SegmentCorrectionDialog(tk.Toplevel):
+    def __init__(self, parent, segments, speakers, name_mapping):
+        super().__init__(parent)
+        self.title("Review Speaker Segments")
+        self.geometry("1100x650")
+        self.minsize(820, 480)
+        self.transient(parent)
+        self.result = None
+        self.changed = False
+        self.working_segments = copy.deepcopy(list(segments))
+        self.name_mapping = dict(name_mapping or {})
+        self.speakers = []
+        for speaker in list(speakers or []) + [seg.get("speaker") for seg in self.working_segments if isinstance(seg, dict)]:
+            if speaker and speaker not in self.speakers:
+                self.speakers.append(speaker)
+        self.friendly_to_raw = {self._friendly_speaker(speaker): speaker for speaker in self.speakers}
+
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+        filters = ttk.LabelFrame(self, text="Filter Segments", padding=10)
+        filters.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 8))
+        filters.columnconfigure(4, weight=1)
+        ttk.Label(filters, text="Speaker filter").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.var_filter_speaker = tk.StringVar(value="All speakers")
+        filter_combo = ttk.Combobox(
+            filters,
+            textvariable=self.var_filter_speaker,
+            values=("All speakers", *self.speakers),
+            width=18,
+            state="readonly",
+        )
+        filter_combo.grid(row=0, column=1, sticky="w", padx=(0, 16))
+        filter_combo.bind("<<ComboboxSelected>>", self._populate_tree)
+        ttk.Label(filters, text="Search transcript").grid(row=0, column=2, sticky="w", padx=(0, 6))
+        self.var_search = tk.StringVar()
+        search_entry = ttk.Entry(filters, textvariable=self.var_search, width=34)
+        search_entry.grid(row=0, column=3, sticky="w")
+        search_entry.bind("<KeyRelease>", self._populate_tree)
+        tb.Label(
+            filters,
+            text=(
+                "Whole-segment correction only: each row is one indivisible segments.json entry. "
+                "If a row contains dialogue from more than one real speaker, this version cannot split "
+                "the text inside it. Assigning changes the entire row."
+            ),
+            bootstyle="warning",
+            font=("Segoe UI", 9, "bold"),
+            justify="left",
+            wraplength=1000,
+            padding=(8, 6),
+        ).grid(row=1, column=0, columnspan=5, sticky="ew", pady=(8, 0))
+
+        tree_frame = ttk.Frame(self, padding=(12, 0))
+        tree_frame.grid(row=1, column=0, sticky="nsew")
+        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.rowconfigure(0, weight=1)
+        tree_style_name = "SegmentCorrection.Treeview"
+        tree_style = tb.Style.get_instance() or tb.Style()
+        colors = tree_style.colors
+        tree_style.configure(
+            tree_style_name,
+            background=colors.inputbg,
+            foreground=colors.inputfg,
+            fieldbackground=colors.inputbg,
+            rowheight=25,
+        )
+        tree_style.map(
+            tree_style_name,
+            background=[("selected", colors.primary)],
+            foreground=[("selected", colors.get_foreground("primary"))],
+        )
+        self.tree = ttk.Treeview(
+            tree_frame,
+            columns=("start", "speaker", "transcript"),
+            show="headings",
+            selectmode="extended",
+            style=tree_style_name,
+        )
+        self.tree.heading("start", text="Start")
+        self.tree.heading("speaker", text="Current speaker")
+        self.tree.heading("transcript", text="Transcript")
+        self.tree.column("start", width=105, minwidth=90, stretch=False, anchor="w")
+        self.tree.column("speaker", width=210, minwidth=150, stretch=False, anchor="w")
+        self.tree.column("transcript", width=700, minwidth=300, stretch=True, anchor="w")
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        yscroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        xscroll = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+
+        assignment = ttk.LabelFrame(self, text="Correction", padding=10)
+        assignment.grid(row=2, column=0, sticky="ew", padx=12, pady=(8, 0))
+        assignment.columnconfigure(3, weight=1)
+        ttk.Label(assignment, text="Target speaker").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.var_target_speaker = tk.StringVar()
+        self.target_combo = ttk.Combobox(
+            assignment,
+            textvariable=self.var_target_speaker,
+            values=tuple(self.friendly_to_raw),
+            width=30,
+            state="readonly",
+        )
+        self.target_combo.grid(row=0, column=1, sticky="w", padx=(0, 10))
+        tb.Button(
+            assignment,
+            text="Assign selected segments",
+            command=self._assign_selected,
+            bootstyle="primary",
+        ).grid(row=0, column=2, sticky="w")
+
+        buttons = ttk.Frame(self, padding=12)
+        buttons.grid(row=3, column=0, sticky="e")
+        tb.Button(buttons, text="Save Corrections", command=self._save, bootstyle="success", padding=(16, 6)).pack(side="right")
+        tb.Button(buttons, text="Cancel", command=self._cancel, bootstyle="secondary-outline", padding=(14, 6)).pack(side="right", padx=(0, 8))
+
+        self.tree.bind("<Control-a>", self._select_all_visible)
+        self.tree.bind("<Control-A>", self._select_all_visible)
+        self.tree.bind("<Double-1>", self._ignore_double_click)
+        self.bind("<Escape>", lambda event: self._cancel())
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self._populate_tree()
+        self.grab_set()
+        self.after_idle(self.tree.focus_set)
+
+    def _friendly_speaker(self, speaker):
+        name = str(self.name_mapping.get(speaker, "") or "").strip()
+        return f"{speaker} ({name})" if name else str(speaker or "Unassigned")
+
+    def _populate_tree(self, *_):
+        selected = set(self.tree.selection()) if hasattr(self, "tree") else set()
+        existing_rows = self.tree.get_children()
+        if existing_rows:
+            self.tree.delete(*existing_rows)
+        speaker_filter = self.var_filter_speaker.get()
+        query = self.var_search.get().strip().casefold()
+        for index, segment in enumerate(self.working_segments):
+            if not isinstance(segment, dict):
+                continue
+            raw_speaker = segment.get("speaker") or ""
+            transcript = str(segment.get("text", "") or "").replace("\n", " ").strip()
+            if speaker_filter != "All speakers" and raw_speaker != speaker_filter:
+                continue
+            if query and query not in transcript.casefold():
+                continue
+            iid = str(index)
+            self.tree.insert(
+                "",
+                "end",
+                iid=iid,
+                values=(_fmt_time_hhmmss(segment.get("start")), self._friendly_speaker(raw_speaker), transcript),
+            )
+        visible_selection = [iid for iid in selected if self.tree.exists(iid)]
+        if visible_selection:
+            self.tree.selection_set(*visible_selection)
+            self.tree.focus(visible_selection[0])
+            self.tree.see(visible_selection[0])
+
+    def _select_all_visible(self, event=None):
+        visible = self.tree.get_children()
+        if visible:
+            self.tree.selection_set(*visible)
+            self.tree.focus(visible[0])
+        return "break"
+
+    def _ignore_double_click(self, event=None):
+        return "break"
+
+    def _assign_selected(self):
+        selected = tuple(self.tree.selection())
+        if not selected:
+            messagebox.showinfo("No segments selected", "Select one or more transcript segments first.", parent=self)
+            return
+        target_display = self.var_target_speaker.get().strip()
+        target_speaker = self.friendly_to_raw.get(target_display)
+        if not target_speaker:
+            messagebox.showinfo("No target speaker", "Choose a target speaker first.", parent=self)
+            return
+        selected_indices = [int(iid) for iid in selected]
+        self.changed = _assign_segment_speaker(self.working_segments, selected_indices, target_speaker) or self.changed
+        friendly = self._friendly_speaker(target_speaker)
+        for iid in selected:
+            if self.tree.exists(iid):
+                self.tree.set(iid, "speaker", friendly)
+        self.tree.selection_set(*selected)
+        self.tree.focus(selected[0])
+        self.tree.see(selected[0])
+
+    def _save(self):
+        self.result = copy.deepcopy(self.working_segments)
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
 class NamingDialog(tk.Toplevel):
     def __init__(self, master, speakers_json: Path, segments_json: Path):
         super().__init__(master)
@@ -907,7 +1150,9 @@ class NamingDialog(tk.Toplevel):
         self.title_name = spk_data.get("title") or speakers_json.parent.name
         self.speakers = list(spk_data.get("speakers") or [])
         self.saved_names = dict(spk_data.get("names") or spk_data.get("name_map") or {})
-        self.segments = seg_data.get("segments") or []
+        self.segments_data = copy.deepcopy(seg_data)
+        self.segments = copy.deepcopy(seg_data.get("segments") or [])
+        self.manual_corrections_pending = False
         global_counts = Counter(_extract_candidates_from_text(" ".join(str(s.get("text","")) for s in self.segments)))
         # Do not use the file title as a strong name source. Titles are usually topics, not speakers.
         title_counts = Counter()
@@ -985,6 +1230,12 @@ class NamingDialog(tk.Toplevel):
         grid.columnconfigure(2, weight=1)
         grid.bind("<Configure>", lambda event: speaker_canvas.configure(scrollregion=speaker_canvas.bbox("all")))
         speaker_canvas.bind("<Configure>", lambda event: speaker_canvas.itemconfigure(speaker_window, width=event.width))
+        tb.Button(
+            assignments,
+            text="Review speaker segments...",
+            command=self.open_segment_corrections,
+            bootstyle="primary-outline",
+        ).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 
         # Candidate name pool: names/entities found in the transcript.
         # These are NOT automatically assigned. The user assigns them manually.
@@ -1123,6 +1374,79 @@ class NamingDialog(tk.Toplevel):
         self._highlight_query(initial)
         if self.var_autofill2.get() and not (getattr(self, "saved_names", None) and len(self.saved_names)>0):
             self._prefill_first_two(per_spk_counts, global_counts, title_counts)
+
+    def _current_name_mapping(self):
+        return {
+            speaker: self.inputs[speaker].get().strip()
+            for speaker in self.speakers
+            if self.inputs[speaker].get().strip()
+        }
+
+    def open_segment_corrections(self):
+        if not self.segments:
+            messagebox.showinfo("No transcript segments", "There are no transcript segments to review.", parent=self)
+            return
+        dialog = SegmentCorrectionDialog(
+            self,
+            self.segments,
+            self.speakers,
+            self._current_name_mapping(),
+        )
+        self.wait_window(dialog)
+        if dialog.result is None:
+            return
+        self.segments = dialog.result
+        self.manual_corrections_pending = dialog.changed or self.manual_corrections_pending
+        self._refresh_transcript_preview()
+
+    def _transcript_content_from_segments(self):
+        mapping = self._current_name_mapping()
+        diarized = any((seg.get("speaker") or "") for seg in self.segments if isinstance(seg, dict))
+        lines = []
+        if diarized:
+            last_speaker = None
+            buffer = []
+
+            def flush():
+                nonlocal buffer, last_speaker
+                if not buffer or last_speaker is None:
+                    return
+                transcript = " ".join(buffer).strip()
+                if transcript:
+                    assigned_name = mapping.get(last_speaker)
+                    speaker_label = f"{last_speaker} ({assigned_name})" if assigned_name else last_speaker
+                    lines.append(f"{speaker_label}: {transcript}")
+                buffer = []
+
+            for segment in self.segments:
+                if not isinstance(segment, dict):
+                    continue
+                transcript = str(segment.get("text", "") or "").strip()
+                if not transcript:
+                    continue
+                speaker = segment.get("speaker") or "SPEAKER_00"
+                if speaker != last_speaker and last_speaker is not None:
+                    flush()
+                last_speaker = speaker
+                buffer.append(transcript)
+            flush()
+        else:
+            transcript = " ".join(
+                str(segment.get("text", "") or "").strip()
+                for segment in self.segments
+                if isinstance(segment, dict) and segment.get("text")
+            ).strip()
+            if transcript:
+                lines.append(transcript)
+        return "\n".join(lines)
+
+    def _refresh_transcript_preview(self):
+        content = self._transcript_content_from_segments()
+        self.text.delete("1.0", "end")
+        self.text.insert("1.0", content)
+        self.text.edit_reset()
+        query = self.find_var.get().strip() if hasattr(self, "find_var") else ""
+        self._highlight_query(query)
 
     def _load_transcript(self):
         out_dir = self.speakers_json.parent
@@ -1317,19 +1641,30 @@ class NamingDialog(tk.Toplevel):
                         pass
 
     def on_apply(self):
-        mapping = {spk: self.inputs[spk].get().strip() for spk in self.speakers}
-        mapping = {k: v for k, v in mapping.items() if v}
+        mapping = self._current_name_mapping()
         try:
             _spk = json.loads(self.speakers_json.read_text(encoding='utf-8'))
             _spk['names'] = mapping
             self.speakers_json.write_text(json.dumps(_spk, ensure_ascii=False, indent=2), encoding='utf-8')
         except:
             pass
-        if not mapping:
+        if not mapping and not self.manual_corrections_pending:
             messagebox.showwarning("Nothing to apply", "Please enter at least one name.")
             return
-        seg_data = json.loads(self.segments_json.read_text(encoding="utf-8"))
-        segments = seg_data.get("segments") or []
+        segments = self.segments
+        seg_data = self.segments_data
+        if self.manual_corrections_pending:
+            try:
+                seg_data = _write_corrected_segments_json(
+                    self.segments_json,
+                    self.segments_data,
+                    segments,
+                    create_backup=True,
+                )
+                self.segments_data = seg_data
+            except Exception as e:
+                messagebox.showerror("Save corrections failed", f"Could not update segments.json:\n{e}")
+                return
         out_dir = self.speakers_json.parent
         title = seg_data.get("title") or out_dir.name
         srt_path = out_dir / f"{title}.srt"
