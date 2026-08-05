@@ -120,6 +120,9 @@ class Conf:
     compute_type_cuda: str = "float16"
     HF_token: Optional[str] = None
     parallel_workers: int = 4
+    diarization_speaker_mode: str = "auto"
+    min_speakers: int = 2
+    max_speakers: int = 2
 
 def load_conf(path: Path) -> Tuple[Conf, Optional[str]]:
     if not path.exists():
@@ -160,6 +163,31 @@ def load_conf(path: Path) -> Tuple[Conf, Optional[str]]:
             base[k] = data[k]
     cfg = Conf(**base)
     return cfg, hf_token
+
+def diarization_speaker_kwargs(cfg: Conf) -> Dict[str, int]:
+    mode = str(cfg.diarization_speaker_mode or "auto").strip().lower()
+    if mode == "auto":
+        return {}
+
+    def positive_int(value, label: str) -> int:
+        text = str(value).strip()
+        if not text.isdigit():
+            raise ValueError(f"{label} must be a positive integer.") from None
+        number = int(text)
+        if number <= 0:
+            raise ValueError(f"{label} must be a positive integer.")
+        return number
+
+    if mode == "exact":
+        number = positive_int(cfg.min_speakers, "Speaker count")
+        return {"min_speakers": number, "max_speakers": number}
+    if mode == "range":
+        minimum = positive_int(cfg.min_speakers, "Minimum speaker count")
+        maximum = positive_int(cfg.max_speakers, "Maximum speaker count")
+        if minimum > maximum:
+            raise ValueError("Minimum speaker count cannot be greater than maximum speaker count.")
+        return {"min_speakers": minimum, "max_speakers": maximum}
+    raise ValueError("Diarization speaker mode must be auto, exact, or range.")
 
 def setup_device(cfg: Conf) -> str:
     import torch
@@ -250,6 +278,16 @@ def transcribe_whisperx(model, audio_path: Path, device: str, cfg: Conf) -> Dict
         print(">>Performed alignment.")
     diar_ok = False
     if cfg.diarize:
+        speaker_kwargs = diarization_speaker_kwargs(cfg)
+        if not speaker_kwargs:
+            print("[diarization] Speaker count: automatic")
+        elif speaker_kwargs["min_speakers"] == speaker_kwargs["max_speakers"]:
+            print(f"[diarization] Speaker count: exactly {speaker_kwargs['min_speakers']}")
+        else:
+            print(
+                f"[diarization] Speaker count range: "
+                f"{speaker_kwargs['min_speakers']}–{speaker_kwargs['max_speakers']}"
+            )
         hf_token = cfg.HF_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")                        or os.environ.get("HUGGING_FACE_HUB_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
         if hf_token:
             os.environ.setdefault("HF_TOKEN", hf_token)
@@ -264,7 +302,7 @@ def transcribe_whisperx(model, audio_path: Path, device: str, cfg: Conf) -> Dict
                     diarize_model = DiarizationPipeline(token=hf_token, device=device)
                 except TypeError:
                     diarize_model = DiarizationPipeline(use_auth_token=hf_token, device=device)
-                diarize_segments = diarize_model(str(audio_path))
+                diarize_segments = diarize_model(str(audio_path), **speaker_kwargs)
             except Exception:
                 from pyannote.audio import Pipeline  # type: ignore
                 try:
@@ -281,7 +319,7 @@ def transcribe_whisperx(model, audio_path: Path, device: str, cfg: Conf) -> Dict
                     diarize_model.to(device)
                 except Exception:
                     pass
-                diarize_segments = diarize_model(str(audio_path))
+                diarize_segments = diarize_model(str(audio_path), **speaker_kwargs)
             result = whisperx.assign_word_speakers(diarize_segments, result)
             diar_ok = True
         except Exception as e:
@@ -397,6 +435,12 @@ def run_pipeline(explicit_files: List[str] = None, explicit_workers: int = None)
     print("Starting processing...")
     pipeline_start = time.perf_counter()
     cfg, hf_token = load_conf(ROOT / "conf.yaml")
+    if cfg.diarize:
+        try:
+            diarization_speaker_kwargs(cfg)
+        except ValueError as e:
+            print(f"[!] Invalid diarization speaker-count settings: {e}")
+            raise SystemExit(2)
     
     # CLI override for workers
     workers = explicit_workers if explicit_workers else cfg.parallel_workers

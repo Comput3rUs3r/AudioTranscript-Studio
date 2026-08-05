@@ -444,10 +444,13 @@ _DEFAULTS = {
     "merge_all_segments_into_one_folder": False,"txt_speaker_tags": True,"one_folder": False,
     "output_format": "both","srt": True,"txt": True,"compute_type": "float16","tf32": "off",
     "padding_seconds": 0.25,"hf_token": "",
+    "diarization_speaker_mode": "auto", "min_speakers": 2, "max_speakers": 2,
 }
 _MODEL_CHOICES = ["tiny","base","small","medium","large-v2","large-v3","large-v3-turbo","distil-large-v3"]
 _COMPUTE_CHOICES = ["float16","float32"]
 _TF32_CHOICES = ["on","off"]
+_SPEAKER_MODE_LABELS = {"auto": "Automatic", "exact": "Exact number", "range": "Range"}
+_SPEAKER_MODE_KEYS = {label: key for key, label in _SPEAKER_MODE_LABELS.items()}
 
 def merge_gui_conf(existing: dict, gui_values: dict) -> dict:
     """Merge GUI-owned settings without discarding other configuration keys."""
@@ -1433,6 +1436,9 @@ class App(ttk.Frame):
         self.var_hf = tk.StringVar(value=_DEFAULTS["hf_token"])
         self.var_player = tk.StringVar(value=_DEFAULTS["video_player_path"])
         self.var_workers = tk.IntVar(value=_DEFAULTS["parallel_workers"]) # <--- NEW
+        self.var_speaker_mode = tk.StringVar(value=_SPEAKER_MODE_LABELS[_DEFAULTS["diarization_speaker_mode"]])
+        self.var_min_speakers = tk.StringVar(value=str(_DEFAULTS["min_speakers"]))
+        self.var_max_speakers = tk.StringVar(value=str(_DEFAULTS["max_speakers"]))
         self._build_ui()
         self._load_conf_to_ui()
         self._update_title_with_conf_path()
@@ -1513,10 +1519,33 @@ class App(ttk.Frame):
         ttk.Entry(self.advanced_content, textvariable=self.var_hf, width=30, show="*").grid(row=1, column=5, sticky="w", padx=(6, 8), pady=(12, 0))
         tb.Button(self.advanced_content, text="Check HF token", command=self.on_check_hf, bootstyle="secondary-outline").grid(row=1, column=6, sticky="w", pady=(12, 0))
 
-        ttk.Label(self.advanced_content, text="Video player path").grid(row=2, column=0, sticky="w", pady=(10, 0))
-        ttk.Entry(self.advanced_content, textvariable=self.var_player, width=48).grid(row=2, column=1, columnspan=5, sticky="w", padx=(6, 8), pady=(10, 0))
-        tb.Button(self.advanced_content, text="Browse", command=self.browse_player, bootstyle="secondary-outline").grid(row=2, column=6, sticky="w", pady=(10, 0))
-        ttk.Frame(self.advanced_content).grid(row=0, column=7, rowspan=3, sticky="ew")
+        ttk.Label(self.advanced_content, text="Speaker count").grid(row=2, column=0, sticky="w", pady=(10, 0))
+        self.cmb_speaker_mode = ttk.Combobox(
+            self.advanced_content,
+            textvariable=self.var_speaker_mode,
+            values=tuple(_SPEAKER_MODE_LABELS.values()),
+            width=14,
+            state="readonly",
+        )
+        self.cmb_speaker_mode.grid(row=2, column=1, sticky="w", padx=(6, 16), pady=(10, 0))
+        self.cmb_speaker_mode.bind("<<ComboboxSelected>>", self._update_speaker_count_controls)
+
+        self.speaker_count_fields = ttk.Frame(self.advanced_content)
+        self.speaker_count_fields.grid(row=2, column=2, columnspan=5, sticky="w", pady=(10, 0))
+        self.speaker_exact_fields = ttk.Frame(self.speaker_count_fields)
+        ttk.Label(self.speaker_exact_fields, text="Number").pack(side="left")
+        ttk.Spinbox(self.speaker_exact_fields, from_=1, to=100, textvariable=self.var_min_speakers, width=5).pack(side="left", padx=(6, 0))
+        self.speaker_range_fields = ttk.Frame(self.speaker_count_fields)
+        ttk.Label(self.speaker_range_fields, text="Minimum").pack(side="left")
+        ttk.Spinbox(self.speaker_range_fields, from_=1, to=100, textvariable=self.var_min_speakers, width=5).pack(side="left", padx=(6, 14))
+        ttk.Label(self.speaker_range_fields, text="Maximum").pack(side="left")
+        ttk.Spinbox(self.speaker_range_fields, from_=1, to=100, textvariable=self.var_max_speakers, width=5).pack(side="left", padx=(6, 0))
+        self._update_speaker_count_controls()
+
+        ttk.Label(self.advanced_content, text="Video player path").grid(row=3, column=0, sticky="w", pady=(10, 0))
+        ttk.Entry(self.advanced_content, textvariable=self.var_player, width=48).grid(row=3, column=1, columnspan=5, sticky="w", padx=(6, 8), pady=(10, 0))
+        tb.Button(self.advanced_content, text="Browse", command=self.browse_player, bootstyle="secondary-outline").grid(row=3, column=6, sticky="w", pady=(10, 0))
+        ttk.Frame(self.advanced_content).grid(row=0, column=7, rowspan=4, sticky="ew")
         self.advanced_content.grid_remove()
 
         utilities = ttk.LabelFrame(self, text="Utilities", padding=10)
@@ -1548,6 +1577,15 @@ class App(ttk.Frame):
             self.advanced_content.grid_remove()
             self.btn_advanced.configure(text="Advanced Settings  ▸")
 
+    def _update_speaker_count_controls(self, *_):
+        self.speaker_exact_fields.pack_forget()
+        self.speaker_range_fields.pack_forget()
+        mode = _SPEAKER_MODE_KEYS.get(self.var_speaker_mode.get(), "auto")
+        if mode == "exact":
+            self.speaker_exact_fields.pack(side="left")
+        elif mode == "range":
+            self.speaker_range_fields.pack(side="left")
+
     def _set_runtime_state(self, status: str):
         styles = {
             "Ready": "secondary",
@@ -1578,6 +1616,45 @@ class App(ttk.Frame):
         self.master.title("AudioTranscript Studio")
         self.lbl_conf.configure(text="Configuration: conf.yaml")
 
+    @staticmethod
+    def _positive_speaker_count(value, label):
+        text = str(value).strip()
+        if not re.fullmatch(r"[0-9]+", text) or int(text) <= 0:
+            raise ValueError(f"{label} must be a positive integer.")
+        return int(text)
+
+    def _speaker_count_config_values(self):
+        mode = _SPEAKER_MODE_KEYS.get(self.var_speaker_mode.get(), "auto")
+        if mode == "auto":
+            try:
+                minimum = self._positive_speaker_count(self.var_min_speakers.get(), "Minimum speaker count")
+            except ValueError:
+                minimum = _DEFAULTS["min_speakers"]
+            try:
+                maximum = self._positive_speaker_count(self.var_max_speakers.get(), "Maximum speaker count")
+            except ValueError:
+                maximum = _DEFAULTS["max_speakers"]
+            return mode, minimum, maximum
+        if mode == "exact":
+            number = self._positive_speaker_count(self.var_min_speakers.get(), "Speaker count")
+            return mode, number, number
+
+        minimum = self._positive_speaker_count(self.var_min_speakers.get(), "Minimum speaker count")
+        maximum = self._positive_speaker_count(self.var_max_speakers.get(), "Maximum speaker count")
+        if minimum > maximum:
+            raise ValueError("Minimum speaker count cannot be greater than maximum speaker count.")
+        return mode, minimum, maximum
+
+    def _validate_diarization_speaker_count(self):
+        try:
+            self._speaker_count_config_values()
+            return True
+        except ValueError as e:
+            self._set_runtime_state("Ready")
+            self.log(f"[validation] Invalid diarization speaker count: {e}")
+            messagebox.showwarning("Invalid speaker count", str(e))
+            return False
+
     def _load_conf_to_ui(self):
         cfg = read_yaml(conf_path())
         if not cfg: return
@@ -1598,10 +1675,18 @@ class App(ttk.Frame):
         self.var_hf.set(cfg.get("hf_token", self.var_hf.get()))
         self.var_player.set(cfg.get("video_player_path", self.var_player.get()))
         self.var_workers.set(int(cfg.get("parallel_workers", self.var_workers.get()))) # <--- LOAD
+        mode = str(cfg.get("diarization_speaker_mode", _DEFAULTS["diarization_speaker_mode"])).strip().lower()
+        if mode not in _SPEAKER_MODE_LABELS:
+            mode = "auto"
+        self.var_speaker_mode.set(_SPEAKER_MODE_LABELS[mode])
+        self.var_min_speakers.set(str(cfg.get("min_speakers", _DEFAULTS["min_speakers"])))
+        self.var_max_speakers.set(str(cfg.get("max_speakers", _DEFAULTS["max_speakers"])))
+        self._update_speaker_count_controls()
 
     def _collect_ui_to_conf(self) -> dict:
         self.var_compute.set("float16")
         self.var_tf32.set("off")
+        speaker_mode, min_speakers, max_speakers = self._speaker_count_config_values()
         ofmt = self.var_output.get()
         srt = self.var_srt.get() if ofmt in ("both","srt") else False
         txt = self.var_txt.get() if ofmt in ("both","txt") else False
@@ -1623,6 +1708,9 @@ class App(ttk.Frame):
             "tf32": "off",
             "padding_seconds": float(self.var_pad.get()),
             "hf_token": self.var_hf.get().strip(),
+            "diarization_speaker_mode": speaker_mode,
+            "min_speakers": min_speakers,
+            "max_speakers": max_speakers,
         }
 
     def on_save(self):
@@ -1630,6 +1718,9 @@ class App(ttk.Frame):
             cfg = merge_gui_conf(read_yaml(conf_path()), self._collect_ui_to_conf())
             atomic_write_yaml(conf_path(), cfg)
             self.log(f"Saved {conf_path()}")
+        except ValueError as e:
+            messagebox.showwarning("Invalid speaker count", str(e))
+            self.log(f"[validation] Invalid diarization speaker count: {e}")
         except Exception as e:
             messagebox.showerror("Save failed", f"{e}")
             self.log(f"ERROR saving conf: {e}")
@@ -1723,6 +1814,8 @@ class App(ttk.Frame):
 
     def on_run(self):
         self.cancel_requested = False
+        if not self._validate_diarization_speaker_count():
+            return
         self.on_save()
         if not self._validate_slice_video_inputs():
             return
