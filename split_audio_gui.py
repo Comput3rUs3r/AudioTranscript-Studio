@@ -1267,9 +1267,12 @@ class NamingDialog(tk.Toplevel):
         self._loaded_video_path = None
         self._video_update_after = None
         self._pending_seek_after = None
+        self._pending_subtitle_after = None
         self._seek_dragging = False
         self._video_duration_seconds = 0.0
         self._player_closing = False
+        self._subtitle_track_ids = {}
+        self._applied_subtitle_choice = None
         self.speakers_json = speakers_json
         self.segments_json = segments_json
         spk_data = json.loads(speakers_json.read_text(encoding="utf-8"))
@@ -1279,6 +1282,20 @@ class NamingDialog(tk.Toplevel):
         self.saved_names = dict(spk_data.get("names") or spk_data.get("name_map") or {})
         self.segments_data = copy.deepcopy(seg_data)
         self.segments = copy.deepcopy(seg_data.get("segments") or [])
+        subtitle_title = seg_data.get("title") or speakers_json.parent.name
+        subtitle_candidates = (
+            ("SRT", speakers_json.parent / f"{subtitle_title}.srt"),
+            ("ASS (plain)", speakers_json.parent / f"{subtitle_title}.plain.ass"),
+            ("ASS (word highlighting)", speakers_json.parent / f"{subtitle_title}.words.ass"),
+        )
+        self._subtitle_paths = {
+            label: path
+            for label, path in subtitle_candidates
+            if path.is_file()
+        }
+        self._subtitle_choices = ["Off"] + [
+            label for label, _path in subtitle_candidates if label in self._subtitle_paths
+        ]
         self.manual_corrections_pending = False
         global_counts = Counter(_extract_candidates_from_text(" ".join(str(s.get("text","")) for s in self.segments)))
         # Do not use the file title as a strong name source. Titles are usually topics, not speakers.
@@ -1529,25 +1546,40 @@ class NamingDialog(tk.Toplevel):
         self.video_seek.bind("<ButtonPress-1>", self._video_seek_started)
         self.video_seek.bind("<ButtonRelease-1>", self._video_seek_released)
 
-        volume_controls = ttk.Frame(video)
-        volume_controls.grid(row=2, column=0, sticky="e", pady=(6, 0))
-        ttk.Label(volume_controls, text="Volume").pack(side="left", padx=(0, 6))
+        lower_controls = ttk.Frame(video)
+        lower_controls.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        lower_controls.columnconfigure(2, weight=1)
+        ttk.Label(lower_controls, text="Subtitles").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        default_subtitle = "SRT" if "SRT" in self._subtitle_paths else "Off"
+        self.subtitle_var = tk.StringVar(value=default_subtitle)
+        self.subtitle_selector = ttk.Combobox(
+            lower_controls,
+            textvariable=self.subtitle_var,
+            values=self._subtitle_choices,
+            width=24,
+            state="readonly",
+        )
+        self.subtitle_selector.grid(row=0, column=1, sticky="w")
+        self.subtitle_selector.bind("<<ComboboxSelected>>", self._subtitle_selection_changed)
+
+        ttk.Label(lower_controls, text="Volume").grid(row=0, column=3, sticky="e", padx=(12, 6))
         self.video_volume_var = tk.DoubleVar(value=80.0)
         self.video_volume = ttk.Scale(
-            volume_controls,
+            lower_controls,
             from_=0.0,
             to=100.0,
             length=120,
             variable=self.video_volume_var,
             command=self._video_volume_changed,
         )
-        self.video_volume.pack(side="left")
+        self.video_volume.grid(row=0, column=4, sticky="e")
         self._video_controls = [
             self.btn_video_back,
             self.btn_video_play,
             self.btn_video_forward,
             self.btn_video_stop,
             self.video_seek,
+            self.subtitle_selector,
             self.video_volume,
         ]
 
@@ -1723,6 +1755,7 @@ class NamingDialog(tk.Toplevel):
             else:
                 self._vlc_player.play()
                 self.btn_video_play.configure(text="Pause")
+                self._schedule_selected_subtitle_after_play()
         except Exception as exc:
             messagebox.showerror("Video Preview", f"Could not control playback:\n{exc}", parent=self)
 
@@ -1746,6 +1779,7 @@ class NamingDialog(tk.Toplevel):
 
     def _video_stop(self):
         self._cancel_pending_video_seek()
+        self._cancel_pending_subtitle_apply()
         if self._vlc_player is None:
             return
         try:
@@ -1767,6 +1801,160 @@ class NamingDialog(tk.Toplevel):
         except Exception:
             pass
 
+    def _cancel_pending_subtitle_apply(self):
+        if self._pending_subtitle_after is not None:
+            try:
+                self.after_cancel(self._pending_subtitle_after)
+            except Exception:
+                pass
+            self._pending_subtitle_after = None
+
+    def _subtitle_selection_changed(self, _event=None):
+        self._cancel_pending_subtitle_apply()
+        self._apply_selected_subtitle(preserve_state=True)
+
+    def _subtitle_playback_snapshot(self):
+        if self._vlc_player is None:
+            return None
+        try:
+            current_ms = max(0, int(self._vlc_player.get_time()))
+        except Exception:
+            current_ms = 0
+        try:
+            was_playing = bool(self._vlc_player.is_playing())
+        except Exception:
+            was_playing = False
+        try:
+            was_paused = "paused" in str(self._vlc_player.get_state()).lower()
+        except Exception:
+            was_paused = False
+        return current_ms, was_playing, was_paused
+
+    def _restore_subtitle_playback_state(self, snapshot):
+        if snapshot is None or self._vlc_player is None or self._player_closing:
+            return
+        saved_time, was_playing, was_paused = snapshot
+        try:
+            current_time = max(0, int(self._vlc_player.get_time()))
+            tolerance = 250 if was_paused else 1500
+            if abs(current_time - saved_time) > tolerance:
+                self._vlc_player.set_time(saved_time)
+            is_playing = bool(self._vlc_player.is_playing())
+            if was_playing and not is_playing:
+                self._vlc_player.play()
+            elif was_paused and is_playing:
+                self._vlc_player.pause()
+        except Exception:
+            pass
+
+    def _set_subtitles_off(self):
+        if self._vlc_player is not None:
+            try:
+                self._vlc_player.video_set_spu(-1)
+            except Exception:
+                pass
+        self._applied_subtitle_choice = "Off"
+
+    def _report_subtitle_failure(self, choice, message, remove_choice=False):
+        self._set_subtitles_off()
+        self.subtitle_var.set("Off")
+        if remove_choice:
+            self._subtitle_paths.pop(choice, None)
+            self._subtitle_choices = [
+                available_choice
+                for available_choice in self._subtitle_choices
+                if available_choice == "Off" or available_choice in self._subtitle_paths
+            ]
+            self.subtitle_selector.configure(values=self._subtitle_choices)
+        if not self._player_closing:
+            messagebox.showwarning("Video subtitles", message, parent=self)
+
+    def _finish_subtitle_apply(self, choice, snapshot, retries):
+        self._pending_subtitle_after = None
+        if (
+            self._player_closing
+            or self._vlc_player is None
+            or self.subtitle_var.get() != choice
+        ):
+            return
+        try:
+            selected_track = int(self._vlc_player.video_get_spu())
+        except Exception:
+            selected_track = -1
+        self._restore_subtitle_playback_state(snapshot)
+        if selected_track >= 0:
+            self._subtitle_track_ids[choice] = selected_track
+            self._applied_subtitle_choice = choice
+            return
+        if retries > 0:
+            self._pending_subtitle_after = self.after(
+                150,
+                lambda: self._finish_subtitle_apply(choice, snapshot, retries - 1),
+            )
+            return
+        subtitle_path = self._subtitle_paths.get(choice)
+        self._report_subtitle_failure(
+            choice,
+            f"VLC could not activate the subtitle file:\n{subtitle_path}\n\nVideo playback will continue without subtitles.",
+        )
+
+    def _apply_selected_subtitle(self, preserve_state=True):
+        if self._vlc_player is None or self._loaded_video_path is None:
+            return
+        choice = self.subtitle_var.get() or "Off"
+        snapshot = self._subtitle_playback_snapshot() if preserve_state else None
+        if choice == "Off":
+            self._set_subtitles_off()
+            self._restore_subtitle_playback_state(snapshot)
+            return
+
+        subtitle_path = self._subtitle_paths.get(choice)
+        if subtitle_path is None or not subtitle_path.is_file():
+            missing_path = subtitle_path or "the selected subtitle file"
+            self._report_subtitle_failure(
+                choice,
+                f"The subtitle file is no longer available:\n{missing_path}\n\nVideo playback will continue without subtitles.",
+                remove_choice=True,
+            )
+            self._restore_subtitle_playback_state(snapshot)
+            return
+
+        try:
+            existing_track = self._subtitle_track_ids.get(choice)
+            if existing_track is not None:
+                result = self._vlc_player.video_set_spu(existing_track)
+                if result == -1:
+                    self._subtitle_track_ids.pop(choice, None)
+                    existing_track = None
+            if existing_track is None:
+                import vlc
+
+                subtitle_uri = subtitle_path.resolve().as_uri()
+                result = self._vlc_player.add_slave(vlc.MediaSlaveType.subtitle, subtitle_uri, True)
+                if result == -1:
+                    raise RuntimeError("LibVLC rejected the subtitle track")
+        except Exception as exc:
+            self._report_subtitle_failure(
+                choice,
+                f"VLC could not load the subtitle file:\n{subtitle_path}\n\n{exc}\n\nVideo playback will continue without subtitles.",
+            )
+            self._restore_subtitle_playback_state(snapshot)
+            return
+
+        self._pending_subtitle_after = self.after(
+            150,
+            lambda: self._finish_subtitle_apply(choice, snapshot, 12),
+        )
+
+    def _schedule_selected_subtitle_after_play(self):
+        self._cancel_pending_subtitle_apply()
+
+        def apply_after_play():
+            self._pending_subtitle_after = None
+            self._apply_selected_subtitle(preserve_state=False)
+
+        self._pending_subtitle_after = self.after(250, apply_after_play)
+
     def _load_embedded_video(self, video_path, start_seconds):
         if self._vlc_player is None or self._vlc_instance is None:
             raise RuntimeError(self._vlc_status.get("reason") or "Embedded VLC playback is unavailable.")
@@ -1778,6 +1966,7 @@ class NamingDialog(tk.Toplevel):
         same_video = normalized_path == self._loaded_video_path and self._vlc_media is not None
 
         self._cancel_pending_video_seek()
+        self._cancel_pending_subtitle_apply()
         if not same_video:
             self._vlc_player.stop()
             media = self._vlc_instance.media_new(str(video_path))
@@ -1787,6 +1976,8 @@ class NamingDialog(tk.Toplevel):
             self._vlc_player.set_media(media)
             self._vlc_media = media
             self._loaded_video_path = normalized_path
+            self._subtitle_track_ids.clear()
+            self._applied_subtitle_choice = None
             if old_media is not None:
                 try:
                     old_media.release()
@@ -1801,12 +1992,14 @@ class NamingDialog(tk.Toplevel):
             raise RuntimeError("LibVLC could not start playback")
         self.btn_video_play.configure(text="Pause")
         self._schedule_video_start_seek(start_seconds)
+        self._schedule_selected_subtitle_after_play()
 
     def _release_embedded_player(self):
         if self._player_closing:
             return
         self._player_closing = True
         self._cancel_pending_video_seek()
+        self._cancel_pending_subtitle_apply()
         if self._video_update_after is not None:
             try:
                 self.after_cancel(self._video_update_after)
