@@ -75,7 +75,7 @@ def write_word_ass(out_path, segments, mapping):
 
     with open(out_path, "w", encoding="utf-8", newline="\n") as f:
         f.write("[Script Info]\n")
-        f.write("ScriptType: v4.00+\nCollisions: Normal\nPlayResX: 1920\nPlayResY: 1080\nScaledBorderAndShadow: yes\nWrapStyle: 2\n")
+        f.write("ScriptType: v4.00+\nCollisions: Normal\nPlayResX: 1920\nPlayResY: 1080\nScaledBorderAndShadow: yes\nWrapStyle: 0\n")
         f.write("\n[V4+ Styles]\n")
         f.write("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n")
         for sp in speakers:
@@ -221,7 +221,7 @@ def write_ass_plain(out_path, segments, mapping):
 
     with open(out_path, "w", encoding="utf-8", newline="\n") as f:
         f.write("[Script Info]\n")
-        f.write("ScriptType: v4.00+\nCollisions: Normal\nPlayResX: 1920\nPlayResY: 1080\nScaledBorderAndShadow: yes\nWrapStyle: 2\n")
+        f.write("ScriptType: v4.00+\nCollisions: Normal\nPlayResX: 1920\nPlayResY: 1080\nScaledBorderAndShadow: yes\nWrapStyle: 0\n")
         f.write("\n[V4+ Styles]\n")
         f.write("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n")
         for sp in speakers:
@@ -856,6 +856,25 @@ def _best_names_list(*counters: Counter, limit: int = 8) -> list:
             break
     return out
 
+_AUTO_SPEAKER_NAME_REJECT_WORDS = {
+    "they", "them", "their", "he", "him", "his", "she", "her", "we", "us", "our",
+    "you", "your", "people", "one", "then", "when", "where", "what", "why", "wait",
+    "first", "now", "these",
+}
+
+def _best_auto_speaker_names(*counters: Counter, limit: int = 8) -> list:
+    candidates = _best_names_list(*counters, limit=50)
+    credible = []
+    for candidate in candidates:
+        words = [word.casefold() for word in candidate.split()]
+        if any(word in _AUTO_SPEAKER_NAME_REJECT_WORDS for word in words):
+            continue
+        credible.append(candidate)
+
+    # Keep the existing ranking within each group, but prefer full person names.
+    credible.sort(key=lambda candidate: 0 if len(candidate.split()) > 1 else 1)
+    return credible[:limit]
+
 def safe_base(name: str) -> str:
     name = name.strip()
     name = re.sub(r"[^A-Za-z0-9 _\-]", "_", name)
@@ -1382,6 +1401,22 @@ class NamingDialog(tk.Toplevel):
             bootstyle="primary-outline",
         ).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 
+        def suggest_first_two_names():
+            filled = self._prefill_first_two(per_spk_counts, global_counts, title_counts)
+            if filled == 0:
+                messagebox.showinfo(
+                    "No names suggested",
+                    "No empty fields for the first two speakers had an available name suggestion.",
+                    parent=self,
+                )
+
+        tb.Button(
+            assignments,
+            text="Suggest names for first two speakers",
+            command=suggest_first_two_names,
+            bootstyle="primary-outline",
+        ).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+
         # Candidate name pool: names/entities found in the transcript.
         # These are NOT automatically assigned. The user assigns them manually.
         pool_frame = ttk.LabelFrame(left, text="Candidate Name Pool", padding=8)
@@ -1455,8 +1490,6 @@ class NamingDialog(tk.Toplevel):
         ttk.Checkbutton(opts, text="Overwrite existing SRT/TXT (recommended)", variable=self.var_overwrite).grid(row=0, column=0, sticky="w")
         self.var_rename_audio = tk.BooleanVar(value=True)
         ttk.Checkbutton(opts, text="Rename folders and .wav files with names", variable=self.var_rename_audio).grid(row=1, column=0, sticky="w", pady=(2, 0))
-        self.var_autofill2 = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opts, text="Prefill first two speakers by earliest appearance", variable=self.var_autofill2).grid(row=2, column=0, sticky="w", pady=(2, 0))
         try:
             _cfg = read_yaml(conf_path())
         except:
@@ -1603,8 +1636,6 @@ class NamingDialog(tk.Toplevel):
             initial = self.speakers[0] if self.speakers else "SPEAKER_00"
         self.find_var.set(initial)
         self._highlight_query(initial)
-        if self.var_autofill2.get() and not (getattr(self, "saved_names", None) and len(self.saved_names)>0):
-            self._prefill_first_two(per_spk_counts, global_counts, title_counts)
         self.protocol("WM_DELETE_WINDOW", self.destroy)
         self.bind("<Destroy>", self._on_dialog_destroyed, add="+")
         self._initialize_embedded_player()
@@ -2333,6 +2364,7 @@ class NamingDialog(tk.Toplevel):
     def _prefill_first_two(self, per_spk_counts: dict, global_counts: list, title_counts: list):
         order = []
         seen = set()
+        filled = 0
         for seg in self.segments:
             sp = seg.get("speaker")
             if not sp or sp in seen: continue
@@ -2341,9 +2373,12 @@ class NamingDialog(tk.Toplevel):
         for sp in order:
             cb = self.inputs.get(sp)
             if not cb: continue
-            candidates = _best_names_list(per_spk_counts.get(sp, Counter()), global_counts, title_counts, limit=8)
+            if cb.get().strip(): continue
+            candidates = _best_auto_speaker_names(per_spk_counts.get(sp, Counter()), global_counts, title_counts, limit=8)
             if candidates:
                 cb.set(candidates[0])
+                filled += 1
+        return filled
 
     def _rename_tree(self, out_dir: Path, mapping: dict):
         spk_dirs = [d for d in out_dir.iterdir() if d.is_dir() and d.name.startswith("SPEAKER_")]
