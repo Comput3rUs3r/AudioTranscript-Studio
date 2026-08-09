@@ -1887,6 +1887,7 @@ class NamingDialog(tk.Toplevel):
         self._applied_subtitle_choice = "Off"
 
     def _report_subtitle_failure(self, choice, message, remove_choice=False):
+        self._subtitle_track_ids.pop(choice, None)
         self._set_subtitles_off()
         self.subtitle_var.set("Off")
         if remove_choice:
@@ -1900,7 +1901,42 @@ class NamingDialog(tk.Toplevel):
         if not self._player_closing:
             messagebox.showwarning("Video subtitles", message, parent=self)
 
-    def _finish_subtitle_apply(self, choice, snapshot, retries):
+    def _available_vlc_subtitle_track_ids(self):
+        track_ids = set()
+        if self._vlc_player is None:
+            return track_ids
+        try:
+            descriptions = self._vlc_player.video_get_spu_description() or ()
+        except Exception:
+            descriptions = ()
+        for description in descriptions:
+            try:
+                track_id = int(description[0])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if track_id >= 0:
+                track_ids.add(track_id)
+        try:
+            current_track = int(self._vlc_player.video_get_spu())
+        except Exception:
+            current_track = -1
+        if current_track >= 0:
+            track_ids.add(current_track)
+        track_ids.update(
+            track_id
+            for track_id in self._subtitle_track_ids.values()
+            if isinstance(track_id, int) and track_id >= 0
+        )
+        return track_ids
+
+    def _finish_subtitle_apply(
+        self,
+        choice,
+        snapshot,
+        retries,
+        previous_track_ids=None,
+        expected_track_id=None,
+    ):
         self._pending_subtitle_after = None
         if (
             self._player_closing
@@ -1912,15 +1948,40 @@ class NamingDialog(tk.Toplevel):
             selected_track = int(self._vlc_player.video_get_spu())
         except Exception:
             selected_track = -1
+        verified_track = None
+        if expected_track_id is not None:
+            if selected_track == expected_track_id:
+                verified_track = expected_track_id
+        else:
+            previous_track_ids = set(previous_track_ids or ())
+            new_track_ids = self._available_vlc_subtitle_track_ids() - previous_track_ids
+            if selected_track in new_track_ids:
+                verified_track = selected_track
+            else:
+                for track_id in sorted(new_track_ids):
+                    try:
+                        result = self._vlc_player.video_set_spu(track_id)
+                        current_track = int(self._vlc_player.video_get_spu())
+                    except Exception:
+                        continue
+                    if result != -1 and current_track == track_id:
+                        verified_track = track_id
+                        break
         self._restore_subtitle_playback_state(snapshot)
-        if selected_track >= 0:
-            self._subtitle_track_ids[choice] = selected_track
+        if verified_track is not None:
+            self._subtitle_track_ids[choice] = verified_track
             self._applied_subtitle_choice = choice
             return
         if retries > 0:
             self._pending_subtitle_after = self.after(
                 150,
-                lambda: self._finish_subtitle_apply(choice, snapshot, retries - 1),
+                lambda: self._finish_subtitle_apply(
+                    choice,
+                    snapshot,
+                    retries - 1,
+                    previous_track_ids,
+                    expected_track_id,
+                ),
             )
             return
         subtitle_path = self._subtitle_paths.get(choice)
@@ -1952,6 +2013,7 @@ class NamingDialog(tk.Toplevel):
 
         try:
             existing_track = self._subtitle_track_ids.get(choice)
+            previous_track_ids = None
             if existing_track is not None:
                 result = self._vlc_player.video_set_spu(existing_track)
                 if result == -1:
@@ -1960,6 +2022,7 @@ class NamingDialog(tk.Toplevel):
             if existing_track is None:
                 import vlc
 
+                previous_track_ids = frozenset(self._available_vlc_subtitle_track_ids())
                 subtitle_uri = subtitle_path.resolve().as_uri()
                 result = self._vlc_player.add_slave(vlc.MediaSlaveType.subtitle, subtitle_uri, True)
                 if result == -1:
@@ -1974,7 +2037,13 @@ class NamingDialog(tk.Toplevel):
 
         self._pending_subtitle_after = self.after(
             150,
-            lambda: self._finish_subtitle_apply(choice, snapshot, 12),
+            lambda: self._finish_subtitle_apply(
+                choice,
+                snapshot,
+                12,
+                previous_track_ids,
+                existing_track,
+            ),
         )
 
     def _schedule_selected_subtitle_after_play(self):
