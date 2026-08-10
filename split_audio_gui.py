@@ -1,9 +1,10 @@
 # split_audio_gui.py — v1.11.0 (Stop Button + Worker Control)
-import os, sys, stat, json, yaml, queue, shutil, threading, subprocess, tkinter as tk, hashlib, datetime, re, signal, copy, math
+import os, sys, stat, json, yaml, queue, shutil, threading, subprocess, tkinter as tk, hashlib, datetime, re, signal, copy, math, time
 import ttkbootstrap as tb
 from tkinter import ttk, messagebox, filedialog
 from pathlib import Path
 from collections import Counter
+from bisect import bisect_right
 from split_audio import (
     AUDIO_EXTS as _PIPELINE_AUDIO_EXTS,
     PROGRESS_PREFIX as _PIPELINE_PROGRESS_PREFIX,
@@ -1302,6 +1303,17 @@ class NamingDialog(tk.Toplevel):
         self._word_records = []
         self._word_tag_to_record = {}
         self._word_tag_names = []
+        self._timed_word_index = []
+        self._timed_word_starts = []
+        self._current_word_tag = None
+        self._word_sync_after = None
+        self._word_sync_interval_ms = 40
+        self._word_clock_vlc_seconds = None
+        self._word_clock_vlc_observed_at = None
+        self._word_clock_estimate_seconds = None
+        self._word_clock_seek_target = None
+        self._word_clock_seek_started_at = None
+        self._transcript_follow_suspended_until = 0.0
         self._transcript_default_cursor = "xterm"
         self.speakers_json = speakers_json
         self.segments_json = segments_json
@@ -1632,7 +1644,7 @@ class NamingDialog(tk.Toplevel):
         viewer.columnconfigure(0, weight=1)
         viewer.rowconfigure(0, weight=1)
         self.text = tk.Text(viewer, wrap="word", height=8)
-        yscroll = ttk.Scrollbar(viewer, orient="vertical", command=self.text.yview)
+        yscroll = ttk.Scrollbar(viewer, orient="vertical", command=self._on_transcript_scrollbar)
         self.text.configure(yscrollcommand=yscroll.set)
         self.text.grid(row=0, column=0, sticky="nsew")
         yscroll.grid(row=0, column=1, sticky="ns")
@@ -1777,11 +1789,17 @@ class NamingDialog(tk.Toplevel):
                 target_ms = min(target_ms, duration_ms)
             self._vlc_player.set_time(target_ms)
             self.video_seek_var.set(target_ms / 1000.0)
+            self._reset_interpolated_playback_clock(
+                target_ms / 1000.0,
+                pending_seek=True,
+            )
+            self._schedule_word_synchronization()
         except Exception:
             pass
 
     def _video_seek_started(self, _event=None):
         self._seek_dragging = True
+        self._rebase_interpolated_playback_clock_from_player()
 
     def _video_seek_released(self, _event=None):
         self._seek_dragging = False
@@ -1794,11 +1812,14 @@ class NamingDialog(tk.Toplevel):
         try:
             if self._vlc_player.is_playing():
                 self._vlc_player.pause()
+                self._rebase_interpolated_playback_clock_from_player()
                 self.btn_video_play.configure(text="Play")
             else:
+                self._rebase_interpolated_playback_clock_from_player()
                 self._vlc_player.play()
                 self.btn_video_play.configure(text="Pause")
                 self._schedule_selected_subtitle_after_play()
+                self._schedule_word_synchronization()
         except Exception as exc:
             messagebox.showerror("Video Preview", f"Could not control playback:\n{exc}", parent=self)
 
@@ -1821,6 +1842,9 @@ class NamingDialog(tk.Toplevel):
         self._seek_embedded_video(current + 5.0)
 
     def _video_stop(self):
+        self._cancel_word_synchronization()
+        self._clear_current_word()
+        self._reset_interpolated_playback_clock()
         self._cancel_pending_video_seek()
         self._cancel_pending_subtitle_apply()
         if self._vlc_player is None:
@@ -2103,13 +2127,18 @@ class NamingDialog(tk.Toplevel):
         if self._vlc_player.play() == -1:
             raise RuntimeError("LibVLC could not start playback")
         self.btn_video_play.configure(text="Pause")
+        self._reset_interpolated_playback_clock(start_seconds, pending_seek=True)
         self._schedule_video_start_seek(start_seconds)
         self._schedule_selected_subtitle_after_play()
+        self._schedule_word_synchronization()
 
     def _release_embedded_player(self):
         if self._player_closing:
             return
         self._player_closing = True
+        self._cancel_word_synchronization()
+        self._clear_current_word()
+        self._reset_interpolated_playback_clock()
         self._cancel_pending_video_seek()
         self._cancel_pending_subtitle_apply()
         if self._video_update_after is not None:
@@ -2176,14 +2205,27 @@ class NamingDialog(tk.Toplevel):
         try:
             style = tb.Style.get_instance() or tb.Style()
             hover_color = style.colors.primary
+            current_background = style.colors.primary
+            current_foreground = style.colors.get_foreground("primary")
         except Exception:
             hover_color = "#0d6efd"
+            current_background = "#0d6efd"
+            current_foreground = "#ffffff"
         self._transcript_default_cursor = self.text.cget("cursor") or "xterm"
         self.text.tag_configure("clickable_word")
         self.text.tag_configure("hover_word", foreground=hover_color, underline=True)
+        self.text.tag_configure(
+            "current_word",
+            background=current_background,
+            foreground=current_foreground,
+        )
         self.text.tag_bind("clickable_word", "<Enter>", self._on_clickable_word_enter)
         self.text.tag_bind("clickable_word", "<Leave>", self._on_clickable_word_leave)
         self.text.tag_bind("clickable_word", "<Button-1>", self._on_clickable_word_click)
+        self.text.bind("<MouseWheel>", self._on_manual_transcript_scroll, add="+")
+        self.text.bind("<Button-4>", self._on_manual_transcript_scroll, add="+")
+        self.text.bind("<Button-5>", self._on_manual_transcript_scroll, add="+")
+        self.text.tag_raise("current_word")
 
     def _clear_transcript_word_mappings(self):
         self.text.tag_remove("hover_word", "1.0", "end")
@@ -2197,6 +2239,8 @@ class NamingDialog(tk.Toplevel):
         self._word_records = []
         self._word_tag_to_record = {}
         self._word_tag_names = []
+        self._timed_word_index = []
+        self._timed_word_starts = []
 
     @staticmethod
     def _valid_word_time_range(word):
@@ -2301,6 +2345,264 @@ class NamingDialog(tk.Toplevel):
             self._insert_segment_with_word_tags(segment, segment_index, segment_text)
             rendered_any = True
         self.text.edit_reset()
+        self._rebuild_timed_word_index()
+
+    def _rebuild_timed_word_index(self):
+        self._timed_word_index = sorted(
+            self._word_records,
+            key=lambda record: (
+                record["media_start"],
+                record["media_end"],
+                record["segment_index"],
+                record["word_index"],
+            ),
+        )
+        self._timed_word_starts = [record["media_start"] for record in self._timed_word_index]
+        self._rebase_interpolated_playback_clock_from_player()
+
+    def _timed_word_at_playback_time(self, current_seconds):
+        if not self._timed_word_index:
+            return None
+        try:
+            current_seconds = float(current_seconds)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(current_seconds):
+            return None
+        index = bisect_right(self._timed_word_starts, current_seconds) - 1
+        if index < 0:
+            return None
+        record = self._timed_word_index[index]
+        if record["media_start"] <= current_seconds < record["media_end"]:
+            return record
+        return None
+
+    def _clear_current_word(self):
+        if self._current_word_tag is None:
+            return
+        try:
+            self.text.tag_remove("current_word", "1.0", "end")
+        except (AttributeError, tk.TclError):
+            pass
+        self._current_word_tag = None
+
+    def _current_word_is_visible(self, text_index):
+        try:
+            bounds = self.text.bbox(text_index)
+            if bounds is None:
+                return False
+            _x, y, _width, height = bounds
+            widget_height = self.text.winfo_height()
+            return y >= 0 and y + height <= widget_height
+        except (AttributeError, tk.TclError):
+            return False
+
+    def _set_current_word(self, record):
+        next_tag = record.get("tag") if record is not None else None
+        if next_tag == self._current_word_tag:
+            return
+        self._clear_current_word()
+        if record is None:
+            return
+        live_range = self._live_word_tag_range(record)
+        if live_range is None:
+            return
+        try:
+            self.text.tag_add("current_word", live_range[0], live_range[1])
+            self.text.tag_raise("current_word")
+            self._current_word_tag = next_tag
+            if (
+                time.monotonic() >= self._transcript_follow_suspended_until
+                and not self._current_word_is_visible(live_range[0])
+            ):
+                self.text.see(live_range[0])
+        except (AttributeError, tk.TclError):
+            self._current_word_tag = None
+
+    def _cancel_word_synchronization(self):
+        if self._word_sync_after is None:
+            return
+        try:
+            self.after_cancel(self._word_sync_after)
+        except (AttributeError, tk.TclError):
+            pass
+        self._word_sync_after = None
+
+    def _reset_interpolated_playback_clock(self, media_seconds=None, *, pending_seek=False):
+        now = time.monotonic()
+        if media_seconds is None:
+            self._word_clock_vlc_seconds = None
+            self._word_clock_vlc_observed_at = None
+            self._word_clock_estimate_seconds = None
+            self._word_clock_seek_target = None
+            self._word_clock_seek_started_at = None
+            return
+        try:
+            media_seconds = float(media_seconds)
+        except (TypeError, ValueError):
+            self._reset_interpolated_playback_clock()
+            return
+        if not math.isfinite(media_seconds):
+            self._reset_interpolated_playback_clock()
+            return
+        media_seconds = max(0.0, media_seconds)
+        self._word_clock_vlc_seconds = None if pending_seek else media_seconds
+        self._word_clock_vlc_observed_at = now
+        self._word_clock_estimate_seconds = media_seconds
+        self._word_clock_seek_target = media_seconds if pending_seek else None
+        self._word_clock_seek_started_at = now if pending_seek else None
+
+    def _reported_vlc_playback_seconds(self):
+        if self._vlc_player is None:
+            return None
+        try:
+            reported_ms = int(self._vlc_player.get_time())
+        except Exception:
+            return None
+        return reported_ms / 1000.0 if reported_ms >= 0 else None
+
+    def _rebase_interpolated_playback_clock_from_player(self):
+        self._reset_interpolated_playback_clock(self._reported_vlc_playback_seconds())
+
+    def _interpolated_playback_time(
+        self,
+        reported_seconds,
+        is_playing,
+        duration_seconds=0.0,
+    ):
+        try:
+            reported_seconds = max(0.0, float(reported_seconds))
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(reported_seconds):
+            return None
+        try:
+            duration_seconds = max(0.0, float(duration_seconds))
+        except (TypeError, ValueError):
+            duration_seconds = 0.0
+        if not math.isfinite(duration_seconds):
+            duration_seconds = 0.0
+
+        now = time.monotonic()
+        allow_seek_correction = False
+        if self._word_clock_seek_target is not None:
+            seek_target = self._word_clock_seek_target
+            seek_started_at = self._word_clock_seek_started_at or now
+            seek_elapsed = max(0.0, now - seek_started_at)
+            reading_matches_seek = abs(reported_seconds - seek_target) <= 0.75
+            if not reading_matches_seek and seek_elapsed < 2.0:
+                estimate = seek_target + (seek_elapsed if is_playing else 0.0)
+                previous_estimate = self._word_clock_estimate_seconds
+                if is_playing and previous_estimate is not None:
+                    estimate = max(previous_estimate, estimate)
+                if duration_seconds > 0:
+                    estimate = min(estimate, duration_seconds)
+                self._word_clock_estimate_seconds = estimate
+                return estimate
+            allow_seek_correction = not reading_matches_seek
+            self._word_clock_seek_target = None
+            self._word_clock_seek_started_at = None
+
+        if not is_playing:
+            estimate = reported_seconds
+            self._word_clock_vlc_seconds = reported_seconds
+            self._word_clock_vlc_observed_at = now
+        elif self._word_clock_vlc_seconds is None:
+            estimate = reported_seconds
+            self._word_clock_vlc_seconds = reported_seconds
+            self._word_clock_vlc_observed_at = now
+        elif reported_seconds != self._word_clock_vlc_seconds:
+            estimate = reported_seconds
+            if not allow_seek_correction and self._word_clock_estimate_seconds is not None:
+                estimate = max(self._word_clock_estimate_seconds, estimate)
+            self._word_clock_vlc_seconds = reported_seconds
+            self._word_clock_vlc_observed_at = now
+        else:
+            observed_at = self._word_clock_vlc_observed_at or now
+            estimate = reported_seconds + max(0.0, now - observed_at)
+            if self._word_clock_estimate_seconds is not None:
+                estimate = max(self._word_clock_estimate_seconds, estimate)
+
+        if duration_seconds > 0:
+            estimate = min(estimate, duration_seconds)
+        self._word_clock_estimate_seconds = estimate
+        return estimate
+
+    def _schedule_word_synchronization(self):
+        if (
+            self._word_sync_after is not None
+            or self._player_closing
+            or self._vlc_player is None
+            or self._loaded_video_path is None
+        ):
+            return
+        try:
+            if not self.winfo_exists() or not self.text.winfo_exists():
+                return
+            self._word_sync_after = self.after(
+                self._word_sync_interval_ms,
+                self._synchronize_current_word,
+            )
+        except (AttributeError, tk.TclError):
+            self._word_sync_after = None
+
+    def _synchronize_current_word(self):
+        self._word_sync_after = None
+        if self._player_closing or self._vlc_player is None or self._loaded_video_path is None:
+            return
+        try:
+            if not self.winfo_exists() or not self.text.winfo_exists():
+                return
+            current_ms = int(self._vlc_player.get_time())
+            duration_ms = max(0, int(self._vlc_player.get_length()))
+            try:
+                is_playing = bool(self._vlc_player.is_playing())
+            except Exception:
+                is_playing = False
+            try:
+                state = self._vlc_player.get_state()
+                player_state = getattr(state, "name", None)
+                if player_state is None:
+                    player_state = str(state)
+            except Exception:
+                player_state = ""
+            if "ended" in str(player_state).lower() or (
+                duration_ms > 0 and current_ms >= duration_ms
+            ):
+                self._clear_current_word()
+                self._reset_interpolated_playback_clock()
+                return
+            current_seconds = (
+                self._interpolated_playback_time(
+                    current_ms / 1000.0,
+                    is_playing,
+                    duration_ms / 1000.0,
+                )
+                if current_ms >= 0
+                else None
+            )
+            record = (
+                self._timed_word_at_playback_time(current_seconds)
+                if current_seconds is not None
+                else None
+            )
+            self._set_current_word(record)
+        except Exception:
+            pass
+        self._schedule_word_synchronization()
+
+    def _suspend_transcript_following(self):
+        self._transcript_follow_suspended_until = time.monotonic() + 3.0
+
+    def _on_manual_transcript_scroll(self, _event=None):
+        self._suspend_transcript_following()
+
+    def _on_transcript_scrollbar(self, *args):
+        self._suspend_transcript_following()
+        self.text.yview(*args)
+
+    def _enable_transcript_following(self):
+        self._transcript_follow_suspended_until = 0.0
 
     def _live_word_tag_range(self, record):
         try:
@@ -2372,8 +2674,14 @@ class NamingDialog(tk.Toplevel):
             messagebox.showinfo("Video Preview", unavailable_reason, parent=self)
             return
         try:
+            self._enable_transcript_following()
+            self._reset_interpolated_playback_clock(
+                max(0.0, float(record["media_start"])),
+                pending_seek=True,
+            )
             self._load_embedded_video(video_path, max(0.0, float(record["media_start"])))
         except Exception as exc:
+            self._rebase_interpolated_playback_clock_from_player()
             messagebox.showwarning("Video Preview", f"Could not play the selected word:\n{exc}", parent=self)
 
     def _on_clickable_word_click(self, event):
@@ -2425,9 +2733,18 @@ class NamingDialog(tk.Toplevel):
         return "\n".join(lines)
 
     def _refresh_transcript_preview(self):
+        restart_synchronization = (
+            not self._player_closing
+            and self._vlc_player is not None
+            and self._loaded_video_path is not None
+        )
+        self._cancel_word_synchronization()
+        self._clear_current_word()
         self._render_transcript_preview()
         query = self.find_var.get().strip() if hasattr(self, "find_var") else ""
         self._highlight_query(query)
+        if restart_synchronization:
+            self._schedule_word_synchronization()
 
     def _load_transcript(self):
         out_dir = self.speakers_json.parent
@@ -2466,6 +2783,7 @@ class NamingDialog(tk.Toplevel):
     def _reset_highlight(self):
         self.text.tag_delete("find")
         self.text.tag_configure("find", background="#fff59d")
+        self.text.tag_raise("current_word")
 
     def _highlight_query(self, query: str):
         self._reset_highlight()
@@ -2483,8 +2801,10 @@ class NamingDialog(tk.Toplevel):
         if first:
             self.text.see(first)
             self.text.mark_set("insert", first)
+        self.text.tag_raise("current_word")
 
     def find_next(self):
+        self._suspend_transcript_following()
         query = self.find_var.get().strip()
         if not query:
             return
@@ -2499,6 +2819,7 @@ class NamingDialog(tk.Toplevel):
         self._highlight_query(query)
 
     def find_speaker_tag(self):
+        self._suspend_transcript_following()
         tag = self.find_speaker_var.get().strip()
         if not tag:
             return
