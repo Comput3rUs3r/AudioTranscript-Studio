@@ -75,7 +75,7 @@ def write_word_ass(out_path, segments, mapping):
 
     with open(out_path, "w", encoding="utf-8", newline="\n") as f:
         f.write("[Script Info]\n")
-        f.write("ScriptType: v4.00+\nCollisions: Normal\nPlayResX: 1920\nPlayResY: 1080\nScaledBorderAndShadow: yes\nWrapStyle: 2\n")
+        f.write("ScriptType: v4.00+\nCollisions: Normal\nPlayResX: 1920\nPlayResY: 1080\nScaledBorderAndShadow: yes\nWrapStyle: 0\n")
         f.write("\n[V4+ Styles]\n")
         f.write("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n")
         for sp in speakers:
@@ -221,7 +221,7 @@ def write_ass_plain(out_path, segments, mapping):
 
     with open(out_path, "w", encoding="utf-8", newline="\n") as f:
         f.write("[Script Info]\n")
-        f.write("ScriptType: v4.00+\nCollisions: Normal\nPlayResX: 1920\nPlayResY: 1080\nScaledBorderAndShadow: yes\nWrapStyle: 2\n")
+        f.write("ScriptType: v4.00+\nCollisions: Normal\nPlayResX: 1920\nPlayResY: 1080\nScaledBorderAndShadow: yes\nWrapStyle: 0\n")
         f.write("\n[V4+ Styles]\n")
         f.write("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n")
         for sp in speakers:
@@ -277,6 +277,123 @@ def find_segments_matching_query(segments, query: str):
     return [seg for seg in segments if q and q in (seg.get("text","").lower())]
 
 _VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".avi", ".m4v")
+
+_EMBEDDED_VLC_CHECKED = False
+_EMBEDDED_VLC_INSTANCE = None
+_EMBEDDED_VLC_VERSION = None
+_EMBEDDED_VLC_RUNTIME_PATH = None
+_EMBEDDED_VLC_FAILURE_REASON = "Embedded VLC availability has not been checked."
+_VLC_DLL_DIRECTORY_HANDLES = {}
+
+
+def _standard_windows_vlc_directories():
+    """Return the standard Windows VLC installation directories, in priority order."""
+    candidates = []
+    for env_name in ("ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"):
+        program_files = os.environ.get(env_name)
+        if program_files:
+            candidates.append(_PathMod(program_files) / "VideoLAN" / "VLC")
+    candidates.extend((
+        _PathMod(r"C:\Program Files\VideoLAN\VLC"),
+        _PathMod(r"C:\Program Files (x86)\VideoLAN\VLC"),
+    ))
+
+    unique = []
+    seen = set()
+    for candidate in candidates:
+        key = str(candidate).rstrip("\\/").casefold()
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+    return unique
+
+
+def _discover_windows_vlc_runtime():
+    if os.name != "nt":
+        return None, "Embedded VLC playback is currently available only on Windows."
+
+    checked = []
+    incomplete = []
+    for directory in _standard_windows_vlc_directories():
+        checked.append(str(directory))
+        missing = []
+        for required_name in ("libvlc.dll", "libvlccore.dll"):
+            if not (directory / required_name).is_file():
+                missing.append(required_name)
+        if not (directory / "plugins").is_dir():
+            missing.append("plugins")
+        if not missing:
+            return directory, ""
+        if directory.exists():
+            incomplete.append(f"{directory} (missing {', '.join(missing)})")
+
+    if incomplete:
+        return None, "VLC installation is incomplete: " + "; ".join(incomplete)
+    return None, "VLC was not found in the standard Program Files locations: " + "; ".join(checked)
+
+
+def _embedded_vlc_status_result():
+    return {
+        "available": _EMBEDDED_VLC_INSTANCE is not None,
+        "instance": _EMBEDDED_VLC_INSTANCE,
+        "version": _EMBEDDED_VLC_VERSION,
+        "runtime_path": _EMBEDDED_VLC_RUNTIME_PATH,
+        "reason": _EMBEDDED_VLC_FAILURE_REASON,
+    }
+
+
+def get_embedded_vlc_status(force_retry=False):
+    """Initialize LibVLC lazily and report whether embedded playback is available."""
+    global _EMBEDDED_VLC_CHECKED
+    global _EMBEDDED_VLC_INSTANCE
+    global _EMBEDDED_VLC_VERSION
+    global _EMBEDDED_VLC_RUNTIME_PATH
+    global _EMBEDDED_VLC_FAILURE_REASON
+
+    if _EMBEDDED_VLC_CHECKED and not force_retry:
+        return _embedded_vlc_status_result()
+
+    _EMBEDDED_VLC_CHECKED = True
+    _EMBEDDED_VLC_INSTANCE = None
+    _EMBEDDED_VLC_VERSION = None
+    _EMBEDDED_VLC_RUNTIME_PATH = None
+
+    runtime_path, failure_reason = _discover_windows_vlc_runtime()
+    if runtime_path is None:
+        _EMBEDDED_VLC_FAILURE_REASON = failure_reason
+        return _embedded_vlc_status_result()
+
+    plugins_path = runtime_path / "plugins"
+    os.environ["VLC_PLUGIN_PATH"] = str(plugins_path)
+
+    try:
+        add_dll_directory = getattr(os, "add_dll_directory", None)
+        if add_dll_directory is None:
+            raise RuntimeError("this Python version does not provide os.add_dll_directory()")
+        handle_key = str(runtime_path).casefold()
+        if handle_key not in _VLC_DLL_DIRECTORY_HANDLES:
+            _VLC_DLL_DIRECTORY_HANDLES[handle_key] = add_dll_directory(str(runtime_path))
+
+        import vlc
+
+        instance = vlc.Instance("--quiet", "--no-video-title-show")
+        if instance is None:
+            raise RuntimeError("LibVLC returned no instance")
+        raw_version = vlc.libvlc_get_version()
+        if isinstance(raw_version, bytes):
+            version = raw_version.decode("utf-8", errors="replace")
+        else:
+            version = str(raw_version)
+    except (Exception, SystemExit) as exc:
+        detail = str(exc).strip() or type(exc).__name__
+        _EMBEDDED_VLC_FAILURE_REASON = f"LibVLC could not initialize from {runtime_path}: {detail}"
+        return _embedded_vlc_status_result()
+
+    _EMBEDDED_VLC_INSTANCE = instance
+    _EMBEDDED_VLC_VERSION = version
+    _EMBEDDED_VLC_RUNTIME_PATH = str(runtime_path)
+    _EMBEDDED_VLC_FAILURE_REASON = ""
+    return _embedded_vlc_status_result()
 
 def guess_video_for_srt(srt_path: _PathMod, project_root: _PathMod):
     try:
@@ -739,6 +856,25 @@ def _best_names_list(*counters: Counter, limit: int = 8) -> list:
             break
     return out
 
+_AUTO_SPEAKER_NAME_REJECT_WORDS = {
+    "they", "them", "their", "he", "him", "his", "she", "her", "we", "us", "our",
+    "you", "your", "people", "one", "then", "when", "where", "what", "why", "wait",
+    "first", "now", "these",
+}
+
+def _best_auto_speaker_names(*counters: Counter, limit: int = 8) -> list:
+    candidates = _best_names_list(*counters, limit=50)
+    credible = []
+    for candidate in candidates:
+        words = [word.casefold() for word in candidate.split()]
+        if any(word in _AUTO_SPEAKER_NAME_REJECT_WORDS for word in words):
+            continue
+        credible.append(candidate)
+
+    # Keep the existing ranking within each group, but prefer full person names.
+    credible.sort(key=lambda candidate: 0 if len(candidate.split()) > 1 else 1)
+    return credible[:limit]
+
 def safe_base(name: str) -> str:
     name = name.strip()
     name = re.sub(r"[^A-Za-z0-9 _\-]", "_", name)
@@ -1143,6 +1279,19 @@ class NamingDialog(tk.Toplevel):
         self.geometry("1180x700")
         self.minsize(960, 600)
         self.resizable(True, True)
+        self._vlc_status = {}
+        self._vlc_instance = None
+        self._vlc_player = None
+        self._vlc_media = None
+        self._loaded_video_path = None
+        self._video_update_after = None
+        self._pending_seek_after = None
+        self._pending_subtitle_after = None
+        self._seek_dragging = False
+        self._video_duration_seconds = 0.0
+        self._player_closing = False
+        self._subtitle_track_ids = {}
+        self._applied_subtitle_choice = None
         self.speakers_json = speakers_json
         self.segments_json = segments_json
         spk_data = json.loads(speakers_json.read_text(encoding="utf-8"))
@@ -1152,6 +1301,20 @@ class NamingDialog(tk.Toplevel):
         self.saved_names = dict(spk_data.get("names") or spk_data.get("name_map") or {})
         self.segments_data = copy.deepcopy(seg_data)
         self.segments = copy.deepcopy(seg_data.get("segments") or [])
+        subtitle_title = seg_data.get("title") or speakers_json.parent.name
+        subtitle_candidates = (
+            ("SRT", speakers_json.parent / f"{subtitle_title}.srt"),
+            ("ASS (plain)", speakers_json.parent / f"{subtitle_title}.plain.ass"),
+            ("ASS (word highlighting)", speakers_json.parent / f"{subtitle_title}.words.ass"),
+        )
+        self._subtitle_paths = {
+            label: path
+            for label, path in subtitle_candidates
+            if path.is_file()
+        }
+        self._subtitle_choices = ["Off"] + [
+            label for label, _path in subtitle_candidates if label in self._subtitle_paths
+        ]
         self.manual_corrections_pending = False
         global_counts = Counter(_extract_candidates_from_text(" ".join(str(s.get("text","")) for s in self.segments)))
         # Do not use the file title as a strong name source. Titles are usually topics, not speakers.
@@ -1178,7 +1341,8 @@ class NamingDialog(tk.Toplevel):
         left.rowconfigure(0, weight=1, minsize=150)
         left.rowconfigure(1, weight=1, minsize=125)
         right.columnconfigure(0, weight=1)
-        right.rowconfigure(1, weight=1)
+        right.rowconfigure(1, weight=3)
+        right.rowconfigure(2, weight=2, minsize=120)
         self.inputs = {}
         self.selected_speaker = tk.StringVar(value=self.speakers[0] if self.speakers else "")
 
@@ -1236,6 +1400,22 @@ class NamingDialog(tk.Toplevel):
             command=self.open_segment_corrections,
             bootstyle="primary-outline",
         ).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+
+        def suggest_first_two_names():
+            filled = self._prefill_first_two(per_spk_counts, global_counts, title_counts)
+            if filled == 0:
+                messagebox.showinfo(
+                    "No names suggested",
+                    "No empty fields for the first two speakers had an available name suggestion.",
+                    parent=self,
+                )
+
+        tb.Button(
+            assignments,
+            text="Suggest names for first two speakers",
+            command=suggest_first_two_names,
+            bootstyle="primary-outline",
+        ).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
         # Candidate name pool: names/entities found in the transcript.
         # These are NOT automatically assigned. The user assigns them manually.
@@ -1310,8 +1490,6 @@ class NamingDialog(tk.Toplevel):
         ttk.Checkbutton(opts, text="Overwrite existing SRT/TXT (recommended)", variable=self.var_overwrite).grid(row=0, column=0, sticky="w")
         self.var_rename_audio = tk.BooleanVar(value=True)
         ttk.Checkbutton(opts, text="Rename folders and .wav files with names", variable=self.var_rename_audio).grid(row=1, column=0, sticky="w", pady=(2, 0))
-        self.var_autofill2 = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opts, text="Prefill first two speakers by earliest appearance", variable=self.var_autofill2).grid(row=2, column=0, sticky="w", pady=(2, 0))
         try:
             _cfg = read_yaml(conf_path())
         except:
@@ -1349,14 +1527,100 @@ class NamingDialog(tk.Toplevel):
         search_actions.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(8, 0))
         tb.Button(search_actions, text="Find next", command=self.find_next, bootstyle="primary-outline").pack(side="left")
         ttk.Button(search_actions, text="Find speaker tag", command=self.find_speaker_tag).pack(side="left", padx=(6, 0))
-        ttk.Button(search_actions, text="Open video at hit", command=self.open_video_at_query).pack(side="left", padx=(6, 0))
-        ttk.Button(search_actions, text="Open externally", command=self.open_txt_external).pack(side="left", padx=(6, 0))
+        ttk.Button(search_actions, text="Preview video at hit", command=self.preview_video_at_query).pack(side="left", padx=(6, 0))
+        ttk.Button(search_actions, text="Open video externally", command=self.open_video_at_query).pack(side="left", padx=(6, 0))
+        ttk.Button(search_actions, text="Open transcript file", command=self.open_txt_external).pack(side="left", padx=(6, 0))
+
+        video = ttk.LabelFrame(right, text="Video Preview", padding=8)
+        video.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
+        video.columnconfigure(0, weight=1, minsize=480)
+        video.rowconfigure(0, weight=1, minsize=270)
+
+        video_host = ttk.Frame(video)
+        video_host.grid(row=0, column=0, sticky="nsew")
+        video_host.columnconfigure(0, weight=1)
+        video_host.rowconfigure(0, weight=1)
+        self.video_surface = tk.Frame(
+            video_host,
+            width=480,
+            height=270,
+            background="black",
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self.video_surface.grid(row=0, column=0, sticky="nsew")
+        self.video_message = tk.Label(
+            self.video_surface,
+            text="No video loaded",
+            background="black",
+            foreground="#c8c8c8",
+            justify="center",
+            wraplength=430,
+        )
+        self.video_message.place(relx=0.5, rely=0.5, anchor="center")
+
+        player_controls = ttk.Frame(video)
+        player_controls.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        player_controls.columnconfigure(4, weight=1)
+        self.btn_video_back = ttk.Button(player_controls, text="Back 5 seconds", command=self._video_back)
+        self.btn_video_back.grid(row=0, column=0, padx=(0, 6))
+        self.btn_video_play = tb.Button(player_controls, text="Play", command=self._video_play_pause, bootstyle="primary-outline")
+        self.btn_video_play.grid(row=0, column=1, padx=(0, 6))
+        self.btn_video_forward = ttk.Button(player_controls, text="Forward 5 seconds", command=self._video_forward)
+        self.btn_video_forward.grid(row=0, column=2, padx=(0, 6))
+        self.btn_video_stop = ttk.Button(player_controls, text="Stop", command=self._video_stop)
+        self.btn_video_stop.grid(row=0, column=3, padx=(0, 8))
+        self.lbl_video_time = ttk.Label(player_controls, text="00:00 / 00:00")
+        self.lbl_video_time.grid(row=0, column=5, sticky="e")
+
+        self.video_seek_var = tk.DoubleVar(value=0.0)
+        self.video_seek = ttk.Scale(player_controls, from_=0.0, to=1.0, variable=self.video_seek_var)
+        self.video_seek.grid(row=1, column=0, columnspan=6, sticky="ew", pady=(8, 0))
+        self.video_seek.bind("<ButtonPress-1>", self._video_seek_started)
+        self.video_seek.bind("<ButtonRelease-1>", self._video_seek_released)
+
+        lower_controls = ttk.Frame(video)
+        lower_controls.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        lower_controls.columnconfigure(2, weight=1)
+        ttk.Label(lower_controls, text="Subtitles").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        default_subtitle = "SRT" if "SRT" in self._subtitle_paths else "Off"
+        self.subtitle_var = tk.StringVar(value=default_subtitle)
+        self.subtitle_selector = ttk.Combobox(
+            lower_controls,
+            textvariable=self.subtitle_var,
+            values=self._subtitle_choices,
+            width=24,
+            state="readonly",
+        )
+        self.subtitle_selector.grid(row=0, column=1, sticky="w")
+        self.subtitle_selector.bind("<<ComboboxSelected>>", self._subtitle_selection_changed)
+
+        ttk.Label(lower_controls, text="Volume").grid(row=0, column=3, sticky="e", padx=(12, 6))
+        self.video_volume_var = tk.DoubleVar(value=80.0)
+        self.video_volume = ttk.Scale(
+            lower_controls,
+            from_=0.0,
+            to=100.0,
+            length=120,
+            variable=self.video_volume_var,
+            command=self._video_volume_changed,
+        )
+        self.video_volume.grid(row=0, column=4, sticky="e")
+        self._video_controls = [
+            self.btn_video_back,
+            self.btn_video_play,
+            self.btn_video_forward,
+            self.btn_video_stop,
+            self.video_seek,
+            self.subtitle_selector,
+            self.video_volume,
+        ]
 
         viewer = ttk.LabelFrame(right, text="Transcript Preview", padding=8)
-        viewer.grid(row=1, column=0, sticky="nsew")
+        viewer.grid(row=2, column=0, sticky="nsew")
         viewer.columnconfigure(0, weight=1)
         viewer.rowconfigure(0, weight=1)
-        self.text = tk.Text(viewer, wrap="word")
+        self.text = tk.Text(viewer, wrap="word", height=8)
         yscroll = ttk.Scrollbar(viewer, orient="vertical", command=self.text.yview)
         self.text.configure(yscrollcommand=yscroll.set)
         self.text.grid(row=0, column=0, sticky="nsew")
@@ -1372,8 +1636,505 @@ class NamingDialog(tk.Toplevel):
             initial = self.speakers[0] if self.speakers else "SPEAKER_00"
         self.find_var.set(initial)
         self._highlight_query(initial)
-        if self.var_autofill2.get() and not (getattr(self, "saved_names", None) and len(self.saved_names)>0):
-            self._prefill_first_two(per_spk_counts, global_counts, title_counts)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.bind("<Destroy>", self._on_dialog_destroyed, add="+")
+        self._initialize_embedded_player()
+
+    def _set_video_message(self, message):
+        self.video_message.configure(text=message)
+        self.video_message.place(relx=0.5, rely=0.5, anchor="center")
+
+    def _initialize_embedded_player(self):
+        self._vlc_status = get_embedded_vlc_status()
+        if not self._vlc_status.get("available"):
+            reason = self._vlc_status.get("reason") or "Embedded VLC playback is unavailable."
+            self._set_video_message(f"Embedded video unavailable\n{reason}")
+            for control in self._video_controls:
+                control.state(["disabled"])
+            return
+
+        try:
+            self._vlc_instance = self._vlc_status["instance"]
+            self._vlc_player = self._vlc_instance.media_player_new()
+            if self._vlc_player is None:
+                raise RuntimeError("LibVLC returned no media player")
+            if os.name == "nt":
+                self.video_surface.update_idletasks()
+                self._vlc_player.set_hwnd(self.video_surface.winfo_id())
+            self._vlc_player.audio_set_volume(80)
+        except Exception as exc:
+            failed_player = self._vlc_player
+            self._vlc_player = None
+            if failed_player is not None:
+                try:
+                    failed_player.stop()
+                except Exception:
+                    pass
+                try:
+                    failed_player.release()
+                except Exception:
+                    pass
+            self._vlc_status = {
+                **self._vlc_status,
+                "available": False,
+                "reason": f"The embedded media player could not be created: {exc}",
+            }
+            self._set_video_message(f"Embedded video unavailable\n{self._vlc_status['reason']}")
+            for control in self._video_controls:
+                control.state(["disabled"])
+            return
+
+        self._schedule_video_ui_update()
+
+    @staticmethod
+    def _format_video_time(seconds):
+        seconds = max(0, int(seconds or 0))
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"{hours}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:02d}:{seconds:02d}"
+
+    def _schedule_video_ui_update(self):
+        if self._player_closing or self._vlc_player is None:
+            return
+        self._video_update_after = self.after(250, self._update_video_ui)
+
+    def _update_video_ui(self):
+        self._video_update_after = None
+        if self._player_closing or self._vlc_player is None:
+            return
+        try:
+            duration_ms = max(0, int(self._vlc_player.get_length()))
+            current_ms = max(0, int(self._vlc_player.get_time()))
+            duration = duration_ms / 1000.0
+            current = current_ms / 1000.0
+            if duration > 0:
+                self._video_duration_seconds = duration
+                self.video_seek.configure(to=max(1.0, duration))
+                current = min(current, duration)
+            if not self._seek_dragging:
+                self.video_seek_var.set(current)
+            self.lbl_video_time.configure(
+                text=f"{self._format_video_time(current)} / {self._format_video_time(duration)}"
+            )
+            self.btn_video_play.configure(text="Pause" if self._vlc_player.is_playing() else "Play")
+        except Exception:
+            pass
+        self._schedule_video_ui_update()
+
+    def _cancel_pending_video_seek(self):
+        if self._pending_seek_after is not None:
+            try:
+                self.after_cancel(self._pending_seek_after)
+            except Exception:
+                pass
+            self._pending_seek_after = None
+
+    def _schedule_video_start_seek(self, seconds, retries=12):
+        self._cancel_pending_video_seek()
+        target = max(0.0, float(seconds))
+
+        def try_seek(remaining):
+            self._pending_seek_after = None
+            if self._player_closing or self._vlc_player is None:
+                return
+            try:
+                duration_ms = max(0, int(self._vlc_player.get_length()))
+                target_ms = int(target * 1000)
+                if duration_ms > 0:
+                    target_ms = min(target_ms, duration_ms)
+                result = self._vlc_player.set_time(target_ms)
+                current_ms = max(0, int(self._vlc_player.get_time()))
+                target_reached = target_ms <= 500 or abs(current_ms - target_ms) <= 1500
+                if remaining > 0 and (result == -1 or not target_reached):
+                    self._pending_seek_after = self.after(150, lambda: try_seek(remaining - 1))
+            except Exception:
+                if remaining > 0:
+                    self._pending_seek_after = self.after(150, lambda: try_seek(remaining - 1))
+
+        self._pending_seek_after = self.after(150, lambda: try_seek(retries))
+
+    def _seek_embedded_video(self, seconds):
+        if self._vlc_player is None or self._loaded_video_path is None:
+            return
+        try:
+            duration_ms = max(0, int(self._vlc_player.get_length()))
+            target_ms = max(0, int(float(seconds) * 1000))
+            if duration_ms > 0:
+                target_ms = min(target_ms, duration_ms)
+            self._vlc_player.set_time(target_ms)
+            self.video_seek_var.set(target_ms / 1000.0)
+        except Exception:
+            pass
+
+    def _video_seek_started(self, _event=None):
+        self._seek_dragging = True
+
+    def _video_seek_released(self, _event=None):
+        self._seek_dragging = False
+        self._seek_embedded_video(self.video_seek_var.get())
+
+    def _video_play_pause(self):
+        if self._vlc_player is None or self._loaded_video_path is None:
+            messagebox.showinfo("Video Preview", "Load a video from a transcript hit first.", parent=self)
+            return
+        try:
+            if self._vlc_player.is_playing():
+                self._vlc_player.pause()
+                self.btn_video_play.configure(text="Play")
+            else:
+                self._vlc_player.play()
+                self.btn_video_play.configure(text="Pause")
+                self._schedule_selected_subtitle_after_play()
+        except Exception as exc:
+            messagebox.showerror("Video Preview", f"Could not control playback:\n{exc}", parent=self)
+
+    def _video_back(self):
+        if self._vlc_player is None:
+            return
+        try:
+            current = max(0.0, self._vlc_player.get_time() / 1000.0)
+        except Exception:
+            current = self.video_seek_var.get()
+        self._seek_embedded_video(current - 5.0)
+
+    def _video_forward(self):
+        if self._vlc_player is None:
+            return
+        try:
+            current = max(0.0, self._vlc_player.get_time() / 1000.0)
+        except Exception:
+            current = self.video_seek_var.get()
+        self._seek_embedded_video(current + 5.0)
+
+    def _video_stop(self):
+        self._cancel_pending_video_seek()
+        self._cancel_pending_subtitle_apply()
+        if self._vlc_player is None:
+            return
+        try:
+            self._vlc_player.stop()
+        except Exception:
+            pass
+        self.video_seek_var.set(0.0)
+        self.lbl_video_time.configure(
+            text=f"00:00 / {self._format_video_time(self._video_duration_seconds)}"
+        )
+        self.btn_video_play.configure(text="Play")
+
+    def _video_volume_changed(self, _value=None):
+        if self._vlc_player is None:
+            return
+        try:
+            volume = max(0, min(100, int(round(self.video_volume_var.get()))))
+            self._vlc_player.audio_set_volume(volume)
+        except Exception:
+            pass
+
+    def _cancel_pending_subtitle_apply(self):
+        if self._pending_subtitle_after is not None:
+            try:
+                self.after_cancel(self._pending_subtitle_after)
+            except Exception:
+                pass
+            self._pending_subtitle_after = None
+
+    def _subtitle_selection_changed(self, _event=None):
+        self._cancel_pending_subtitle_apply()
+        self._apply_selected_subtitle(preserve_state=True)
+
+    def _subtitle_playback_snapshot(self):
+        if self._vlc_player is None:
+            return None
+        try:
+            current_ms = max(0, int(self._vlc_player.get_time()))
+        except Exception:
+            current_ms = 0
+        try:
+            was_playing = bool(self._vlc_player.is_playing())
+        except Exception:
+            was_playing = False
+        try:
+            was_paused = "paused" in str(self._vlc_player.get_state()).lower()
+        except Exception:
+            was_paused = False
+        return current_ms, was_playing, was_paused
+
+    def _restore_subtitle_playback_state(self, snapshot):
+        if snapshot is None or self._vlc_player is None or self._player_closing:
+            return
+        saved_time, was_playing, was_paused = snapshot
+        try:
+            current_time = max(0, int(self._vlc_player.get_time()))
+            tolerance = 250 if was_paused else 1500
+            if abs(current_time - saved_time) > tolerance:
+                self._vlc_player.set_time(saved_time)
+            is_playing = bool(self._vlc_player.is_playing())
+            if was_playing and not is_playing:
+                self._vlc_player.play()
+            elif was_paused and is_playing:
+                self._vlc_player.pause()
+        except Exception:
+            pass
+
+    def _set_subtitles_off(self):
+        if self._vlc_player is not None:
+            try:
+                self._vlc_player.video_set_spu(-1)
+            except Exception:
+                pass
+        self._applied_subtitle_choice = "Off"
+
+    def _report_subtitle_failure(self, choice, message, remove_choice=False):
+        self._subtitle_track_ids.pop(choice, None)
+        self._set_subtitles_off()
+        self.subtitle_var.set("Off")
+        if remove_choice:
+            self._subtitle_paths.pop(choice, None)
+            self._subtitle_choices = [
+                available_choice
+                for available_choice in self._subtitle_choices
+                if available_choice == "Off" or available_choice in self._subtitle_paths
+            ]
+            self.subtitle_selector.configure(values=self._subtitle_choices)
+        if not self._player_closing:
+            messagebox.showwarning("Video subtitles", message, parent=self)
+
+    def _available_vlc_subtitle_track_ids(self):
+        track_ids = set()
+        if self._vlc_player is None:
+            return track_ids
+        try:
+            descriptions = self._vlc_player.video_get_spu_description() or ()
+        except Exception:
+            descriptions = ()
+        for description in descriptions:
+            try:
+                track_id = int(description[0])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if track_id >= 0:
+                track_ids.add(track_id)
+        try:
+            current_track = int(self._vlc_player.video_get_spu())
+        except Exception:
+            current_track = -1
+        if current_track >= 0:
+            track_ids.add(current_track)
+        track_ids.update(
+            track_id
+            for track_id in self._subtitle_track_ids.values()
+            if isinstance(track_id, int) and track_id >= 0
+        )
+        return track_ids
+
+    def _finish_subtitle_apply(
+        self,
+        choice,
+        snapshot,
+        retries,
+        previous_track_ids=None,
+        expected_track_id=None,
+    ):
+        self._pending_subtitle_after = None
+        if (
+            self._player_closing
+            or self._vlc_player is None
+            or self.subtitle_var.get() != choice
+        ):
+            return
+        try:
+            selected_track = int(self._vlc_player.video_get_spu())
+        except Exception:
+            selected_track = -1
+        verified_track = None
+        if expected_track_id is not None:
+            if selected_track == expected_track_id:
+                verified_track = expected_track_id
+        else:
+            previous_track_ids = set(previous_track_ids or ())
+            new_track_ids = self._available_vlc_subtitle_track_ids() - previous_track_ids
+            if selected_track in new_track_ids:
+                verified_track = selected_track
+            else:
+                for track_id in sorted(new_track_ids):
+                    try:
+                        result = self._vlc_player.video_set_spu(track_id)
+                        current_track = int(self._vlc_player.video_get_spu())
+                    except Exception:
+                        continue
+                    if result != -1 and current_track == track_id:
+                        verified_track = track_id
+                        break
+        self._restore_subtitle_playback_state(snapshot)
+        if verified_track is not None:
+            self._subtitle_track_ids[choice] = verified_track
+            self._applied_subtitle_choice = choice
+            return
+        if retries > 0:
+            self._pending_subtitle_after = self.after(
+                150,
+                lambda: self._finish_subtitle_apply(
+                    choice,
+                    snapshot,
+                    retries - 1,
+                    previous_track_ids,
+                    expected_track_id,
+                ),
+            )
+            return
+        subtitle_path = self._subtitle_paths.get(choice)
+        self._report_subtitle_failure(
+            choice,
+            f"VLC could not activate the subtitle file:\n{subtitle_path}\n\nVideo playback will continue without subtitles.",
+        )
+
+    def _apply_selected_subtitle(self, preserve_state=True):
+        if self._vlc_player is None or self._loaded_video_path is None:
+            return
+        choice = self.subtitle_var.get() or "Off"
+        snapshot = self._subtitle_playback_snapshot() if preserve_state else None
+        if choice == "Off":
+            self._set_subtitles_off()
+            self._restore_subtitle_playback_state(snapshot)
+            return
+
+        subtitle_path = self._subtitle_paths.get(choice)
+        if subtitle_path is None or not subtitle_path.is_file():
+            missing_path = subtitle_path or "the selected subtitle file"
+            self._report_subtitle_failure(
+                choice,
+                f"The subtitle file is no longer available:\n{missing_path}\n\nVideo playback will continue without subtitles.",
+                remove_choice=True,
+            )
+            self._restore_subtitle_playback_state(snapshot)
+            return
+
+        try:
+            existing_track = self._subtitle_track_ids.get(choice)
+            previous_track_ids = None
+            if existing_track is not None:
+                result = self._vlc_player.video_set_spu(existing_track)
+                if result == -1:
+                    self._subtitle_track_ids.pop(choice, None)
+                    existing_track = None
+            if existing_track is None:
+                import vlc
+
+                previous_track_ids = frozenset(self._available_vlc_subtitle_track_ids())
+                subtitle_uri = subtitle_path.resolve().as_uri()
+                result = self._vlc_player.add_slave(vlc.MediaSlaveType.subtitle, subtitle_uri, True)
+                if result == -1:
+                    raise RuntimeError("LibVLC rejected the subtitle track")
+        except Exception as exc:
+            self._report_subtitle_failure(
+                choice,
+                f"VLC could not load the subtitle file:\n{subtitle_path}\n\n{exc}\n\nVideo playback will continue without subtitles.",
+            )
+            self._restore_subtitle_playback_state(snapshot)
+            return
+
+        self._pending_subtitle_after = self.after(
+            150,
+            lambda: self._finish_subtitle_apply(
+                choice,
+                snapshot,
+                12,
+                previous_track_ids,
+                existing_track,
+            ),
+        )
+
+    def _schedule_selected_subtitle_after_play(self):
+        self._cancel_pending_subtitle_apply()
+
+        def apply_after_play():
+            self._pending_subtitle_after = None
+            self._apply_selected_subtitle(preserve_state=False)
+
+        self._pending_subtitle_after = self.after(250, apply_after_play)
+
+    def _load_embedded_video(self, video_path, start_seconds):
+        if self._vlc_player is None or self._vlc_instance is None:
+            raise RuntimeError(self._vlc_status.get("reason") or "Embedded VLC playback is unavailable.")
+
+        video_path = Path(video_path).resolve()
+        if not video_path.is_file():
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+        normalized_path = os.path.normcase(str(video_path))
+        same_video = normalized_path == self._loaded_video_path and self._vlc_media is not None
+
+        self._cancel_pending_video_seek()
+        self._cancel_pending_subtitle_apply()
+        if not same_video:
+            self._vlc_player.stop()
+            media = self._vlc_instance.media_new(str(video_path))
+            if media is None:
+                raise RuntimeError("LibVLC could not create media for the selected video")
+            old_media = self._vlc_media
+            self._vlc_player.set_media(media)
+            self._vlc_media = media
+            self._loaded_video_path = normalized_path
+            self._subtitle_track_ids.clear()
+            self._applied_subtitle_choice = None
+            if old_media is not None:
+                try:
+                    old_media.release()
+                except Exception:
+                    pass
+
+        if os.name == "nt":
+            self._vlc_player.set_hwnd(self.video_surface.winfo_id())
+        self.video_message.place_forget()
+        self._vlc_player.audio_set_volume(max(0, min(100, int(self.video_volume_var.get()))))
+        if self._vlc_player.play() == -1:
+            raise RuntimeError("LibVLC could not start playback")
+        self.btn_video_play.configure(text="Pause")
+        self._schedule_video_start_seek(start_seconds)
+        self._schedule_selected_subtitle_after_play()
+
+    def _release_embedded_player(self):
+        if self._player_closing:
+            return
+        self._player_closing = True
+        self._cancel_pending_video_seek()
+        self._cancel_pending_subtitle_apply()
+        if self._video_update_after is not None:
+            try:
+                self.after_cancel(self._video_update_after)
+            except Exception:
+                pass
+            self._video_update_after = None
+        player = self._vlc_player
+        media = self._vlc_media
+        self._vlc_player = None
+        self._vlc_media = None
+        if player is not None:
+            try:
+                player.stop()
+            except Exception:
+                pass
+            try:
+                player.release()
+            except Exception:
+                pass
+        if media is not None:
+            try:
+                media.release()
+            except Exception:
+                pass
+
+    def destroy(self):
+        self._release_embedded_player()
+        try:
+            super().destroy()
+        except tk.TclError:
+            pass
+
+    def _on_dialog_destroyed(self, event):
+        if event.widget is self:
+            self._release_embedded_player()
 
     def _current_name_mapping(self):
         return {
@@ -1530,6 +2291,91 @@ class NamingDialog(tk.Toplevel):
         else:
             messagebox.showinfo("No .txt file", "Transcript .txt not found on disk; showing generated preview only.")
 
+    def _select_srt_hit_for_preview(self):
+        query = (self.find_var.get() if hasattr(self, "find_var") else "").strip()
+        if not query:
+            messagebox.showinfo("Jump by SRT", "Type something in the Find box first, then try again.")
+            return None
+        out_dir = self.speakers_json.parent
+        srt_path = out_dir / f"{self.title_name}.srt"
+        if not srt_path.exists():
+            messagebox.showinfo("Jump by SRT", f"SRT not found:\n{srt_path.name}\n\nRun transcription first or enable SRT output.")
+            return None
+        try:
+            segments = parse_srt_segments(srt_path)
+        except Exception as exc:
+            messagebox.showerror("Jump by SRT", f"Could not read SRT:\n{exc}")
+            return None
+        hits = find_segments_matching_query(segments, query)
+        if not hits:
+            messagebox.showinfo("Jump by SRT", f"No SRT lines matched:\n\"{query}\"")
+            return None
+        if len(hits) == 1:
+            return srt_path, hits[0]
+        dialog = _SrtHitsDialog(self, hits)
+        self.wait_window(dialog)
+        if dialog.result is None:
+            return None
+        return srt_path, dialog.result
+
+    def _locate_video_for_preview(self, srt_path):
+        try:
+            project_root = program_root()
+        except Exception:
+            project_root = Path(".")
+        video_path = guess_video_for_srt(srt_path, project_root)
+        if video_path:
+            return Path(video_path)
+        selected = filedialog.askopenfilename(
+            title=f"Locate original video for {self.title_name}",
+            filetypes=[("Video files", "*.mp4 *.mkv *.mov *.avi *.webm *.m4v"), ("All Files", "*.*")],
+        )
+        return Path(selected) if selected else None
+
+    def _open_selected_hit_externally(self, srt_path, chosen):
+        try:
+            start = max(0.0, float(chosen["start"]))
+            cfg = read_yaml(conf_path()) if callable(globals().get("read_yaml")) else {}
+            vlc_p_str = cfg.get("video_player_path")
+            vlc_path = Path(vlc_p_str) if vlc_p_str else None
+            try:
+                jump_video_to_srt_time(srt_path, start, vlc_path=vlc_path)
+            except FileNotFoundError:
+                video_path = filedialog.askopenfilename(
+                    title=f"Locate original video for {self.title_name}",
+                    filetypes=[("Video files", "*.mp4 *.mkv *.mov *.avi *.webm *.m4v"), ("All Files", "*.*")],
+                )
+                if not video_path:
+                    return
+                video_path = Path(video_path)
+                if not _open_in_vlc(video_path, start, vlc_path=vlc_path):
+                    _open_in_ffplay(video_path, start)
+        except Exception as exc:
+            messagebox.showerror("Jump by SRT", f"Failed to open player:\n{exc}")
+
+    def preview_video_at_query(self):
+        selected_hit = self._select_srt_hit_for_preview()
+        if selected_hit is None:
+            return
+        srt_path, chosen = selected_hit
+        if self._vlc_player is None:
+            reason = self._vlc_status.get("reason") or "Embedded VLC playback is unavailable."
+            if messagebox.askyesno(
+                "Embedded video unavailable",
+                f"{reason}\n\nOpen this hit in the external video player instead?",
+                parent=self,
+            ):
+                self._open_selected_hit_externally(srt_path, chosen)
+            return
+        try:
+            video_path = self._locate_video_for_preview(srt_path)
+            if video_path is None:
+                return
+            start = max(0.0, float(chosen["start"]))
+            self._load_embedded_video(video_path, start)
+        except Exception as exc:
+            messagebox.showerror("Video Preview", f"Failed to preview video:\n{exc}", parent=self)
+
     def open_video_at_query(self):
         query = (self.find_var.get() if hasattr(self, "find_var") else "").strip()
         if not query:
@@ -1558,7 +2404,7 @@ class NamingDialog(tk.Toplevel):
         else:
             chosen = hits[0]
         try:
-            start = max(0.0, float(chosen["start"]) - 0.8)
+            start = max(0.0, float(chosen["start"]))
             cfg = read_yaml(conf_path()) if callable(globals().get("read_yaml")) else {}
             vlc_p_str = cfg.get("video_player_path")
             vlc_path = Path(vlc_p_str) if vlc_p_str else None
@@ -1587,6 +2433,7 @@ class NamingDialog(tk.Toplevel):
     def _prefill_first_two(self, per_spk_counts: dict, global_counts: list, title_counts: list):
         order = []
         seen = set()
+        filled = 0
         for seg in self.segments:
             sp = seg.get("speaker")
             if not sp or sp in seen: continue
@@ -1595,9 +2442,12 @@ class NamingDialog(tk.Toplevel):
         for sp in order:
             cb = self.inputs.get(sp)
             if not cb: continue
-            candidates = _best_names_list(per_spk_counts.get(sp, Counter()), global_counts, title_counts, limit=8)
+            if cb.get().strip(): continue
+            candidates = _best_auto_speaker_names(per_spk_counts.get(sp, Counter()), global_counts, title_counts, limit=8)
             if candidates:
                 cb.set(candidates[0])
+                filled += 1
+        return filled
 
     def _rename_tree(self, out_dir: Path, mapping: dict):
         spk_dirs = [d for d in out_dir.iterdir() if d.is_dir() and d.name.startswith("SPEAKER_")]
