@@ -13,7 +13,7 @@ from __future__ import annotations
 import os, sys, math, time, shlex, yaml, json, subprocess, hashlib, datetime, concurrent.futures, argparse
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 PIPELINE_VERSION = "v1.6.0"
 
@@ -30,6 +30,24 @@ AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".wma", ".opus"}
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
 MEDIA_EXTS = AUDIO_EXTS | VIDEO_EXTS
 SOURCE_IDENTITY_FIELDS = ("path", "size", "mtime_ns", "st_dev", "st_ino")
+PROGRESS_PREFIX = "@@ATS_PROGRESS@@"
+
+
+def emit_progress(
+    phase: str,
+    label: str,
+    file_percent: float,
+    file_index: int,
+    file_total: int,
+) -> None:
+    payload = {
+        "phase": phase,
+        "label": label,
+        "file_percent": file_percent,
+        "file_index": file_index,
+        "file_total": file_total,
+    }
+    print(PROGRESS_PREFIX + json.dumps(payload, separators=(",", ":")), flush=True)
 
 def normalized_source_path(path: Path | str) -> str:
     resolved = Path(path).expanduser().resolve(strict=True)
@@ -350,11 +368,21 @@ def load_asr_model(device: str, cfg: Conf):
     print(f"Loading WhisperX model='{cfg.model}' on {device} (compute_type={compute_type}) ...")
     return whisperx.load_model(cfg.model, device, compute_type=compute_type, language=cfg.language)
 
-def transcribe_whisperx(model, audio_path: Path, device: str, cfg: Conf) -> Dict[str, Any]:
+def transcribe_whisperx(
+    model,
+    audio_path: Path,
+    device: str,
+    cfg: Conf,
+    progress_callback: Optional[Callable[[str, str, float], None]] = None,
+) -> Dict[str, Any]:
     import whisperx
+    if progress_callback:
+        progress_callback("transcribing", "Transcribing", 25)
     print(">>Performing transcription...")
     result = model.transcribe(str(audio_path))
     if cfg.language:
+        if progress_callback:
+            progress_callback("aligning", "Aligning", 55)
         print(">>Performing alignment...")
         model_a, metadata = whisperx.load_align_model(language_code=cfg.language, device=device)
         result = whisperx.align(result["segments"], model_a, metadata, str(audio_path), device)
@@ -378,6 +406,8 @@ def transcribe_whisperx(model, audio_path: Path, device: str, cfg: Conf) -> Dict
             os.environ.setdefault("HUGGING_FACE_HUB_TOKEN", hf_token)
             os.environ.setdefault("HUGGINGFACE_HUB_TOKEN", hf_token)
         try:
+            if progress_callback:
+                progress_callback("identifying_speakers", "Identifying speakers", 68)
             print(">>Performing diarization...")
             try:
                 from whisperx.diarize import DiarizationPipeline  # type: ignore
@@ -547,8 +577,13 @@ def run_pipeline(explicit_files: List[str] = None, explicit_workers: int = None)
     print(f"Found {len(sources)} file(s) to process:")
     for p in sources: print(f" - {print_rel_or_abs(p)}")
     
+    file_total = len(sources)
     for idx, src in enumerate(sources, 1):
-        print(f"\nProcessing {idx}/{len(sources)}: {print_rel_or_abs(src)}")
+        def file_progress(phase: str, label: str, file_percent: float) -> None:
+            emit_progress(phase, label, file_percent, idx, file_total)
+
+        print(f"\nProcessing {idx}/{file_total}: {print_rel_or_abs(src)}")
+        file_progress("preparing_input", "Preparing input", 0)
         start_file = time.perf_counter()
         title = to_safe_title(src); title_dir = OUT_DIR / title; safe_mkdir(title_dir)
         saved_names, saved_names_status = load_verified_speaker_names(title_dir / "names.yaml", src)
@@ -568,8 +603,9 @@ def run_pipeline(explicit_files: List[str] = None, explicit_workers: int = None)
         dur = probe_duration_seconds(wav_path)
         if dur is not None: print(f"  Media duration: {hhmmss(int(dur))} ({dur:.2f} s)")
         
+        file_progress("loading_model", "Loading WhisperX model", 12)
         model = load_asr_model(device, cfg)
-        result = transcribe_whisperx(model, wav_path, device, cfg)
+        result = transcribe_whisperx(model, wav_path, device, cfg, progress_callback=file_progress)
         segments = result.get("segments") or []
         diar_ok = bool(result.get("__diar_ok__", False)) or any((s.get("speaker") or "") for s in segments)
         speakers = sorted({(s.get("speaker") or "SPEAKER_00") for s in segments if (s.get("speaker") or diar_ok)})
@@ -579,6 +615,7 @@ def run_pipeline(explicit_files: List[str] = None, explicit_workers: int = None)
         elif saved_names:
             print("[names] No saved names matched the current speaker IDs.")
         
+        file_progress("writing_json", "Writing JSON outputs", 80)
         seg_json = {"title": title, "segments": segments, "source_path": str(src.resolve())}
         spk_json = {"title": title, "diarization": diar_ok, "speakers": speakers}
         if restored_names:
@@ -588,16 +625,19 @@ def run_pipeline(explicit_files: List[str] = None, explicit_workers: int = None)
         print(f"[segments-json] {print_rel_or_abs(title_dir / 'segments.json')}")
         print(f"[speakers-json] {print_rel_or_abs(title_dir / 'speakers.json')}")
         
+        file_progress("writing_transcripts", "Writing SRT/TXT", 84)
         fmt = (cfg.output_format or "both").lower().strip()
         srt_path = title_dir / f"{title}.srt"; txt_path = title_dir / f"{title}.txt"
         if fmt in ("srt", "both"): write_srt(segments, srt_path)
         if fmt in ("txt", "both"): write_txt(segments, txt_path, diarized=diar_ok, include_speakers=cfg.txt_speaker_tags)
         
         if cfg.slice_audio:
+            file_progress("cutting_audio", "Cutting audio", 90)
             cut_segments_to_wavs(wav_path, segments, title_dir, padding=cfg.padding_seconds,
                                  merge_all=cfg.merge_all_segments_into_one_folder, workers=workers)
         
         if cfg.slice_video and src.suffix.lower() in VIDEO_EXTS:
+            file_progress("cutting_video", "Cutting video", 95)
             cut_segments_to_video(src, segments, title_dir, padding=cfg.padding_seconds,
                                   merge_all=cfg.merge_all_segments_into_one_folder,
                                   fast_cut=cfg.fast_cut_video, workers=workers)
@@ -605,6 +645,7 @@ def run_pipeline(explicit_files: List[str] = None, explicit_workers: int = None)
         file_time = time.perf_counter() - start_file
         rtf = (dur / file_time) if (dur and file_time > 0) else None
         print(f"Finished {src.name} in {hhmmss(file_time)}" + (f"  |  RTF: {rtf:.2f}x" if rtf else ""))
+        file_progress("file_complete", "File complete", 100)
     total = time.perf_counter() - pipeline_start
     print("Done."); print(f"Total elapsed: {hhmmss(total)}")
 

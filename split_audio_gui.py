@@ -6,6 +6,7 @@ from pathlib import Path
 from collections import Counter
 from split_audio import (
     AUDIO_EXTS as _PIPELINE_AUDIO_EXTS,
+    PROGRESS_PREFIX as _PIPELINE_PROGRESS_PREFIX,
     VIDEO_EXTS as _PIPELINE_VIDEO_EXTS,
     build_source_identity,
     discover_sources,
@@ -2680,8 +2681,19 @@ class App(ttk.Frame):
         self.btn_start.pack(side="left")
         self.btn_cancel = tb.Button(actions, text="Cancel", command=self.on_stop, bootstyle="danger-outline", padding=(16, 8))
         self.btn_cancel.pack(side="left", padx=(8, 0))
-        self.progress = tb.Progressbar(actions, mode="indeterminate", length=180, bootstyle="info-striped")
-        self.progress.pack(side="left", padx=(14, 0))
+        progress_area = ttk.Frame(actions)
+        progress_area.pack(side="left", padx=(14, 0))
+        self.lbl_progress = ttk.Label(progress_area, text="Ready — 0%")
+        self.lbl_progress.pack(anchor="w")
+        self.progress = tb.Progressbar(
+            progress_area,
+            mode="determinate",
+            maximum=100,
+            length=220,
+            bootstyle="info-striped",
+        )
+        self.progress.pack(fill="x", pady=(2, 0))
+        self._last_progress = 0
         self._set_runtime_state("Ready")
 
         advanced = ttk.Frame(self)
@@ -2793,14 +2805,69 @@ class App(ttk.Frame):
         if status == "Running":
             self.btn_start.configure(state="disabled")
             self.btn_cancel.configure(state="normal")
-            self.progress.start(12)
         elif status == "Cancelling":
             self.btn_start.configure(state="disabled")
             self.btn_cancel.configure(state="disabled")
+            self._set_progress_display("Cancelling", self._last_progress)
         else:
             self.btn_start.configure(state="normal")
             self.btn_cancel.configure(state="disabled")
-            self.progress.stop()
+            if status == "Ready":
+                self._reset_progress("Ready")
+            elif status == "Complete":
+                self._last_progress = 100
+                self._set_progress_display("Complete", 100)
+            elif status in ("Failed", "Cancelled"):
+                self._set_progress_display(status, self._last_progress)
+
+    def _set_progress_display(self, label: str, percent: int, file_index=None, file_total=None):
+        if file_total and file_total > 1:
+            text = f"{label} (file {file_index} of {file_total}) — {percent}%"
+        else:
+            text = f"{label} — {percent}%"
+        self.lbl_progress.configure(text=text)
+        self.progress.configure(value=percent)
+
+    def _reset_progress(self, label: str = "Starting"):
+        self._last_progress = 0
+        self._set_progress_display(label, 0)
+
+    def _handle_progress_line(self, message: str) -> bool:
+        if not message.startswith(_PIPELINE_PROGRESS_PREFIX):
+            return False
+        try:
+            payload = json.loads(message[len(_PIPELINE_PROGRESS_PREFIX):])
+            if not isinstance(payload, dict):
+                raise ValueError
+            phase = payload["phase"]
+            label = payload["label"]
+            file_percent = payload["file_percent"]
+            file_index = payload["file_index"]
+            file_total = payload["file_total"]
+            if not isinstance(phase, str) or not phase.strip():
+                raise ValueError
+            if not isinstance(label, str) or not label.strip():
+                raise ValueError
+            if isinstance(file_percent, bool) or not isinstance(file_percent, (int, float)):
+                raise ValueError
+            if isinstance(file_index, bool) or not isinstance(file_index, int):
+                raise ValueError
+            if isinstance(file_total, bool) or not isinstance(file_total, int):
+                raise ValueError
+            if not (0 <= file_percent <= 100 and file_total >= 1 and 1 <= file_index <= file_total):
+                raise ValueError
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return False
+
+        if self.cancel_requested:
+            return True
+        overall = ((file_index - 1) + file_percent / 100) / file_total * 100
+        percent = min(99, max(0, int(round(overall))))
+        if percent < self._last_progress:
+            return True
+        self._last_progress = percent
+        self._set_progress_display(label.strip(), percent, file_index, file_total)
+        return True
 
     def log(self, s: str):
         self.txt.insert("end", s.rstrip() + "\n")
@@ -3013,6 +3080,7 @@ class App(ttk.Frame):
         self.on_save()
         if not self._validate_slice_video_inputs():
             return
+        self._reset_progress("Starting")
         model = self.var_model.get().strip()
         workers = self.var_workers.get()
         try:
@@ -3106,7 +3174,8 @@ class App(ttk.Frame):
                 if isinstance(event, tuple):
                     kind = event[0]
                     if kind == "log":
-                        self.log(event[1])
+                        if not self._handle_progress_line(event[1]):
+                            self.log(event[1])
                     elif kind == "speakers":
                         NamingDialog(self.master, event[1], event[2])
                     elif kind == "process_finished":
