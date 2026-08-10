@@ -10,6 +10,7 @@ from split_audio import (
     VIDEO_EXTS as _PIPELINE_VIDEO_EXTS,
     build_source_identity,
     discover_sources,
+    write_speaker_name_record,
 )
 
 # === word-level exporters (VTT, ASS, and HTML player) ========================
@@ -2595,11 +2596,26 @@ class NamingDialog(tk.Toplevel):
         if source_identity is not None:
             names_data["source_identity"] = source_identity
         atomic_write_yaml(names_yaml, names_data)
+        persistent_warning = None
+        try:
+            persistent_path = write_speaker_name_record(seg_data.get("source_path"), mapping)
+            if persistent_path is None:
+                persistent_warning = (
+                    "The original source file is missing or unavailable. The current outputs were updated, "
+                    "but the speaker names could not be saved persistently."
+                )
+        except Exception as e:
+            persistent_warning = (
+                "The current outputs were updated, but the persistent speaker-name record could not be saved:\n"
+                f"{e}"
+            )
         if self.var_rename_audio.get():
             try:
                 self._rename_tree(out_dir, mapping)
             except Exception as e:
                 messagebox.showwarning("Rename issue", f"Some files could not be renamed:\n{e}")
+        if persistent_warning:
+            messagebox.showwarning("Speaker names not persisted", persistent_warning)
         messagebox.showinfo("Done", "Updated files:\n" + txt_tmp.name + "\n" + srt_tmp.name + ("\n\nExports:\n" + "\n".join(export_created) if export_created else "") + "\n\nSaved mapping: " + names_yaml.name)
         self.destroy()
 

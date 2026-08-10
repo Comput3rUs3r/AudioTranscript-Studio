@@ -15,6 +15,7 @@ __pycache__/
 # User files and generated output
 data/input/*
 data/output/*
+data/speaker_names/
 data/wav_files/*
 output/
 wav_files/
