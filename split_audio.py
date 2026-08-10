@@ -29,6 +29,89 @@ FFPROBE_BIN = str((ROOT / "ffprobe.exe").resolve()) if (ROOT / "ffprobe.exe").ex
 AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".wma", ".opus"}
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
 MEDIA_EXTS = AUDIO_EXTS | VIDEO_EXTS
+SOURCE_IDENTITY_FIELDS = ("path", "size", "mtime_ns", "st_dev", "st_ino")
+
+def normalized_source_path(path: Path | str) -> str:
+    resolved = Path(path).expanduser().resolve(strict=True)
+    return os.path.normcase(os.path.normpath(str(resolved)))
+
+def build_source_identity(path: Path | str | None) -> Optional[Dict[str, Any]]:
+    if not path:
+        return None
+    try:
+        resolved = Path(path).expanduser().resolve(strict=True)
+        source_stat = resolved.stat()
+        return {
+            "path": os.path.normcase(os.path.normpath(str(resolved))),
+            "size": int(source_stat.st_size),
+            "mtime_ns": int(source_stat.st_mtime_ns),
+            "st_dev": int(source_stat.st_dev),
+            "st_ino": int(source_stat.st_ino),
+        }
+    except (OSError, TypeError, ValueError):
+        return None
+
+def is_valid_source_identity(identity: Any) -> bool:
+    if not isinstance(identity, dict):
+        return False
+    if set(SOURCE_IDENTITY_FIELDS) - set(identity):
+        return False
+    identity_path = identity.get("path")
+    if not isinstance(identity_path, str) or not identity_path:
+        return False
+    for field in SOURCE_IDENTITY_FIELDS[1:]:
+        value = identity.get(field)
+        if isinstance(value, bool) or not isinstance(value, int):
+            return False
+    return True
+
+def source_identities_match(saved: Any, current: Any) -> bool:
+    if not is_valid_source_identity(saved) or not is_valid_source_identity(current):
+        return False
+    if os.path.normcase(os.path.normpath(saved["path"])) != os.path.normcase(os.path.normpath(current["path"])):
+        return False
+    for field in SOURCE_IDENTITY_FIELDS[1:]:
+        if saved[field] != current[field]:
+            return False
+    return True
+
+def load_verified_speaker_names(names_path: Path, source_path: Path) -> Tuple[Dict[str, str], str]:
+    if not names_path.is_file():
+        return {}, "missing"
+    try:
+        raw = yaml.safe_load(names_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}, "malformed"
+    if not isinstance(raw, dict):
+        return {}, "malformed"
+    if "source_identity" not in raw:
+        return {}, "legacy"
+    if not is_valid_source_identity(raw.get("source_identity")):
+        return {}, "malformed"
+    current_identity = build_source_identity(source_path)
+    if current_identity is None:
+        return {}, "source_unavailable"
+    if not source_identities_match(raw.get("source_identity"), current_identity):
+        return {}, "identity_mismatch"
+    speaker_names = raw.get("speaker_names")
+    if not isinstance(speaker_names, dict):
+        return {}, "malformed"
+    verified = {
+        str(speaker): str(name).strip()
+        for speaker, name in speaker_names.items()
+        if isinstance(speaker, str) and isinstance(name, str) and name.strip()
+    }
+    return verified, "verified"
+
+def names_for_current_speakers(saved_names: Dict[str, str], speakers: List[str]) -> Dict[str, str]:
+    current_speakers = set(speakers)
+    return {
+        speaker: name
+        for speaker, name in saved_names.items()
+        if speaker.startswith("SPEAKER_")
+        and speaker.removeprefix("SPEAKER_").isdigit()
+        and speaker in current_speakers
+    }
 
 def build_id() -> str:
     try:
@@ -468,6 +551,15 @@ def run_pipeline(explicit_files: List[str] = None, explicit_workers: int = None)
         print(f"\nProcessing {idx}/{len(sources)}: {print_rel_or_abs(src)}")
         start_file = time.perf_counter()
         title = to_safe_title(src); title_dir = OUT_DIR / title; safe_mkdir(title_dir)
+        saved_names, saved_names_status = load_verified_speaker_names(title_dir / "names.yaml", src)
+        if saved_names_status == "identity_mismatch":
+            print("[names] Saved names not restored: source identity differs.")
+        elif saved_names_status == "legacy":
+            print("[names] Ignored legacy names.yaml without source identity.")
+        elif saved_names_status == "malformed":
+            print("[names] Ignored malformed names.yaml.")
+        elif saved_names_status == "source_unavailable":
+            print("[names] Saved names not restored: current source identity is unavailable.")
         
         wav_path = src
         if src.suffix.lower() != ".wav" or src.parent != WAV_DIR:
@@ -481,9 +573,16 @@ def run_pipeline(explicit_files: List[str] = None, explicit_workers: int = None)
         segments = result.get("segments") or []
         diar_ok = bool(result.get("__diar_ok__", False)) or any((s.get("speaker") or "") for s in segments)
         speakers = sorted({(s.get("speaker") or "SPEAKER_00") for s in segments if (s.get("speaker") or diar_ok)})
+        restored_names = names_for_current_speakers(saved_names, speakers)
+        if restored_names:
+            print(f"[names] Restored {len(restored_names)} speaker name(s).")
+        elif saved_names:
+            print("[names] No saved names matched the current speaker IDs.")
         
         seg_json = {"title": title, "segments": segments, "source_path": str(src.resolve())}
         spk_json = {"title": title, "diarization": diar_ok, "speakers": speakers}
+        if restored_names:
+            spk_json["names"] = restored_names
         (title_dir / "segments.json").write_text(json.dumps(seg_json, ensure_ascii=False, indent=2), encoding="utf-8")
         (title_dir / "speakers.json").write_text(json.dumps(spk_json, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"[segments-json] {print_rel_or_abs(title_dir / 'segments.json')}")

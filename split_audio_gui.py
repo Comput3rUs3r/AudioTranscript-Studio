@@ -4,7 +4,12 @@ import ttkbootstrap as tb
 from tkinter import ttk, messagebox, filedialog
 from pathlib import Path
 from collections import Counter
-from split_audio import AUDIO_EXTS as _PIPELINE_AUDIO_EXTS, VIDEO_EXTS as _PIPELINE_VIDEO_EXTS, discover_sources
+from split_audio import (
+    AUDIO_EXTS as _PIPELINE_AUDIO_EXTS,
+    VIDEO_EXTS as _PIPELINE_VIDEO_EXTS,
+    build_source_identity,
+    discover_sources,
+)
 
 # === word-level exporters (VTT, ASS, and HTML player) ========================
 def _has_word_level(segments):
@@ -2584,7 +2589,11 @@ class NamingDialog(tk.Toplevel):
         except:
             pass
         names_yaml = out_dir / "names.yaml"
-        atomic_write_yaml(names_yaml, {"speaker_names": mapping})
+        names_data = {"speaker_names": mapping}
+        source_identity = build_source_identity(seg_data.get("source_path"))
+        if source_identity is not None:
+            names_data["source_identity"] = source_identity
+        atomic_write_yaml(names_yaml, names_data)
         if self.var_rename_audio.get():
             try:
                 self._rename_tree(out_dir, mapping)
