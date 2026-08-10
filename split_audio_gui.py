@@ -1,5 +1,5 @@
 # split_audio_gui.py — v1.11.0 (Stop Button + Worker Control)
-import os, sys, stat, json, yaml, queue, shutil, threading, subprocess, tkinter as tk, hashlib, datetime, re, signal, copy
+import os, sys, stat, json, yaml, queue, shutil, threading, subprocess, tkinter as tk, hashlib, datetime, re, signal, copy, math
 import ttkbootstrap as tb
 from tkinter import ttk, messagebox, filedialog
 from pathlib import Path
@@ -1299,6 +1299,10 @@ class NamingDialog(tk.Toplevel):
         self._player_closing = False
         self._subtitle_track_ids = {}
         self._applied_subtitle_choice = None
+        self._word_records = []
+        self._word_tag_to_record = {}
+        self._word_tag_names = []
+        self._transcript_default_cursor = "xterm"
         self.speakers_json = speakers_json
         self.segments_json = segments_json
         spk_data = json.loads(speakers_json.read_text(encoding="utf-8"))
@@ -1632,9 +1636,10 @@ class NamingDialog(tk.Toplevel):
         self.text.configure(yscrollcommand=yscroll.set)
         self.text.grid(row=0, column=0, sticky="nsew")
         yscroll.grid(row=0, column=1, sticky="ns")
-        self.txt_path, txt_content = self._load_transcript()
-        self.text.insert("1.0", txt_content)
-        self.text.edit_reset()
+        self._configure_transcript_word_tags()
+        self.txt_path, _txt_content = self._load_transcript()
+        self._render_transcript_preview()
+        txt_content = self.text.get("1.0", "end-1c")
         self._reset_highlight()
         initial = "SPEAKER_00"
         if initial not in txt_content and self.speakers:
@@ -2167,6 +2172,217 @@ class NamingDialog(tk.Toplevel):
         self.manual_corrections_pending = dialog.changed or self.manual_corrections_pending
         self._refresh_transcript_preview()
 
+    def _configure_transcript_word_tags(self):
+        try:
+            style = tb.Style.get_instance() or tb.Style()
+            hover_color = style.colors.primary
+        except Exception:
+            hover_color = "#0d6efd"
+        self._transcript_default_cursor = self.text.cget("cursor") or "xterm"
+        self.text.tag_configure("clickable_word")
+        self.text.tag_configure("hover_word", foreground=hover_color, underline=True)
+        self.text.tag_bind("clickable_word", "<Enter>", self._on_clickable_word_enter)
+        self.text.tag_bind("clickable_word", "<Leave>", self._on_clickable_word_leave)
+        self.text.tag_bind("clickable_word", "<Button-1>", self._on_clickable_word_click)
+
+    def _clear_transcript_word_mappings(self):
+        self.text.tag_remove("hover_word", "1.0", "end")
+        self.text.tag_remove("clickable_word", "1.0", "end")
+        self.text.configure(cursor=self._transcript_default_cursor)
+        for tag_name in self._word_tag_names:
+            try:
+                self.text.tag_delete(tag_name)
+            except tk.TclError:
+                pass
+        self._word_records = []
+        self._word_tag_to_record = {}
+        self._word_tag_names = []
+
+    @staticmethod
+    def _valid_word_time_range(word):
+        start = word.get("start")
+        end = word.get("end")
+        if isinstance(start, bool) or not isinstance(start, (int, float)):
+            return None
+        if isinstance(end, bool) or not isinstance(end, (int, float)):
+            return None
+        start = float(start)
+        end = float(end)
+        if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start:
+            return None
+        return start, end
+
+    def _insert_segment_with_word_tags(self, segment, segment_index, segment_text):
+        words = segment.get("words")
+        if not isinstance(words, list):
+            self.text.insert("end", segment_text)
+            return
+
+        matches = []
+        search_from = 0
+        for word_index, word in enumerate(words):
+            if not isinstance(word, dict):
+                continue
+            raw_word = word.get("word")
+            if raw_word is None:
+                raw_word = word.get("text")
+            word_text = str(raw_word or "")
+            if not word_text.strip():
+                continue
+            match_start = segment_text.find(word_text, search_from)
+            if match_start < 0:
+                continue
+            match_end = match_start + len(word_text)
+            matches.append((match_start, match_end, word_index, word, self._valid_word_time_range(word)))
+            search_from = match_end
+
+        inserted_to = 0
+        for match_start, match_end, word_index, word, timing in matches:
+            if match_start > inserted_to:
+                self.text.insert("end", segment_text[inserted_to:match_start])
+            text_start = self.text.index("end-1c")
+            displayed_word = segment_text[match_start:match_end]
+            self.text.insert("end", displayed_word)
+            text_end = self.text.index("end-1c")
+            if timing is not None:
+                tag_name = f"transcript_word_{segment_index}_{word_index}"
+                record = {
+                    "tag": tag_name,
+                    "text_start": text_start,
+                    "text_end": text_end,
+                    "display_text": displayed_word,
+                    "media_start": timing[0],
+                    "media_end": timing[1],
+                    "segment_index": segment_index,
+                    "word_index": word_index,
+                    "segment_speaker": segment.get("speaker"),
+                    "word_speaker": word.get("speaker"),
+                }
+                self.text.tag_add(tag_name, text_start, text_end)
+                self.text.tag_add("clickable_word", text_start, text_end)
+                self._word_records.append(record)
+                self._word_tag_to_record[tag_name] = record
+                self._word_tag_names.append(tag_name)
+            inserted_to = match_end
+        if inserted_to < len(segment_text):
+            self.text.insert("end", segment_text[inserted_to:])
+
+    def _render_transcript_preview(self):
+        self._clear_transcript_word_mappings()
+        self.text.delete("1.0", "end")
+        mapping = self._current_name_mapping()
+        diarized = any(
+            (segment.get("speaker") or "")
+            for segment in self.segments
+            if isinstance(segment, dict)
+        )
+        last_speaker = None
+        rendered_any = False
+
+        for segment_index, segment in enumerate(self.segments):
+            if not isinstance(segment, dict):
+                continue
+            segment_text = str(segment.get("text", "") or "").strip()
+            if not segment_text:
+                continue
+            if diarized:
+                speaker = segment.get("speaker") or "SPEAKER_00"
+                if speaker != last_speaker:
+                    if rendered_any:
+                        self.text.insert("end", "\n")
+                    assigned_name = mapping.get(speaker)
+                    speaker_label = f"{speaker} ({assigned_name})" if assigned_name else speaker
+                    self.text.insert("end", f"{speaker_label}: ")
+                elif rendered_any:
+                    self.text.insert("end", " ")
+                last_speaker = speaker
+            elif rendered_any:
+                self.text.insert("end", " ")
+            self._insert_segment_with_word_tags(segment, segment_index, segment_text)
+            rendered_any = True
+        self.text.edit_reset()
+
+    def _live_word_tag_range(self, record):
+        try:
+            ranges = self.text.tag_ranges(record["tag"])
+            if len(ranges) != 2:
+                return None
+            if self.text.get(ranges[0], ranges[1]) != record["display_text"]:
+                return None
+            return str(ranges[0]), str(ranges[1])
+        except (KeyError, tk.TclError):
+            return None
+
+    def _word_record_at_event(self, event):
+        try:
+            index = self.text.index(f"@{event.x},{event.y}")
+        except tk.TclError:
+            return None
+        for tag_name in self.text.tag_names(index):
+            record = self._word_tag_to_record.get(tag_name)
+            if record is not None and self._live_word_tag_range(record) is not None:
+                return record
+        return None
+
+    def _on_clickable_word_enter(self, event):
+        record = self._word_record_at_event(event)
+        self.text.tag_remove("hover_word", "1.0", "end")
+        if record is None:
+            self.text.configure(cursor=self._transcript_default_cursor)
+            return
+        live_range = self._live_word_tag_range(record)
+        if live_range is None:
+            self.text.configure(cursor=self._transcript_default_cursor)
+            return
+        self.text.tag_add("hover_word", live_range[0], live_range[1])
+        self.text.configure(cursor="hand2")
+
+    def _on_clickable_word_leave(self, _event=None):
+        self.text.tag_remove("hover_word", "1.0", "end")
+        self.text.configure(cursor=self._transcript_default_cursor)
+
+    def _video_path_for_timed_word(self):
+        if self._loaded_video_path:
+            loaded_path = Path(self._loaded_video_path)
+            if loaded_path.is_file():
+                return loaded_path, None
+
+        source_path = self.segments_data.get("source_path") if isinstance(self.segments_data, dict) else None
+        if not source_path:
+            return None, "The original video path is not available for this transcript."
+        try:
+            source = Path(source_path).expanduser()
+        except (TypeError, ValueError):
+            return None, "The original video path is invalid."
+        if not source.is_file():
+            return None, "The original video file is missing. Use Preview video at hit to locate it first."
+        if source.suffix.lower() in _PIPELINE_AUDIO_EXTS:
+            return None, "Clickable word playback requires a video source; this transcript contains audio only."
+        if source.suffix.lower() not in _PIPELINE_VIDEO_EXTS:
+            return None, "The original source is not a supported video file."
+        return source, None
+
+    def _play_timed_word(self, record):
+        if self._vlc_player is None or self._vlc_instance is None:
+            reason = self._vlc_status.get("reason") or "Embedded VLC playback is unavailable."
+            messagebox.showinfo("Video Preview", reason, parent=self)
+            return
+        video_path, unavailable_reason = self._video_path_for_timed_word()
+        if video_path is None:
+            messagebox.showinfo("Video Preview", unavailable_reason, parent=self)
+            return
+        try:
+            self._load_embedded_video(video_path, max(0.0, float(record["media_start"])))
+        except Exception as exc:
+            messagebox.showwarning("Video Preview", f"Could not play the selected word:\n{exc}", parent=self)
+
+    def _on_clickable_word_click(self, event):
+        record = self._word_record_at_event(event)
+        if record is None:
+            return None
+        self._play_timed_word(record)
+        return "break"
+
     def _transcript_content_from_segments(self):
         mapping = self._current_name_mapping()
         diarized = any((seg.get("speaker") or "") for seg in self.segments if isinstance(seg, dict))
@@ -2209,10 +2425,7 @@ class NamingDialog(tk.Toplevel):
         return "\n".join(lines)
 
     def _refresh_transcript_preview(self):
-        content = self._transcript_content_from_segments()
-        self.text.delete("1.0", "end")
-        self.text.insert("1.0", content)
-        self.text.edit_reset()
+        self._render_transcript_preview()
         query = self.find_var.get().strip() if hasattr(self, "find_var") else ""
         self._highlight_query(query)
 
