@@ -10,7 +10,7 @@ AudioTranscript Studio + WhisperX pipeline (v1.6.0)
 """
 from __future__ import annotations
 
-import os, sys, math, time, shlex, yaml, json, subprocess, hashlib, datetime, concurrent.futures, argparse
+import os, sys, math, time, shlex, yaml, json, subprocess, hashlib, datetime, concurrent.futures, argparse, tempfile
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -22,6 +22,7 @@ DATA_DIR = ROOT / "data"
 INPUT_DIR = DATA_DIR / "input"
 WAV_DIR = DATA_DIR / "wav_files"
 OUT_DIR = DATA_DIR / "output"
+SPEAKER_NAMES_DIR = DATA_DIR / "speaker_names"
 
 FFMPEG_BIN  = str((ROOT / "ffmpeg.exe").resolve())  if (ROOT / "ffmpeg.exe").exists()  else "ffmpeg"
 FFPROBE_BIN = str((ROOT / "ffprobe.exe").resolve()) if (ROOT / "ffprobe.exe").exists() else "ffprobe"
@@ -120,6 +121,90 @@ def load_verified_speaker_names(names_path: Path, source_path: Path) -> Tuple[Di
         if isinstance(speaker, str) and isinstance(name, str) and name.strip()
     }
     return verified, "verified"
+
+def _speaker_name_record_path_from_identity(identity: Dict[str, Any]) -> Path:
+    path_hash = hashlib.sha256(identity["path"].encode("utf-8", errors="surrogatepass")).hexdigest()
+    return SPEAKER_NAMES_DIR / f"{path_hash}.yaml"
+
+def speaker_name_record_path(source_path: Path | str | None) -> Optional[Path]:
+    identity = build_source_identity(source_path)
+    return _speaker_name_record_path_from_identity(identity) if identity is not None else None
+
+def write_speaker_name_record(
+    source_path: Path | str | None,
+    speaker_names: Dict[str, str],
+    *,
+    overwrite: bool = True,
+) -> Optional[Path]:
+    identity = build_source_identity(source_path)
+    if identity is None:
+        return None
+    record_path = _speaker_name_record_path_from_identity(identity)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_data = {
+        "source_identity": identity,
+        "speaker_names": {
+            str(speaker): str(name).strip()
+            for speaker, name in speaker_names.items()
+            if isinstance(speaker, str) and isinstance(name, str) and name.strip()
+        },
+    }
+
+    if not overwrite:
+        with record_path.open("x", encoding="utf-8", newline="\n") as record_file:
+            yaml.safe_dump(record_data, record_file, sort_keys=False, allow_unicode=True)
+            record_file.flush()
+            os.fsync(record_file.fileno())
+        return record_path
+
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=record_path.parent,
+            prefix=f".{record_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+            yaml.safe_dump(record_data, temp_file, sort_keys=False, allow_unicode=True)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.replace(temp_path, record_path)
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return record_path
+
+def load_speaker_names_with_migration(
+    source_path: Path,
+    output_names_path: Path,
+) -> Tuple[Dict[str, str], str]:
+    persistent_path = speaker_name_record_path(source_path)
+    if persistent_path is None:
+        return {}, "source_unavailable"
+
+    if persistent_path.exists():
+        names, status = load_verified_speaker_names(persistent_path, source_path)
+        return names, f"persistent_{status}"
+
+    output_names, output_status = load_verified_speaker_names(output_names_path, source_path)
+    if output_status != "verified":
+        return {}, f"output_{output_status}"
+
+    try:
+        write_speaker_name_record(source_path, output_names, overwrite=False)
+    except FileExistsError:
+        names, status = load_verified_speaker_names(persistent_path, source_path)
+        return names, f"persistent_{status}"
+    except Exception:
+        return output_names, "migration_failed"
+    return output_names, "migrated"
 
 def names_for_current_speakers(saved_names: Dict[str, str], speakers: List[str]) -> Dict[str, str]:
     current_speakers = set(speakers)
@@ -586,12 +671,16 @@ def run_pipeline(explicit_files: List[str] = None, explicit_workers: int = None)
         file_progress("preparing_input", "Preparing input", 0)
         start_file = time.perf_counter()
         title = to_safe_title(src); title_dir = OUT_DIR / title; safe_mkdir(title_dir)
-        saved_names, saved_names_status = load_verified_speaker_names(title_dir / "names.yaml", src)
-        if saved_names_status == "identity_mismatch":
+        saved_names, saved_names_status = load_speaker_names_with_migration(src, title_dir / "names.yaml")
+        if saved_names_status == "migrated":
+            print("[names] Migrated verified output-local speaker names to persistent storage.")
+        elif saved_names_status == "migration_failed":
+            print("[names] Verified output-local names restored, but persistent migration failed.")
+        elif saved_names_status.endswith("identity_mismatch"):
             print("[names] Saved names not restored: source identity differs.")
-        elif saved_names_status == "legacy":
+        elif saved_names_status.endswith("legacy"):
             print("[names] Ignored legacy names.yaml without source identity.")
-        elif saved_names_status == "malformed":
+        elif saved_names_status.endswith("malformed"):
             print("[names] Ignored malformed names.yaml.")
         elif saved_names_status == "source_unavailable":
             print("[names] Saved names not restored: current source identity is unavailable.")
