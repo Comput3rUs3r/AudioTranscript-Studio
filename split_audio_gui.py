@@ -1,7 +1,7 @@
 # split_audio_gui.py — v1.11.0 (Stop Button + Worker Control)
 import os, sys, stat, json, yaml, queue, shutil, threading, subprocess, tkinter as tk, hashlib, datetime, re, signal, copy, math, time
 import ttkbootstrap as tb
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, font as tkfont
 from pathlib import Path
 from collections import Counter
 from bisect import bisect_right
@@ -1281,6 +1281,12 @@ class SegmentCorrectionDialog(tk.Toplevel):
         self.destroy()
 
 class NamingDialog(tk.Toplevel):
+    _VIDEO_RATIO_DEFAULT = 0.65
+    _VIDEO_RATIO_MIN = 0.35
+    _VIDEO_RATIO_MAX = 0.80
+    _TRANSCRIPT_FONT_MIN = 8
+    _TRANSCRIPT_FONT_MAX = 28
+
     def __init__(self, master, speakers_json: Path, segments_json: Path):
         super().__init__(master)
         self.title("Name Speakers")
@@ -1315,6 +1321,18 @@ class NamingDialog(tk.Toplevel):
         self._word_clock_seek_started_at = None
         self._transcript_follow_suspended_until = 0.0
         self._transcript_default_cursor = "xterm"
+        self._view_preferences_saved = False
+        self._preview_ratio_after = None
+        self._preview_ratio_applied = False
+        try:
+            self._naming_cfg = read_yaml(conf_path())
+            if not isinstance(self._naming_cfg, dict):
+                self._naming_cfg = {}
+        except Exception:
+            self._naming_cfg = {}
+        self._preview_video_ratio = self._validated_video_ratio(
+            self._naming_cfg.get("name_speakers_video_ratio")
+        )
         self.speakers_json = speakers_json
         self.segments_json = segments_json
         spk_data = json.loads(speakers_json.read_text(encoding="utf-8"))
@@ -1364,8 +1382,7 @@ class NamingDialog(tk.Toplevel):
         left.rowconfigure(0, weight=1, minsize=150)
         left.rowconfigure(1, weight=1, minsize=125)
         right.columnconfigure(0, weight=1)
-        right.rowconfigure(1, weight=3)
-        right.rowconfigure(2, weight=2, minsize=120)
+        right.rowconfigure(1, weight=1)
         self.inputs = {}
         self.selected_speaker = tk.StringVar(value=self.speakers[0] if self.speakers else "")
 
@@ -1513,10 +1530,7 @@ class NamingDialog(tk.Toplevel):
         ttk.Checkbutton(opts, text="Overwrite existing SRT/TXT (recommended)", variable=self.var_overwrite).grid(row=0, column=0, sticky="w")
         self.var_rename_audio = tk.BooleanVar(value=True)
         ttk.Checkbutton(opts, text="Rename folders and .wav files with names", variable=self.var_rename_audio).grid(row=1, column=0, sticky="w", pady=(2, 0))
-        try:
-            _cfg = read_yaml(conf_path())
-        except:
-            _cfg = {}
+        _cfg = self._naming_cfg
         self.var_export_vtt  = tk.BooleanVar(value=bool(_cfg.get("export_word_vtt", False)))
         self.var_export_ass  = tk.BooleanVar(value=bool(_cfg.get("export_word_ass", False)))
         self.var_export_html = tk.BooleanVar(value=bool(_cfg.get("export_word_html", False)))
@@ -1554,10 +1568,22 @@ class NamingDialog(tk.Toplevel):
         ttk.Button(search_actions, text="Open video externally", command=self.open_video_at_query).pack(side="left", padx=(6, 0))
         ttk.Button(search_actions, text="Open transcript file", command=self.open_txt_external).pack(side="left", padx=(6, 0))
 
-        video = ttk.LabelFrame(right, text="Video Preview", padding=8)
-        video.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
+        self._preview_paned = tk.PanedWindow(
+            right,
+            orient="vertical",
+            sashwidth=8,
+            sashrelief="raised",
+            showhandle=False,
+            opaqueresize=True,
+            borderwidth=0,
+        )
+        self._preview_paned.grid(row=1, column=0, sticky="nsew")
+
+        video = ttk.LabelFrame(self._preview_paned, text="Video Preview", padding=8)
+        self._video_preview_frame = video
         video.columnconfigure(0, weight=1, minsize=480)
-        video.rowconfigure(0, weight=1, minsize=270)
+        video.rowconfigure(0, weight=1, minsize=160)
+        self._preview_paned.add(video, minsize=240, stretch="always")
 
         video_host = ttk.Frame(video)
         video_host.grid(row=0, column=0, sticky="nsew")
@@ -1639,15 +1665,64 @@ class NamingDialog(tk.Toplevel):
             self.video_volume,
         ]
 
-        viewer = ttk.LabelFrame(right, text="Transcript Preview", padding=8)
-        viewer.grid(row=2, column=0, sticky="nsew")
+        viewer = ttk.LabelFrame(self._preview_paned, text="Transcript Preview", padding=8)
+        self._transcript_preview_frame = viewer
         viewer.columnconfigure(0, weight=1)
-        viewer.rowconfigure(0, weight=1)
+        viewer.rowconfigure(1, weight=1)
+        self._preview_paned.add(viewer, minsize=130, stretch="always")
+
+        transcript_controls = ttk.Frame(viewer)
+        transcript_controls.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        ttk.Label(transcript_controls, text="Text size").pack(side="left", padx=(0, 6))
+        self.btn_transcript_font_down = ttk.Button(
+            transcript_controls,
+            text="A\N{MINUS SIGN}",
+            width=3,
+            command=lambda: self._adjust_transcript_font_size(-1),
+        )
+        self.btn_transcript_font_down.pack(side="left")
+        self.transcript_font_size_var = tk.StringVar()
+        ttk.Label(
+            transcript_controls,
+            textvariable=self.transcript_font_size_var,
+            width=3,
+            anchor="center",
+        ).pack(side="left", padx=4)
+        self.btn_transcript_font_up = ttk.Button(
+            transcript_controls,
+            text="A+",
+            width=3,
+            command=lambda: self._adjust_transcript_font_size(1),
+        )
+        self.btn_transcript_font_up.pack(side="left")
+        ttk.Button(
+            transcript_controls,
+            text="Reset",
+            command=self._reset_transcript_font_size,
+        ).pack(side="left", padx=(6, 0))
+
         self.text = tk.Text(viewer, wrap="word", height=8)
+        self.transcript_font = tkfont.Font(root=self, font=self.text.cget("font"))
+        try:
+            captured_font_size = abs(int(self.transcript_font.cget("size")))
+        except (TypeError, ValueError, tk.TclError):
+            captured_font_size = 10
+        self._transcript_default_font_size = max(
+            self._TRANSCRIPT_FONT_MIN,
+            min(self._TRANSCRIPT_FONT_MAX, captured_font_size),
+        )
+        self.text.configure(font=self.transcript_font)
+        initial_font_size = self._validated_transcript_font_size(
+            self._naming_cfg.get("name_speakers_transcript_font_size")
+        )
         yscroll = ttk.Scrollbar(viewer, orient="vertical", command=self._on_transcript_scrollbar)
         self.text.configure(yscrollcommand=yscroll.set)
-        self.text.grid(row=0, column=0, sticky="nsew")
-        yscroll.grid(row=0, column=1, sticky="ns")
+        self.text.grid(row=1, column=0, sticky="nsew")
+        yscroll.grid(row=1, column=1, sticky="ns")
+        self._set_transcript_font_size(initial_font_size)
+        self.text.bind("<Control-MouseWheel>", self._on_transcript_ctrl_mousewheel)
+        self.text.bind("<Control-Button-4>", self._on_transcript_ctrl_mousewheel)
+        self.text.bind("<Control-Button-5>", self._on_transcript_ctrl_mousewheel)
         self._configure_transcript_word_tags()
         self.txt_path, _txt_content = self._load_transcript()
         self._render_transcript_preview()
@@ -1663,6 +1738,127 @@ class NamingDialog(tk.Toplevel):
         self.protocol("WM_DELETE_WINDOW", self.destroy)
         self.bind("<Destroy>", self._on_dialog_destroyed, add="+")
         self._initialize_embedded_player()
+        self._preview_ratio_after = self.after(100, self._apply_initial_preview_ratio)
+
+    def _validated_video_ratio(self, value):
+        if isinstance(value, bool):
+            return self._VIDEO_RATIO_DEFAULT
+        try:
+            ratio = float(value)
+        except (TypeError, ValueError):
+            return self._VIDEO_RATIO_DEFAULT
+        if not math.isfinite(ratio):
+            return self._VIDEO_RATIO_DEFAULT
+        return max(self._VIDEO_RATIO_MIN, min(self._VIDEO_RATIO_MAX, ratio))
+
+    def _validated_transcript_font_size(self, value):
+        default = self._transcript_default_font_size
+        if isinstance(value, bool):
+            return default
+        try:
+            size = int(value)
+            if isinstance(value, float) and not value.is_integer():
+                return default
+            if isinstance(value, str) and not re.fullmatch(r"[+-]?\d+", value.strip()):
+                return default
+        except (TypeError, ValueError):
+            return default
+        return max(self._TRANSCRIPT_FONT_MIN, min(self._TRANSCRIPT_FONT_MAX, size))
+
+    def _set_transcript_font_size(self, size):
+        size = max(self._TRANSCRIPT_FONT_MIN, min(self._TRANSCRIPT_FONT_MAX, int(size)))
+        self.transcript_font.configure(size=size)
+        self.transcript_font_size_var.set(str(size))
+        self.btn_transcript_font_down.configure(
+            state="disabled" if size <= self._TRANSCRIPT_FONT_MIN else "normal"
+        )
+        self.btn_transcript_font_up.configure(
+            state="disabled" if size >= self._TRANSCRIPT_FONT_MAX else "normal"
+        )
+
+    def _adjust_transcript_font_size(self, amount):
+        try:
+            current = int(self.transcript_font.cget("size"))
+        except (TypeError, ValueError, tk.TclError):
+            current = self._transcript_default_font_size
+        self._set_transcript_font_size(current + int(amount))
+
+    def _reset_transcript_font_size(self):
+        self._set_transcript_font_size(self._transcript_default_font_size)
+
+    def _on_transcript_ctrl_mousewheel(self, event):
+        direction = 0
+        if getattr(event, "delta", 0) > 0 or getattr(event, "num", None) == 4:
+            direction = 1
+        elif getattr(event, "delta", 0) < 0 or getattr(event, "num", None) == 5:
+            direction = -1
+        if direction:
+            self._adjust_transcript_font_size(direction)
+        return "break"
+
+    def _apply_initial_preview_ratio(self):
+        self._preview_ratio_after = None
+        if self._preview_ratio_applied or self._player_closing:
+            return
+        try:
+            self.update_idletasks()
+            available_height = self._preview_paned.winfo_height()
+            if available_height <= 1 or len(self._preview_paned.panes()) < 2:
+                self._preview_ratio_after = self.after(50, self._apply_initial_preview_ratio)
+                return
+            sash_position = int(round(available_height * self._preview_video_ratio))
+            self._preview_paned.sash_place(0, 0, sash_position)
+            self._preview_ratio_applied = True
+        except (AttributeError, tk.TclError):
+            if not self._player_closing:
+                try:
+                    self._preview_ratio_after = self.after(50, self._apply_initial_preview_ratio)
+                except tk.TclError:
+                    self._preview_ratio_after = None
+
+    def _current_preview_video_ratio(self):
+        if not self._preview_ratio_applied:
+            return self._preview_video_ratio
+        try:
+            available_height = self._preview_paned.winfo_height()
+            if available_height <= 1:
+                return self._preview_video_ratio
+            _x, sash_position = self._preview_paned.sash_coord(0)
+            return self._validated_video_ratio(sash_position / available_height)
+        except (AttributeError, tk.TclError):
+            return self._preview_video_ratio
+
+    def _cancel_pending_preview_ratio(self):
+        if self._preview_ratio_after is None:
+            return
+        try:
+            self.after_cancel(self._preview_ratio_after)
+        except (AttributeError, tk.TclError):
+            pass
+        self._preview_ratio_after = None
+
+    def _save_name_speakers_view_preferences(self):
+        if self._view_preferences_saved:
+            return
+        self._view_preferences_saved = True
+        ratio = self._current_preview_video_ratio()
+        try:
+            font_size = int(self.transcript_font.cget("size"))
+        except (AttributeError, TypeError, ValueError, tk.TclError):
+            font_size = self._transcript_default_font_size
+        try:
+            cfg = read_yaml(conf_path())
+            if not isinstance(cfg, dict):
+                return
+            cfg["name_speakers_video_ratio"] = round(ratio, 4)
+            cfg["name_speakers_transcript_font_size"] = max(
+                self._TRANSCRIPT_FONT_MIN,
+                min(self._TRANSCRIPT_FONT_MAX, font_size),
+            )
+            atomic_write_yaml(conf_path(), cfg)
+            self._preview_video_ratio = ratio
+        except Exception:
+            pass
 
     def _set_video_message(self, message):
         self.video_message.configure(text=message)
@@ -2135,7 +2331,9 @@ class NamingDialog(tk.Toplevel):
     def _release_embedded_player(self):
         if self._player_closing:
             return
+        self._save_name_speakers_view_preferences()
         self._player_closing = True
+        self._cancel_pending_preview_ratio()
         self._cancel_word_synchronization()
         self._clear_current_word()
         self._reset_interpolated_playback_clock()
@@ -2594,7 +2792,9 @@ class NamingDialog(tk.Toplevel):
     def _suspend_transcript_following(self):
         self._transcript_follow_suspended_until = time.monotonic() + 3.0
 
-    def _on_manual_transcript_scroll(self, _event=None):
+    def _on_manual_transcript_scroll(self, event=None):
+        if event is not None and getattr(event, "state", 0) & 0x0004:
+            return "break"
         self._suspend_transcript_following()
 
     def _on_transcript_scrollbar(self, *args):
