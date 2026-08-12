@@ -1,5 +1,5 @@
 # split_audio_gui.py — v1.11.0 (Stop Button + Worker Control)
-import os, sys, stat, json, yaml, queue, shutil, threading, subprocess, tkinter as tk, hashlib, datetime, re, signal, copy, math, time
+import os, sys, stat, json, yaml, queue, shutil, threading, subprocess, tkinter as tk, hashlib, datetime, re, signal, copy, math, time, tempfile
 import ttkbootstrap as tb
 from tkinter import ttk, messagebox, filedialog, font as tkfont
 from pathlib import Path
@@ -12,7 +12,7 @@ from split_audio import (
     VIDEO_EXTS as _PIPELINE_VIDEO_EXTS,
     build_source_identity,
     discover_sources,
-    write_speaker_name_record,
+    speaker_name_record_path,
 )
 
 # === word-level exporters (VTT, ASS, and HTML player) ========================
@@ -1409,6 +1409,7 @@ class NamingWorkspace(ttk.Frame):
         self._video_update_after = None
         self._pending_seek_after = None
         self._pending_subtitle_after = None
+        self._apply_player_restore_after = None
         self._seek_dragging = False
         self._video_duration_seconds = 0.0
         self._player_closing = False
@@ -2233,6 +2234,7 @@ class NamingWorkspace(ttk.Frame):
     def _seek_embedded_video(self, seconds):
         if self._vlc_player is None or self._loaded_video_path is None:
             return
+        self._cancel_pending_apply_player_restore()
         try:
             duration_ms = max(0, int(self._vlc_player.get_length()))
             target_ms = max(0, int(float(seconds) * 1000))
@@ -2264,6 +2266,7 @@ class NamingWorkspace(ttk.Frame):
                 parent=self.winfo_toplevel(),
             )
             return
+        self._cancel_pending_apply_player_restore()
         try:
             if self._vlc_player.is_playing():
                 self._vlc_player.pause()
@@ -2301,6 +2304,7 @@ class NamingWorkspace(ttk.Frame):
         self._seek_embedded_video(current + 5.0)
 
     def _video_stop(self):
+        self._cancel_pending_apply_player_restore()
         self._cancel_word_synchronization()
         self._clear_current_word()
         self._reset_interpolated_playback_clock()
@@ -2321,6 +2325,7 @@ class NamingWorkspace(ttk.Frame):
     def _video_volume_changed(self, _value=None):
         if self._vlc_player is None:
             return
+        self._cancel_pending_apply_player_restore()
         try:
             volume = max(0, min(100, int(round(self.video_volume_var.get()))))
             self._vlc_player.audio_set_volume(volume)
@@ -2335,7 +2340,17 @@ class NamingWorkspace(ttk.Frame):
                 pass
             self._pending_subtitle_after = None
 
+    def _cancel_pending_apply_player_restore(self):
+        if self._apply_player_restore_after is None:
+            return
+        try:
+            self.after_cancel(self._apply_player_restore_after)
+        except (AttributeError, tk.TclError):
+            pass
+        self._apply_player_restore_after = None
+
     def _subtitle_selection_changed(self, _event=None):
+        self._cancel_pending_apply_player_restore()
         self._cancel_pending_subtitle_apply()
         self._apply_selected_subtitle(preserve_state=True)
 
@@ -2355,6 +2370,172 @@ class NamingWorkspace(ttk.Frame):
         except Exception:
             was_paused = False
         return current_ms, was_playing, was_paused
+
+    def _vlc_may_lock_apply_targets(self, target_paths):
+        if (
+            self._player_closing
+            or self._vlc_player is None
+            or self._vlc_media is None
+            or self._loaded_video_path is None
+        ):
+            return False
+        target_keys = {
+            os.path.normcase(str(Path(path).resolve())) for path in target_paths
+        }
+        subtitle_keys = {
+            os.path.normcase(str(path.resolve()))
+            for _choice, path in self._subtitle_file_candidates()
+        }
+        return bool(target_keys & subtitle_keys)
+
+    def _detach_embedded_player_for_apply(self):
+        player = self._vlc_player
+        media = self._vlc_media
+        if player is None or media is None or self._loaded_video_path is None:
+            return None
+
+        playback_snapshot = self._subtitle_playback_snapshot() or (0, False, False)
+        try:
+            volume = int(player.audio_get_volume())
+            if volume < 0:
+                raise ValueError
+        except Exception:
+            volume = int(round(self.video_volume_var.get()))
+        snapshot = {
+            "player": player,
+            "video_path": Path(self._loaded_video_path),
+            "current_ms": playback_snapshot[0],
+            "was_playing": playback_snapshot[1],
+            "was_paused": playback_snapshot[2],
+            "volume": max(0, min(100, volume)),
+            "subtitle_choice": self.subtitle_var.get() or "Off",
+            "detached": False,
+        }
+
+        self._cancel_pending_apply_player_restore()
+        self._cancel_pending_video_seek()
+        self._cancel_pending_subtitle_apply()
+        self._cancel_word_synchronization()
+        self._reset_interpolated_playback_clock()
+        try:
+            player.stop()
+        except Exception:
+            pass
+        try:
+            player.set_media(None)
+            snapshot["detached"] = True
+            self._vlc_media = None
+            self._subtitle_track_ids.clear()
+            self._applied_subtitle_choice = None
+            try:
+                media.release()
+            except Exception:
+                pass
+        except Exception:
+            self._restore_embedded_player_after_apply(snapshot)
+            raise RuntimeError(
+                "VLC could not release the active subtitle file before Apply."
+            )
+        return snapshot
+
+    def _schedule_apply_player_state_restore(self, snapshot):
+        self._cancel_pending_apply_player_restore()
+        first_update = True
+
+        def restore_state(remaining):
+            nonlocal first_update
+            self._apply_player_restore_after = None
+            player = snapshot["player"]
+            if (
+                self._player_closing
+                or self._vlc_player is not player
+                or self._loaded_video_path is None
+            ):
+                return
+            pending_media_work = (
+                self._pending_seek_after is not None
+                or self._pending_subtitle_after is not None
+            )
+            final_update = not pending_media_work or remaining <= 0
+            try:
+                volume = snapshot["volume"]
+                self.video_volume_var.set(volume)
+                player.audio_set_volume(volume)
+                if first_update or final_update:
+                    target_ms = max(0, int(snapshot["current_ms"]))
+                    duration_ms = max(0, int(player.get_length()))
+                    if duration_ms > 0:
+                        target_ms = min(target_ms, duration_ms)
+                    player.set_time(target_ms)
+                is_playing = bool(player.is_playing())
+                if snapshot["was_paused"]:
+                    if is_playing:
+                        player.pause()
+                    self.btn_video_play.configure(text="Play")
+                elif snapshot["was_playing"]:
+                    if not is_playing:
+                        player.play()
+                    self.btn_video_play.configure(text="Pause")
+                elif final_update:
+                    player.stop()
+                    player.set_time(max(0, int(snapshot["current_ms"])))
+                    self.btn_video_play.configure(text="Play")
+                self._reset_interpolated_playback_clock(
+                    max(0.0, snapshot["current_ms"] / 1000.0)
+                )
+            except Exception:
+                pass
+            first_update = False
+            if pending_media_work and remaining > 0:
+                try:
+                    self._apply_player_restore_after = self.after(
+                        100,
+                        lambda: restore_state(remaining - 1),
+                    )
+                except tk.TclError:
+                    self._apply_player_restore_after = None
+            else:
+                self._schedule_word_synchronization()
+
+        try:
+            self._apply_player_restore_after = self.after(
+                100,
+                lambda: restore_state(30),
+            )
+        except tk.TclError:
+            self._apply_player_restore_after = None
+
+    def _restore_embedded_player_after_apply(self, snapshot):
+        if snapshot is None:
+            return
+        player = snapshot["player"]
+        if self._player_closing or self._vlc_player is not player:
+            return
+        try:
+            self.video_volume_var.set(snapshot["volume"])
+            self.refresh_available_subtitles()
+            choice = snapshot["subtitle_choice"]
+            self.subtitle_var.set(
+                choice if choice in self._subtitle_choices else "Off"
+            )
+            if snapshot["detached"]:
+                self._load_embedded_video(
+                    snapshot["video_path"],
+                    max(0.0, snapshot["current_ms"] / 1000.0),
+                )
+            else:
+                try:
+                    player.play()
+                except Exception:
+                    pass
+            self._schedule_apply_player_state_restore(snapshot)
+        except Exception as exc:
+            messagebox.showwarning(
+                "Video Preview",
+                "Apply finished, but the embedded video preview could not be fully restored:\n"
+                f"{exc}",
+                parent=self.winfo_toplevel(),
+            )
 
     def _restore_subtitle_playback_state(self, snapshot):
         if snapshot is None or self._vlc_player is None or self._player_closing:
@@ -2592,6 +2773,7 @@ class NamingWorkspace(ttk.Frame):
         if self._vlc_player is None or self._vlc_instance is None:
             raise RuntimeError(self._vlc_status.get("reason") or "Embedded VLC playback is unavailable.")
 
+        self._cancel_pending_apply_player_restore()
         video_path = Path(video_path).resolve()
         if not video_path.is_file():
             raise FileNotFoundError(f"Video file not found: {video_path}")
@@ -2640,6 +2822,7 @@ class NamingWorkspace(ttk.Frame):
         self._reset_interpolated_playback_clock()
         self._cancel_pending_video_seek()
         self._cancel_pending_subtitle_apply()
+        self._cancel_pending_apply_player_restore()
         if self._video_reattach_after is not None:
             try:
                 self.after_cancel(self._video_reattach_after)
@@ -3768,6 +3951,181 @@ class NamingWorkspace(ttk.Frame):
                     except:
                         pass
 
+    @staticmethod
+    def _write_apply_json(path, data):
+        path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _write_apply_yaml(path, data):
+        with path.open("w", encoding="utf-8", newline="\n") as output_file:
+            yaml.safe_dump(
+                data,
+                output_file,
+                sort_keys=False,
+                allow_unicode=True,
+            )
+
+    @staticmethod
+    def _write_apply_srt(path, segments, mapping):
+        with path.open("w", encoding="utf-8", newline="\n") as output_file:
+            for index, segment in enumerate(segments, 1):
+                start = float(segment.get("start", 0.0))
+                end = float(segment.get("end", start))
+                text = str(segment.get("text", "")).strip()
+                speaker = segment.get("speaker")
+                display = mapping.get(speaker, speaker) if speaker else text
+                line = f"{display}: {text}" if speaker else text
+                output_file.write(str(index))
+                output_file.write("\n")
+                output_file.write(f"{srt_timestamp(start)} --> {srt_timestamp(end)}")
+                output_file.write("\n")
+                output_file.write(line)
+                output_file.write("\n\n")
+
+    @staticmethod
+    def _write_apply_txt(path, segments, mapping):
+        diarized = any((segment.get("speaker") or "") for segment in segments)
+        with path.open("w", encoding="utf-8", newline="\n") as output_file:
+            if diarized:
+                last_speaker = None
+                buffered_text = []
+
+                def flush():
+                    nonlocal buffered_text, last_speaker
+                    if not buffered_text or last_speaker is None:
+                        return
+                    text = " ".join(buffered_text).strip()
+                    if text:
+                        output_file.write(
+                            f"{mapping.get(last_speaker, last_speaker)}: {text}\n"
+                        )
+                    buffered_text = []
+
+                for segment in segments:
+                    text = str(segment.get("text", "")).strip()
+                    if not text:
+                        continue
+                    speaker = segment.get("speaker") or "SPEAKER_00"
+                    if speaker != last_speaker and last_speaker is not None:
+                        flush()
+                    last_speaker = speaker
+                    buffered_text.append(text)
+                flush()
+            else:
+                all_text = " ".join(
+                    str(segment.get("text", "")).strip()
+                    for segment in segments
+                    if segment.get("text")
+                ).strip()
+                if all_text:
+                    output_file.write(all_text + "\n")
+
+    @staticmethod
+    def _validate_staged_apply_file(path, output_kind, expected_data=None):
+        if not path.is_file():
+            raise RuntimeError(f"Staged {output_kind} output was not created.")
+        with path.open("r+b") as staged_file:
+            raw = staged_file.read()
+            staged_file.flush()
+            os.fsync(staged_file.fileno())
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RuntimeError(f"Staged {output_kind} output is not valid UTF-8.") from exc
+
+        if output_kind == "json":
+            parsed = json.loads(text)
+            if not isinstance(parsed, dict):
+                raise RuntimeError("Staged JSON output must contain a top-level object.")
+            if expected_data is not None and parsed != expected_data:
+                raise RuntimeError("Staged JSON output did not preserve the expected data.")
+        elif output_kind == "yaml":
+            parsed = yaml.safe_load(text)
+            if not isinstance(parsed, dict):
+                raise RuntimeError("Staged YAML output must contain a top-level mapping.")
+            if expected_data is not None and parsed != expected_data:
+                raise RuntimeError("Staged YAML output did not preserve the expected data.")
+        elif output_kind == "vtt" and not text.startswith("WEBVTT\n"):
+            raise RuntimeError("Staged VTT output is missing its WEBVTT header.")
+        elif output_kind == "ass" and (
+            "[Script Info]" not in text or "[Events]" not in text
+        ):
+            raise RuntimeError("Staged ASS output is missing required sections.")
+        elif output_kind == "html" and (
+            "<!doctype html>" not in text.lower() or "</html>" not in text.lower()
+        ):
+            raise RuntimeError("Staged HTML output is incomplete.")
+        elif output_kind == "lrc" and (
+            not text.splitlines() or text.splitlines()[0] != "[re:audiosplitter]"
+        ):
+            raise RuntimeError("Staged LRC output is missing its header.")
+
+    def _stage_apply_file(
+        self,
+        staging_dir,
+        staged_files,
+        target_path,
+        output_kind,
+        writer,
+        expected_data=None,
+    ):
+        target_path = Path(target_path).resolve()
+        staged_path = staging_dir / f"{len(staged_files):03d}-{target_path.name}"
+        writer(staged_path)
+        self._validate_staged_apply_file(staged_path, output_kind, expected_data)
+        staged_files.append((target_path, staged_path))
+        return target_path
+
+    def _atomic_replace_staged_apply_file(self, staged_path, target_path):
+        os.replace(staged_path, target_path)
+
+    def _commit_staged_apply_files(self, staging_dir, staged_files):
+        normalized_targets = [os.path.normcase(str(target)) for target, _staged in staged_files]
+        if len(normalized_targets) != len(set(normalized_targets)):
+            raise RuntimeError("The Apply transaction contains duplicate output targets.")
+
+        backup_dir = staging_dir / "backups"
+        backup_dir.mkdir()
+        originals = {}
+        for index, (target_path, _staged_path) in enumerate(staged_files):
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            if target_path.exists():
+                if not target_path.is_file():
+                    raise RuntimeError(f"Apply output target is not a file: {target_path}")
+                backup_path = backup_dir / f"{index:03d}-{target_path.name}"
+                shutil.copy2(target_path, backup_path)
+                originals[target_path] = backup_path
+            else:
+                originals[target_path] = None
+
+        replaced = []
+        try:
+            for target_path, staged_path in staged_files:
+                self._atomic_replace_staged_apply_file(staged_path, target_path)
+                replaced.append(target_path)
+        except Exception as replace_error:
+            rollback_errors = []
+            for target_path in reversed(replaced):
+                backup_path = originals[target_path]
+                try:
+                    if backup_path is None:
+                        target_path.unlink(missing_ok=True)
+                    else:
+                        os.replace(backup_path, target_path)
+                except Exception as rollback_error:
+                    rollback_errors.append(f"{target_path}: {rollback_error}")
+            if rollback_errors:
+                raise RuntimeError(
+                    "Could not commit the staged outputs, and rollback was incomplete: "
+                    + "; ".join(rollback_errors)
+                ) from replace_error
+            raise RuntimeError(
+                f"Could not commit the staged outputs; original files were restored: {replace_error}"
+            ) from replace_error
+
     def apply_changes(self):
         if self._preflight_current_disk_result("apply changes") is None:
             self._update_dirty_state()
@@ -3798,30 +4156,16 @@ class NamingWorkspace(ttk.Frame):
                 parent=self.winfo_toplevel(),
             )
             return False
-        try:
-            _spk = json.loads(self.speakers_json.read_text(encoding='utf-8'))
-            _spk['names'] = mapping
-            self.speakers_json.write_text(json.dumps(_spk, ensure_ascii=False, indent=2), encoding='utf-8')
-        except Exception as exc:
-            raise RuntimeError(f"Could not update speakers.json: {exc}") from exc
+
+        current_preflight = self._preflight_current_disk_result("apply changes")
+        if current_preflight is None:
+            return False
+        speakers_data = copy.deepcopy(current_preflight.speakers_data)
+        speakers_data["names"] = mapping
         segments = self.segments
-        seg_data = self.segments_data
+        seg_data = copy.deepcopy(self.segments_data)
         if self.manual_corrections_pending:
-            try:
-                seg_data = _write_corrected_segments_json(
-                    self.segments_json,
-                    self.segments_data,
-                    segments,
-                    create_backup=True,
-                )
-                self.segments_data = seg_data
-            except Exception as e:
-                messagebox.showerror(
-                    "Save corrections failed",
-                    f"Could not update segments.json:\n{e}",
-                    parent=self.winfo_toplevel(),
-                )
-                return False
+            seg_data["segments"] = copy.deepcopy(segments)
         out_dir = self.speakers_json.parent
         title = seg_data.get("title") or out_dir.name
         srt_path = out_dir / f"{title}.srt"
@@ -3832,83 +4176,174 @@ class NamingWorkspace(ttk.Frame):
         else:
             srt_tmp = out_dir / f"{title}.named.srt"
             txt_tmp = out_dir / f"{title}.named.txt"
-        with srt_tmp.open("w", encoding="utf-8", newline="\n") as f:
-            for idx, seg in enumerate(segments, 1):
-                start = float(seg.get("start", 0.0))
-                end = float(seg.get("end", start))
-                text = str(seg.get("text", "")).strip()
-                spk = seg.get("speaker")
-                disp = mapping.get(spk, spk) if spk else text
-                line = f"{disp}: {text}" if spk else text
-                f.write(str(idx)); f.write("\n")
-                f.write(f"{srt_timestamp(start)} --> {srt_timestamp(end)}"); f.write("\n")
-                f.write(line); f.write("\n\n")
-        diarized = any((seg.get("speaker") or "") for seg in segments)
-        with txt_tmp.open("w", encoding="utf-8", newline="\n") as f:
-            if diarized:
-                last = None
-                buf = []
-                def flush():
-                    nonlocal buf, last
-                    if not buf or last is None: return
-                    text = " ".join(buf).strip()
-                    if text: f.write(f"{mapping.get(last, last)}: {text}\n")
-                    buf = []
-                for seg in segments:
-                    t = str(seg.get("text", "")).strip()
-                    if not t: continue
-                    sp = seg.get("speaker") or "SPEAKER_00"
-                    if sp != last and last is not None: flush()
-                    last = sp; buf.append(t)
-                flush()
-            else:
-                all_text = " ".join(str(seg.get("text", "")).strip() for seg in segments if seg.get("text")).strip()
-                if all_text: f.write(all_text + "\n")
+
         export_created = []
-        try:
-            if _has_word_level(segments):
-                if self.var_export_vtt.get():
-                    vp = out_dir / f"{title}.words.vtt"
-                    write_word_vtt(vp, segments, mapping)
-                    export_created.append(vp.name)
-                if self.var_export_ass.get():
-                    ap = out_dir / f"{title}.words.ass"
-                    write_word_ass(ap, segments, mapping)
-                    export_created.append(ap.name)
-                if self.var_export_html.get():
-                    sps = sorted({mapping.get(seg.get("speaker"), seg.get("speaker")) for seg in segments if seg.get("speaker")})
-                    hp = out_dir / "word_player.html"
-                    write_word_player_html(hp, sps)
-                    export_created.append(hp.name)
-            if self.var_export_lrc.get():
-                lp = out_dir / f"{title}.lrc"
-                write_lrc(lp, segments, mapping)
-                export_created.append(lp.name)
-            if self.var_export_ass_plain.get():
-                pp = out_dir / f"{title}.plain.ass"
-                write_ass_plain(pp, segments, mapping)
-                export_created.append(pp.name)
-        except Exception as exc:
-            raise RuntimeError(f"Could not create an optional transcript export: {exc}") from exc
         names_yaml = out_dir / "names.yaml"
         names_data = {"speaker_names": mapping}
         source_identity = build_source_identity(seg_data.get("source_path"))
-        if source_identity is not None:
-            names_data["source_identity"] = source_identity
-        atomic_write_yaml(names_yaml, names_data)
         persistent_warning = None
-        try:
-            persistent_path = write_speaker_name_record(seg_data.get("source_path"), mapping)
+        persistent_path = None
+        persistent_data = None
+        if source_identity is None:
+            persistent_warning = (
+                "The original source file is missing or unavailable. The current outputs were updated, "
+                "but the speaker names could not be saved persistently."
+            )
+        else:
+            names_data["source_identity"] = source_identity
+            persistent_path = speaker_name_record_path(seg_data.get("source_path"))
             if persistent_path is None:
                 persistent_warning = (
                     "The original source file is missing or unavailable. The current outputs were updated, "
                     "but the speaker names could not be saved persistently."
                 )
-        except Exception as e:
-            persistent_warning = (
-                "The current outputs were updated, but the persistent speaker-name record could not be saved:\n"
-                f"{e}"
+            else:
+                persistent_data = {
+                    "source_identity": source_identity,
+                    "speaker_names": dict(mapping),
+                }
+
+        with tempfile.TemporaryDirectory(prefix=".ats-apply-", dir=out_dir) as staging_name:
+            staging_dir = Path(staging_name)
+            staged_files = []
+
+            if self.manual_corrections_pending:
+                backup_path = self.segments_json.with_name(
+                    "segments.before_manual_corrections.json"
+                )
+                if not backup_path.exists():
+                    original_segments = self.segments_json.read_bytes()
+                    if hashlib.sha256(original_segments).hexdigest() != self.result_identity.segments_sha256:
+                        raise RuntimeError(
+                            "segments.json changed while the manual-correction backup was being prepared."
+                        )
+                    self._stage_apply_file(
+                        staging_dir,
+                        staged_files,
+                        backup_path,
+                        "json",
+                        lambda path, data=original_segments: path.write_bytes(data),
+                        expected_data=current_preflight.segments_data,
+                    )
+
+            self._stage_apply_file(
+                staging_dir,
+                staged_files,
+                self.speakers_json,
+                "json",
+                lambda path: self._write_apply_json(path, speakers_data),
+                expected_data=speakers_data,
             )
+            if self.manual_corrections_pending:
+                self._stage_apply_file(
+                    staging_dir,
+                    staged_files,
+                    self.segments_json,
+                    "json",
+                    lambda path: self._write_apply_json(path, seg_data),
+                    expected_data=seg_data,
+                )
+            self._stage_apply_file(
+                staging_dir,
+                staged_files,
+                srt_tmp,
+                "srt",
+                lambda path: self._write_apply_srt(path, segments, mapping),
+            )
+            self._stage_apply_file(
+                staging_dir,
+                staged_files,
+                txt_tmp,
+                "txt",
+                lambda path: self._write_apply_txt(path, segments, mapping),
+            )
+
+            if _has_word_level(segments):
+                if self.var_export_vtt.get():
+                    vp = out_dir / f"{title}.words.vtt"
+                    self._stage_apply_file(
+                        staging_dir,
+                        staged_files,
+                        vp,
+                        "vtt",
+                        lambda path: write_word_vtt(path, segments, mapping),
+                    )
+                    export_created.append(vp.name)
+                if self.var_export_ass.get():
+                    ap = out_dir / f"{title}.words.ass"
+                    self._stage_apply_file(
+                        staging_dir,
+                        staged_files,
+                        ap,
+                        "ass",
+                        lambda path: write_word_ass(path, segments, mapping),
+                    )
+                    export_created.append(ap.name)
+                if self.var_export_html.get():
+                    sps = sorted({mapping.get(seg.get("speaker"), seg.get("speaker")) for seg in segments if seg.get("speaker")})
+                    hp = out_dir / "word_player.html"
+                    self._stage_apply_file(
+                        staging_dir,
+                        staged_files,
+                        hp,
+                        "html",
+                        lambda path: write_word_player_html(path, sps),
+                    )
+                    export_created.append(hp.name)
+            if self.var_export_lrc.get():
+                lp = out_dir / f"{title}.lrc"
+                self._stage_apply_file(
+                    staging_dir,
+                    staged_files,
+                    lp,
+                    "lrc",
+                    lambda path: write_lrc(path, segments, mapping),
+                )
+                export_created.append(lp.name)
+            if self.var_export_ass_plain.get():
+                pp = out_dir / f"{title}.plain.ass"
+                self._stage_apply_file(
+                    staging_dir,
+                    staged_files,
+                    pp,
+                    "ass",
+                    lambda path: write_ass_plain(path, segments, mapping),
+                )
+                export_created.append(pp.name)
+
+            self._stage_apply_file(
+                staging_dir,
+                staged_files,
+                names_yaml,
+                "yaml",
+                lambda path: self._write_apply_yaml(path, names_data),
+                expected_data=names_data,
+            )
+            if persistent_path is not None:
+                self._stage_apply_file(
+                    staging_dir,
+                    staged_files,
+                    persistent_path,
+                    "yaml",
+                    lambda path: self._write_apply_yaml(path, persistent_data),
+                    expected_data=persistent_data,
+                )
+
+            final_preflight = self._preflight_current_disk_result("apply changes")
+            if final_preflight is None:
+                return False
+            player_snapshot = None
+            try:
+                target_paths = [target_path for target_path, _staged_path in staged_files]
+                if self._vlc_may_lock_apply_targets(target_paths):
+                    player_snapshot = self._detach_embedded_player_for_apply()
+                self._commit_staged_apply_files(staging_dir, staged_files)
+            finally:
+                if player_snapshot is not None:
+                    self._restore_embedded_player_after_apply(player_snapshot)
+
+        if self.manual_corrections_pending:
+            self.segments_data = seg_data
         if self.var_rename_audio.get():
             try:
                 self._rename_tree(out_dir, mapping)
