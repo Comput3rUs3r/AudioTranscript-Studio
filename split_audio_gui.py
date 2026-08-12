@@ -1282,6 +1282,9 @@ class SegmentCorrectionDialog(tk.Toplevel):
         self.destroy()
 
 class NamingWorkspace(ttk.Frame):
+    _LEFT_RATIO_DEFAULT = 0.40
+    _LEFT_RATIO_MIN = 0.10
+    _LEFT_RATIO_MAX = 0.50
     _VIDEO_RATIO_DEFAULT = 0.65
     _VIDEO_RATIO_MIN = 0.35
     _VIDEO_RATIO_MAX = 0.80
@@ -1303,6 +1306,9 @@ class NamingWorkspace(ttk.Frame):
         self._on_discard = on_discard
         self._discard_label = discard_label
         self._started = False
+        self._clean_baseline = None
+        self._dirty_tracking_suspended = False
+        self._dirty_trace_ids = []
         self._vlc_status = {}
         self._vlc_instance = None
         self._vlc_player = None
@@ -1341,8 +1347,17 @@ class NamingWorkspace(ttk.Frame):
                 self._naming_cfg = {}
         except Exception:
             self._naming_cfg = {}
-        self._preview_video_ratio = self._validated_video_ratio(
-            self._naming_cfg.get("name_speakers_video_ratio")
+        self._preview_video_ratio = self._validated_saved_pane_ratio(
+            self._naming_cfg.get("name_speakers_video_ratio"),
+            self._VIDEO_RATIO_DEFAULT,
+            self._VIDEO_RATIO_MIN,
+            self._VIDEO_RATIO_MAX,
+        )
+        self._workspace_left_ratio = self._validated_saved_pane_ratio(
+            self._naming_cfg.get("name_speakers_left_ratio"),
+            self._LEFT_RATIO_DEFAULT,
+            self._LEFT_RATIO_MIN,
+            self._LEFT_RATIO_MAX,
         )
         self.speakers_json = speakers_json
         self.segments_json = segments_json
@@ -1370,18 +1385,19 @@ class NamingWorkspace(ttk.Frame):
         main.rowconfigure(2, weight=1)
         ttk.Label(main, text="Name Speakers", font=("Segoe UI", 16, "bold")).grid(row=0, column=0, sticky="w")
         ttk.Label(main, text=f"{self.title_name} — assign names and review the transcript").grid(row=1, column=0, sticky="w", pady=(2, 10))
-        paned = ttk.PanedWindow(main, orient="horizontal")
-        paned.grid(row=2, column=0, sticky="nsew")
-        left = ttk.Frame(paned, padding=(0, 0, 6, 0))
-        right = ttk.Frame(paned, padding=(6, 0, 0, 0))
-        paned.add(left, weight=2)
-        paned.add(right, weight=3)
+        self._workspace_paned = ttk.PanedWindow(main, orient="horizontal")
+        self._workspace_paned.grid(row=2, column=0, sticky="nsew")
+        left = ttk.Frame(self._workspace_paned, padding=(0, 0, 6, 0))
+        right = ttk.Frame(self._workspace_paned, padding=(6, 0, 0, 0))
+        self._workspace_paned.add(left, weight=2)
+        self._workspace_paned.add(right, weight=3)
         left.columnconfigure(0, weight=1)
         left.rowconfigure(0, weight=1, minsize=150)
         left.rowconfigure(1, weight=1, minsize=125)
         right.columnconfigure(0, weight=1)
         right.rowconfigure(1, weight=1)
         self.inputs = {}
+        self.name_vars = {}
         self.selected_speaker = tk.StringVar(value=self.speakers[0] if self.speakers else "")
 
         assignments = ttk.LabelFrame(left, text="Speaker Assignments", padding=8)
@@ -1418,7 +1434,14 @@ class NamingWorkspace(ttk.Frame):
             if saved and saved not in suggestions:
                 suggestions = [saved] + suggestions
 
-            cb = ttk.Combobox(grid, values=suggestions, width=30, state="normal")
+            name_var = tk.StringVar()
+            cb = ttk.Combobox(
+                grid,
+                textvariable=name_var,
+                values=suggestions,
+                width=30,
+                state="normal",
+            )
             cb.grid(row=r, column=2, sticky="ew", pady=4)
 
             cb.bind("<FocusIn>", lambda e, spk=spk: self.selected_speaker.set(spk))
@@ -1428,6 +1451,7 @@ class NamingWorkspace(ttk.Frame):
                 cb.set(saved)
 
             self.inputs[spk] = cb
+            self.name_vars[spk] = name_var
 
         grid.columnconfigure(2, weight=1)
         grid.bind("<Configure>", lambda event: speaker_canvas.configure(scrollregion=speaker_canvas.bbox("all")))
@@ -1511,6 +1535,7 @@ class NamingWorkspace(ttk.Frame):
             existing = [self.name_pool.get(i) for i in range(self.name_pool.size())]
             if nm not in existing:
                 self.name_pool.insert("end", nm)
+                self._update_dirty_state()
 
         self.name_pool.bind("<Double-1>", assign_selected_name)
 
@@ -1551,6 +1576,16 @@ class NamingWorkspace(ttk.Frame):
             bootstyle="secondary-outline",
             padding=(14, 6),
         ).pack(side="right", padx=(0, 8))
+        self.lbl_dirty_status = tb.Label(btns, text="Saved", bootstyle="success")
+        self.lbl_dirty_status.pack(side="left")
+        self.btn_revert = tb.Button(
+            btns,
+            text="Revert Unsaved Changes",
+            command=self.revert_unsaved_changes,
+            bootstyle="warning-outline",
+            state="disabled",
+        )
+        self.btn_revert.pack(side="left", padx=(8, 0))
 
         toolbar = ttk.LabelFrame(right, text="Search", padding=10)
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
@@ -1674,6 +1709,12 @@ class NamingWorkspace(ttk.Frame):
         viewer.columnconfigure(0, weight=1)
         viewer.rowconfigure(1, weight=1)
         self._preview_paned.add(viewer, minsize=130, stretch="always")
+        self._workspace_paned.bind(
+            "<ButtonRelease-1>", self._pane_divider_released, add="+"
+        )
+        self._preview_paned.bind(
+            "<ButtonRelease-1>", self._pane_divider_released, add="+"
+        )
 
         transcript_controls = ttk.Frame(viewer)
         transcript_controls.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
@@ -1739,6 +1780,8 @@ class NamingWorkspace(ttk.Frame):
             initial = self.speakers[0] if self.speakers else "SPEAKER_00"
         self.find_var.set(initial)
         self._highlight_query(initial)
+        self._install_dirty_tracking()
+        self._capture_clean_baseline()
         self.bind("<Destroy>", self._on_workspace_destroyed, add="+")
 
     def start(self):
@@ -1747,10 +1790,11 @@ class NamingWorkspace(ttk.Frame):
             return
         self._started = True
         self._initialize_embedded_player()
-        self._preview_ratio_after = self.after(100, self._apply_initial_preview_ratio)
+        self._schedule_initial_pane_ratios(100)
 
     def on_host_activated(self):
         """Reattach the existing video output after an embedded host is remapped."""
+        self._schedule_initial_pane_ratios()
         if (
             os.name != "nt"
             or self._player_closing
@@ -1777,6 +1821,29 @@ class NamingWorkspace(ttk.Frame):
             self._video_reattach_after = self.after_idle(reattach)
         except tk.TclError:
             self._video_reattach_after = None
+
+    def _validated_left_ratio(self, value):
+        if isinstance(value, bool):
+            return self._LEFT_RATIO_DEFAULT
+        try:
+            ratio = float(value)
+        except (TypeError, ValueError):
+            return self._LEFT_RATIO_DEFAULT
+        if not math.isfinite(ratio):
+            return self._LEFT_RATIO_DEFAULT
+        return max(self._LEFT_RATIO_MIN, min(self._LEFT_RATIO_MAX, ratio))
+
+    @staticmethod
+    def _validated_saved_pane_ratio(value, default, minimum, maximum):
+        if isinstance(value, bool):
+            return default
+        try:
+            ratio = float(value)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(ratio) or not minimum <= ratio <= maximum:
+            return default
+        return ratio
 
     def _validated_video_ratio(self, value):
         if isinstance(value, bool):
@@ -1834,25 +1901,61 @@ class NamingWorkspace(ttk.Frame):
             self._adjust_transcript_font_size(direction)
         return "break"
 
+    def _schedule_initial_pane_ratios(self, delay=50):
+        if (
+            self._preview_ratio_applied
+            or self._player_closing
+            or self._preview_ratio_after is not None
+        ):
+            return
+        try:
+            self._preview_ratio_after = self.after(
+                delay, self._apply_initial_preview_ratio
+            )
+        except tk.TclError:
+            self._preview_ratio_after = None
+
     def _apply_initial_preview_ratio(self):
         self._preview_ratio_after = None
         if self._preview_ratio_applied or self._player_closing:
             return
         try:
             self.update_idletasks()
-            available_height = self._preview_paned.winfo_height()
-            if available_height <= 1 or len(self._preview_paned.panes()) < 2:
-                self._preview_ratio_after = self.after(50, self._apply_initial_preview_ratio)
+            if not self.winfo_ismapped():
+                self._schedule_initial_pane_ratios()
                 return
-            sash_position = int(round(available_height * self._preview_video_ratio))
-            self._preview_paned.sash_place(0, 0, sash_position)
+            available_width = self._workspace_paned.winfo_width()
+            available_height = self._preview_paned.winfo_height()
+            if (
+                available_width < 500
+                or available_height < 350
+                or len(self._workspace_paned.panes()) < 2
+                or len(self._preview_paned.panes()) < 2
+            ):
+                self._schedule_initial_pane_ratios()
+                return
+            left_sash = int(round(available_width * self._workspace_left_ratio))
+            video_sash = int(round(available_height * self._preview_video_ratio))
+            self._workspace_paned.sashpos(0, left_sash)
+            self._preview_paned.sash_place(0, 0, video_sash)
+            self.update_idletasks()
             self._preview_ratio_applied = True
+            self._remember_current_pane_ratios()
         except (AttributeError, tk.TclError):
             if not self._player_closing:
-                try:
-                    self._preview_ratio_after = self.after(50, self._apply_initial_preview_ratio)
-                except tk.TclError:
-                    self._preview_ratio_after = None
+                self._schedule_initial_pane_ratios()
+
+    def _current_workspace_left_ratio(self):
+        if not self._preview_ratio_applied:
+            return self._workspace_left_ratio
+        try:
+            available_width = self._workspace_paned.winfo_width()
+            if available_width <= 1:
+                return self._workspace_left_ratio
+            sash_position = self._workspace_paned.sashpos(0)
+            return self._validated_left_ratio(sash_position / available_width)
+        except (AttributeError, tk.TclError):
+            return self._workspace_left_ratio
 
     def _current_preview_video_ratio(self):
         if not self._preview_ratio_applied:
@@ -1865,6 +1968,20 @@ class NamingWorkspace(ttk.Frame):
             return self._validated_video_ratio(sash_position / available_height)
         except (AttributeError, tk.TclError):
             return self._preview_video_ratio
+
+    def _remember_current_pane_ratios(self):
+        if not self._preview_ratio_applied or self._player_closing:
+            return
+        self._workspace_left_ratio = self._current_workspace_left_ratio()
+        self._preview_video_ratio = self._current_preview_video_ratio()
+
+    def _pane_divider_released(self, _event=None):
+        if not self._preview_ratio_applied or self._player_closing:
+            return
+        try:
+            self.after_idle(self._remember_current_pane_ratios)
+        except tk.TclError:
+            pass
 
     def _cancel_pending_preview_ratio(self):
         if self._preview_ratio_after is None:
@@ -1879,22 +1996,27 @@ class NamingWorkspace(ttk.Frame):
         if self._view_preferences_saved:
             return
         self._view_preferences_saved = True
-        ratio = self._current_preview_video_ratio()
+        left_ratio = self._current_workspace_left_ratio()
+        video_ratio = self._current_preview_video_ratio()
         try:
             font_size = int(self.transcript_font.cget("size"))
         except (AttributeError, TypeError, ValueError, tk.TclError):
             font_size = self._transcript_default_font_size
         try:
-            cfg = read_yaml(conf_path())
-            if not isinstance(cfg, dict):
-                return
-            cfg["name_speakers_video_ratio"] = round(ratio, 4)
-            cfg["name_speakers_transcript_font_size"] = max(
-                self._TRANSCRIPT_FONT_MIN,
-                min(self._TRANSCRIPT_FONT_MAX, font_size),
+            cfg = merge_gui_conf(
+                read_yaml(conf_path()),
+                {
+                    "name_speakers_left_ratio": round(left_ratio, 4),
+                    "name_speakers_video_ratio": round(video_ratio, 4),
+                    "name_speakers_transcript_font_size": max(
+                        self._TRANSCRIPT_FONT_MIN,
+                        min(self._TRANSCRIPT_FONT_MAX, font_size),
+                    ),
+                },
             )
             atomic_write_yaml(conf_path(), cfg)
-            self._preview_video_ratio = ratio
+            self._workspace_left_ratio = left_ratio
+            self._preview_video_ratio = video_ratio
         except Exception:
             pass
 
@@ -2455,6 +2577,7 @@ class NamingWorkspace(ttk.Frame):
                 pass
 
     def shutdown(self):
+        self._remove_dirty_tracking()
         self._release_embedded_player()
 
     def _on_workspace_destroyed(self, event):
@@ -2464,6 +2587,140 @@ class NamingWorkspace(ttk.Frame):
     def discard_changes(self):
         if self._on_discard is not None:
             self._on_discard()
+
+    def _review_option_variables(self):
+        return (
+            ("overwrite", self.var_overwrite),
+            ("rename_audio", self.var_rename_audio),
+            ("export_vtt", self.var_export_vtt),
+            ("export_ass", self.var_export_ass),
+            ("export_html", self.var_export_html),
+            ("export_lrc", self.var_export_lrc),
+            ("export_ass_plain", self.var_export_ass_plain),
+        )
+
+    def _review_state_snapshot(self):
+        return {
+            "names": {
+                speaker: self.inputs[speaker].get().strip()
+                for speaker in self.speakers
+            },
+            "candidate_pool": tuple(
+                self.name_pool.get(index) for index in range(self.name_pool.size())
+            ),
+            "segments": copy.deepcopy(self.segments),
+            "options": {
+                name: bool(variable.get())
+                for name, variable in self._review_option_variables()
+            },
+        }
+
+    def _set_dirty_indicator(self, dirty):
+        if not hasattr(self, "lbl_dirty_status"):
+            return
+        self.lbl_dirty_status.configure(
+            text="Unsaved changes" if dirty else "Saved",
+            bootstyle="warning" if dirty else "success",
+        )
+        self.btn_revert.configure(state="normal" if dirty else "disabled")
+
+    def _update_dirty_state(self, *_):
+        if self._dirty_tracking_suspended or self._clean_baseline is None:
+            return False
+        dirty = self._review_state_snapshot() != self._clean_baseline
+        if not dirty:
+            self.manual_corrections_pending = False
+        self._set_dirty_indicator(dirty)
+        return dirty
+
+    def has_unsaved_changes(self):
+        return self._update_dirty_state()
+
+    def _capture_clean_baseline(self):
+        self._clean_baseline = self._review_state_snapshot()
+        self.manual_corrections_pending = False
+        self._set_dirty_indicator(False)
+
+    def _install_dirty_tracking(self):
+        variables = list(self.name_vars.values()) + [
+            variable for _name, variable in self._review_option_variables()
+        ]
+        for variable in variables:
+            trace_id = variable.trace_add("write", self._update_dirty_state)
+            self._dirty_trace_ids.append((variable, trace_id))
+
+    def _remove_dirty_tracking(self):
+        traces = self._dirty_trace_ids
+        self._dirty_trace_ids = []
+        for variable, trace_id in traces:
+            try:
+                variable.trace_remove("write", trace_id)
+            except (AttributeError, tk.TclError):
+                pass
+
+    def revert_unsaved_changes(self):
+        if not self.has_unsaved_changes():
+            return True
+        if not messagebox.askyesno(
+            "Revert unsaved changes",
+            "Discard all unsaved speaker names, candidate-pool changes, segment corrections, and output-option changes?",
+            parent=self.winfo_toplevel(),
+        ):
+            return False
+
+        playback_snapshot = self._subtitle_playback_snapshot()
+        try:
+            transcript_scroll = self.text.yview()[0]
+        except (AttributeError, IndexError, tk.TclError):
+            transcript_scroll = None
+        baseline = copy.deepcopy(self._clean_baseline)
+        try:
+            speakers_data = json.loads(self.speakers_json.read_text(encoding="utf-8"))
+            segments_data = json.loads(self.segments_json.read_text(encoding="utf-8"))
+            if not isinstance(speakers_data, dict) or not isinstance(segments_data, dict):
+                raise ValueError("speaker and segment files must contain JSON objects")
+            disk_names = dict(
+                speakers_data.get("names") or speakers_data.get("name_map") or {}
+            )
+            disk_segments = copy.deepcopy(segments_data.get("segments") or [])
+        except Exception as exc:
+            messagebox.showerror(
+                "Revert failed",
+                f"Could not reload the saved review data:\n{exc}",
+                parent=self.winfo_toplevel(),
+            )
+            return False
+
+        self._dirty_tracking_suspended = True
+        try:
+            try:
+                self.saved_names = disk_names
+                self.segments_data = copy.deepcopy(segments_data)
+                self.segments = disk_segments
+                for speaker in self.speakers:
+                    self.inputs[speaker].set(str(disk_names.get(speaker, "") or ""))
+                self.name_pool.delete(0, "end")
+                for name in baseline["candidate_pool"]:
+                    self.name_pool.insert("end", name)
+                option_values = baseline["options"]
+                for name, variable in self._review_option_variables():
+                    variable.set(bool(option_values[name]))
+                self.manual_corrections_pending = False
+                self._refresh_transcript_preview()
+                if transcript_scroll is not None:
+                    self.text.yview_moveto(transcript_scroll)
+                self._restore_subtitle_playback_state(playback_snapshot)
+                self._capture_clean_baseline()
+            except Exception as exc:
+                messagebox.showerror(
+                    "Revert failed",
+                    f"Could not restore the saved review state:\n{exc}",
+                    parent=self.winfo_toplevel(),
+                )
+                return False
+        finally:
+            self._dirty_tracking_suspended = False
+        return True
 
     def _current_name_mapping(self):
         return {
@@ -2493,6 +2750,7 @@ class NamingWorkspace(ttk.Frame):
         self.segments = dialog.result
         self.manual_corrections_pending = dialog.changed or self.manual_corrections_pending
         self._refresh_transcript_preview()
+        self._update_dirty_state()
 
     def _configure_transcript_word_tags(self):
         try:
@@ -3388,20 +3646,35 @@ class NamingWorkspace(ttk.Frame):
                         pass
 
     def apply_changes(self):
-        mapping = self._current_name_mapping()
         try:
-            _spk = json.loads(self.speakers_json.read_text(encoding='utf-8'))
-            _spk['names'] = mapping
-            self.speakers_json.write_text(json.dumps(_spk, ensure_ascii=False, indent=2), encoding='utf-8')
-        except:
-            pass
+            applied = self._apply_changes_impl()
+        except Exception as exc:
+            messagebox.showerror(
+                "Apply failed",
+                f"Could not finish applying the Review & Name changes:\n{exc}",
+                parent=self.winfo_toplevel(),
+            )
+            self._update_dirty_state()
+            return False
+        if applied and self._on_apply_complete is not None:
+            self._on_apply_complete()
+        return bool(applied)
+
+    def _apply_changes_impl(self):
+        mapping = self._current_name_mapping()
         if not mapping and not self.manual_corrections_pending:
             messagebox.showwarning(
                 "Nothing to apply",
                 "Please enter at least one name.",
                 parent=self.winfo_toplevel(),
             )
-            return
+            return False
+        try:
+            _spk = json.loads(self.speakers_json.read_text(encoding='utf-8'))
+            _spk['names'] = mapping
+            self.speakers_json.write_text(json.dumps(_spk, ensure_ascii=False, indent=2), encoding='utf-8')
+        except Exception as exc:
+            raise RuntimeError(f"Could not update speakers.json: {exc}") from exc
         segments = self.segments
         seg_data = self.segments_data
         if self.manual_corrections_pending:
@@ -3419,7 +3692,7 @@ class NamingWorkspace(ttk.Frame):
                     f"Could not update segments.json:\n{e}",
                     parent=self.winfo_toplevel(),
                 )
-                return
+                return False
         out_dir = self.speakers_json.parent
         title = seg_data.get("title") or out_dir.name
         srt_path = out_dir / f"{title}.srt"
@@ -3486,8 +3759,8 @@ class NamingWorkspace(ttk.Frame):
                 pp = out_dir / f"{title}.plain.ass"
                 write_ass_plain(pp, segments, mapping)
                 export_created.append(pp.name)
-        except:
-            pass
+        except Exception as exc:
+            raise RuntimeError(f"Could not create an optional transcript export: {exc}") from exc
         names_yaml = out_dir / "names.yaml"
         names_data = {"speaker_names": mapping}
         source_identity = build_source_identity(seg_data.get("source_path"))
@@ -3522,13 +3795,15 @@ class NamingWorkspace(ttk.Frame):
                 persistent_warning,
                 parent=self.winfo_toplevel(),
             )
+        self.saved_names = dict(mapping)
+        self.manual_corrections_pending = False
+        self._capture_clean_baseline()
         messagebox.showinfo(
             "Done",
             "Updated files:\n" + txt_tmp.name + "\n" + srt_tmp.name + ("\n\nExports:\n" + "\n".join(export_created) if export_created else "") + "\n\nSaved mapping: " + names_yaml.name,
             parent=self.winfo_toplevel(),
         )
-        if self._on_apply_complete is not None:
-            self._on_apply_complete()
+        return True
 
 
 class NamingDialog(tk.Toplevel):
@@ -3649,14 +3924,27 @@ class ReviewNamePage(ttk.Frame):
             return True
 
         if self.workspace is not None and confirm_replacement:
-            replace = messagebox.askyesno(
-                "Replace review result",
-                "Another result is already open. Replace it with the selected result?\n\n"
-                "Any unapplied in-memory edits in the current review will be lost.",
-                parent=self.winfo_toplevel(),
-            )
-            if not replace:
-                return False
+            if self.workspace.has_unsaved_changes():
+                decision = messagebox.askyesnocancel(
+                    "Unsaved Review & Name changes",
+                    "The current review has unsaved changes.\n\n"
+                    "Yes: Apply the current changes, then load the new result.\n"
+                    "No: Discard the current changes and load the new result.\n"
+                    "Cancel: Keep the current result open.",
+                    parent=self.winfo_toplevel(),
+                )
+                if decision is None:
+                    return False
+                if decision and not self.workspace.apply_changes():
+                    return False
+            else:
+                replace = messagebox.askyesno(
+                    "Replace review result",
+                    "Another result is already open. Replace it with the selected result?",
+                    parent=self.winfo_toplevel(),
+                )
+                if not replace:
+                    return False
 
         if self.workspace is not None:
             self._unload_workspace()
@@ -3716,6 +4004,24 @@ class ReviewNamePage(ttk.Frame):
         if self.workspace is not None:
             self.workspace.on_host_activated()
 
+    def approve_application_close(self):
+        workspace = self.workspace
+        if workspace is None or not workspace.has_unsaved_changes():
+            return True
+        decision = messagebox.askyesnocancel(
+            "Unsaved Review & Name changes",
+            "The current review has unsaved changes.\n\n"
+            "Yes: Apply the changes, then close.\n"
+            "No: Discard the changes and close.\n"
+            "Cancel: Keep AudioTranscript Studio open.",
+            parent=self.winfo_toplevel(),
+        )
+        if decision is None:
+            return False
+        if decision:
+            return bool(workspace.apply_changes())
+        return True
+
     def shutdown(self):
         self._unload_workspace()
 
@@ -3733,6 +4039,8 @@ class App(ttk.Frame):
         self.input_files = []
         self.pending_review_result = None
         self._application_closing = False
+        self._main_window_normal_geometry = None
+        self._main_window_tracking_enabled = False
         self.var_model = tk.StringVar(value=_DEFAULTS["model"])
         self.var_lang = tk.StringVar(value=_DEFAULTS["language"])
         self.var_output = tk.StringVar(value=_DEFAULTS["output_format"])
@@ -3757,6 +4065,7 @@ class App(ttk.Frame):
         self._build_ui()
         self._load_conf_to_ui()
         self._update_title_with_conf_path()
+        self._restore_main_window_preferences()
         self.master.protocol("WM_DELETE_WINDOW", self.close_application)
         self.after(120, self._poll_queue)
 
@@ -3952,10 +4261,164 @@ class App(ttk.Frame):
         if self.notebook.select() == str(self.review_page):
             self.review_page.on_activated()
 
+    def _desktop_bounds(self):
+        if os.name == "nt":
+            try:
+                import ctypes
+
+                user32 = ctypes.windll.user32
+                return (
+                    int(user32.GetSystemMetrics(76)),
+                    int(user32.GetSystemMetrics(77)),
+                    int(user32.GetSystemMetrics(78)),
+                    int(user32.GetSystemMetrics(79)),
+                )
+            except Exception:
+                pass
+        try:
+            return (
+                int(self.master.winfo_vrootx()),
+                int(self.master.winfo_vrooty()),
+                int(self.master.winfo_vrootwidth()),
+                int(self.master.winfo_vrootheight()),
+            )
+        except tk.TclError:
+            return (0, 0, 0, 0)
+
+    def _validated_main_window_geometry(self, value):
+        if not isinstance(value, str):
+            return None
+        match = re.fullmatch(r"\s*(\d+)x(\d+)([+-]\d+)([+-]\d+)\s*", value)
+        if not match:
+            return None
+        width, height, x_pos, y_pos = (int(part) for part in match.groups())
+        desktop_x, desktop_y, desktop_width, desktop_height = self._desktop_bounds()
+        if (
+            width < 800
+            or height < 500
+            or desktop_width <= 0
+            or desktop_height <= 0
+            or width > desktop_width
+            or height > desktop_height
+        ):
+            return None
+        visible_width = min(x_pos + width, desktop_x + desktop_width) - max(x_pos, desktop_x)
+        title_bar_visible = desktop_y <= y_pos <= desktop_y + desktop_height - 80
+        if visible_width < min(160, width) or not title_bar_visible:
+            return None
+        return f"{width}x{height}{x_pos:+d}{y_pos:+d}"
+
+    def _default_main_window_geometry(self):
+        try:
+            screen_width = max(1, int(self.master.winfo_screenwidth()))
+            screen_height = max(1, int(self.master.winfo_screenheight()))
+        except tk.TclError:
+            screen_width, screen_height = 1400, 900
+        width = min(1400, max(960, screen_width - 80))
+        height = min(900, max(650, screen_height - 80))
+        x_pos = max(0, (screen_width - width) // 2)
+        y_pos = max(0, (screen_height - height) // 2)
+        return f"{width}x{height}+{x_pos}+{y_pos}"
+
+    def _set_main_window_maximized(self, maximized):
+        try:
+            self.master.state("zoomed" if maximized else "normal")
+            return
+        except tk.TclError:
+            pass
+        try:
+            self.master.attributes("-zoomed", bool(maximized))
+        except tk.TclError:
+            pass
+
+    def _main_window_is_maximized(self):
+        try:
+            if self.master.state() == "zoomed":
+                return True
+        except tk.TclError:
+            return False
+        try:
+            return bool(self.master.attributes("-zoomed"))
+        except tk.TclError:
+            return False
+
+    def _track_main_window_geometry(self, event=None):
+        if not self._main_window_tracking_enabled or self._application_closing:
+            return
+        if event is not None and event.widget is not self.master:
+            return
+        if self._main_window_is_maximized():
+            return
+        try:
+            geometry = self._validated_main_window_geometry(self.master.geometry())
+        except tk.TclError:
+            return
+        if geometry is not None:
+            self._main_window_normal_geometry = geometry
+
+    def _restore_main_window_preferences(self):
+        try:
+            self.master.update_idletasks()
+        except tk.TclError:
+            return
+        try:
+            cfg = read_yaml(conf_path())
+            if not isinstance(cfg, dict):
+                cfg = {}
+        except Exception:
+            cfg = {}
+        saved_geometry = self._validated_main_window_geometry(
+            cfg.get("main_window_geometry")
+        )
+        saved_maximized = cfg.get("main_window_maximized")
+        preference_valid = saved_geometry is not None and isinstance(saved_maximized, bool)
+        normal_geometry = saved_geometry if preference_valid else self._default_main_window_geometry()
+        self._set_main_window_maximized(False)
+        try:
+            self.master.geometry(normal_geometry)
+            self.master.update_idletasks()
+        except tk.TclError:
+            return
+        self._main_window_normal_geometry = normal_geometry
+        self._set_main_window_maximized(saved_maximized if preference_valid else True)
+        self._main_window_tracking_enabled = True
+        self.master.bind("<Configure>", self._track_main_window_geometry, add="+")
+
+    def _save_main_window_preferences(self):
+        maximized = self._main_window_is_maximized()
+        if not maximized:
+            try:
+                current_geometry = self._validated_main_window_geometry(
+                    self.master.geometry()
+                )
+            except tk.TclError:
+                current_geometry = None
+            if current_geometry is not None:
+                self._main_window_normal_geometry = current_geometry
+        geometry = self._validated_main_window_geometry(
+            self._main_window_normal_geometry
+        )
+        if geometry is None:
+            geometry = self._default_main_window_geometry()
+        try:
+            cfg = merge_gui_conf(
+                read_yaml(conf_path()),
+                {
+                    "main_window_geometry": geometry,
+                    "main_window_maximized": bool(maximized),
+                },
+            )
+            atomic_write_yaml(conf_path(), cfg)
+        except Exception as exc:
+            self.log(f"[window] Could not save main-window preferences: {exc}")
+
     def close_application(self):
         if self._application_closing:
             return
+        if not self.review_page.approve_application_close():
+            return
         self._application_closing = True
+        self._save_main_window_preferences()
         try:
             self.review_page.shutdown()
         finally:
@@ -4574,9 +5037,8 @@ class App(ttk.Frame):
 
 def main():
     root = tb.Window(themename="litera")
-    app = App(root)
-    root.geometry("1140x620")
     root.title("AudioTranscript Studio")
+    app = App(root)
     root.mainloop()
 
 if __name__ == "__main__":
