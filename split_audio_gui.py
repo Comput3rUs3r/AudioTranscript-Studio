@@ -3,6 +3,7 @@ import os, sys, stat, json, yaml, queue, shutil, threading, subprocess, tkinter 
 import ttkbootstrap as tb
 from tkinter import ttk, messagebox, filedialog, font as tkfont
 from pathlib import Path
+from dataclasses import dataclass
 from collections import Counter
 from bisect import bisect_right
 from split_audio import (
@@ -1281,6 +1282,96 @@ class SegmentCorrectionDialog(tk.Toplevel):
         self.result = None
         self.destroy()
 
+
+@dataclass(frozen=True)
+class ReviewResultIdentity:
+    speakers_json: Path
+    segments_json: Path
+    speakers_sha256: str
+    segments_sha256: str
+
+    @property
+    def paths(self):
+        return self.speakers_json, self.segments_json
+
+
+@dataclass(frozen=True)
+class _ReviewResultPreflight:
+    identity: ReviewResultIdentity
+    speakers_data: dict
+    segments_data: dict
+
+
+def _read_review_json(path: Path, label: str):
+    try:
+        raw = path.read_bytes()
+    except Exception as exc:
+        raise ValueError(f"Could not read {label}: {exc}") from exc
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        raise ValueError(f"{label} is not valid UTF-8 JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"{label} must contain a top-level JSON object.")
+    return data, hashlib.sha256(raw).hexdigest()
+
+
+def _preflight_review_result(speakers_json, segments_json):
+    speakers_path = Path(speakers_json).resolve()
+    segments_path = Path(segments_json).resolve()
+    if not speakers_path.is_file():
+        raise FileNotFoundError(f"Missing speakers.json: {speakers_path}")
+    if not segments_path.is_file():
+        raise FileNotFoundError(f"Missing segments.json: {segments_path}")
+
+    speakers_data, speakers_sha256 = _read_review_json(speakers_path, "speakers.json")
+    segments_data, segments_sha256 = _read_review_json(segments_path, "segments.json")
+
+    speakers = speakers_data.get("speakers")
+    if not isinstance(speakers, list):
+        raise ValueError("speakers.json must contain a 'speakers' list.")
+    if any(not isinstance(speaker, str) or not speaker.strip() for speaker in speakers):
+        raise ValueError("Every speakers.json speaker entry must be a non-empty string.")
+    if len(set(speakers)) != len(speakers):
+        raise ValueError("speakers.json contains duplicate speaker IDs.")
+    for mapping_key in ("names", "name_map"):
+        mapping = speakers_data.get(mapping_key)
+        if mapping is not None and not isinstance(mapping, dict):
+            raise ValueError(f"speakers.json '{mapping_key}' must be an object when present.")
+
+    segments = segments_data.get("segments")
+    if not isinstance(segments, list):
+        raise ValueError("segments.json must contain a 'segments' list.")
+    for segment_index, segment in enumerate(segments):
+        if not isinstance(segment, dict):
+            raise ValueError(
+                f"segments.json segment {segment_index + 1} must be a JSON object."
+            )
+        speaker = segment.get("speaker")
+        if speaker is not None and not isinstance(speaker, str):
+            raise ValueError(
+                f"segments.json segment {segment_index + 1} has an invalid speaker value."
+            )
+        words = segment.get("words")
+        if words is not None:
+            if not isinstance(words, list):
+                raise ValueError(
+                    f"segments.json segment {segment_index + 1} has a non-list words value."
+                )
+            if any(not isinstance(word, dict) for word in words):
+                raise ValueError(
+                    f"segments.json segment {segment_index + 1} contains an invalid word entry."
+                )
+
+    identity = ReviewResultIdentity(
+        speakers_json=speakers_path,
+        segments_json=segments_path,
+        speakers_sha256=speakers_sha256,
+        segments_sha256=segments_sha256,
+    )
+    return _ReviewResultPreflight(identity, speakers_data, segments_data)
+
+
 class NamingWorkspace(ttk.Frame):
     _LEFT_RATIO_DEFAULT = 0.40
     _LEFT_RATIO_MIN = 0.10
@@ -1300,6 +1391,7 @@ class NamingWorkspace(ttk.Frame):
         on_apply_complete=None,
         on_discard=None,
         discard_label="Cancel",
+        result_preflight=None,
     ):
         super().__init__(master)
         self._on_apply_complete = on_apply_complete
@@ -1359,11 +1451,14 @@ class NamingWorkspace(ttk.Frame):
             self._LEFT_RATIO_MIN,
             self._LEFT_RATIO_MAX,
         )
-        self.speakers_json = speakers_json
-        self.segments_json = segments_json
-        spk_data = json.loads(speakers_json.read_text(encoding="utf-8"))
-        seg_data = json.loads(segments_json.read_text(encoding="utf-8"))
-        self.title_name = spk_data.get("title") or speakers_json.parent.name
+        if result_preflight is None:
+            result_preflight = _preflight_review_result(speakers_json, segments_json)
+        self.result_identity = result_preflight.identity
+        self.speakers_json = self.result_identity.speakers_json
+        self.segments_json = self.result_identity.segments_json
+        spk_data = copy.deepcopy(result_preflight.speakers_data)
+        seg_data = copy.deepcopy(result_preflight.segments_data)
+        self.title_name = spk_data.get("title") or self.speakers_json.parent.name
         self.speakers = list(spk_data.get("speakers") or [])
         self.saved_names = dict(spk_data.get("names") or spk_data.get("name_map") or {})
         self.segments_data = copy.deepcopy(seg_data)
@@ -2658,6 +2753,40 @@ class NamingWorkspace(ttk.Frame):
             except (AttributeError, tk.TclError):
                 pass
 
+    def _preflight_current_disk_result(self, action_label):
+        try:
+            result_preflight = _preflight_review_result(
+                self.speakers_json,
+                self.segments_json,
+            )
+        except Exception as exc:
+            messagebox.showwarning(
+                f"Cannot {action_label}",
+                "The review files are no longer available or valid:\n"
+                f"{exc}\n\nNo review files were changed.",
+                parent=self.winfo_toplevel(),
+            )
+            return None
+        if result_preflight.identity != self.result_identity:
+            messagebox.showwarning(
+                f"Cannot {action_label}",
+                "This transcription result was regenerated after it was loaded. "
+                "The current in-memory review is now an older revision and cannot be written safely.\n\n"
+                "Open the pending result and review the newly generated transcript before applying changes.",
+                parent=self.winfo_toplevel(),
+            )
+            return None
+        return result_preflight
+
+    def _refresh_result_identity_after_own_write(self):
+        try:
+            self.result_identity = _preflight_review_result(
+                self.speakers_json,
+                self.segments_json,
+            ).identity
+        except Exception:
+            pass
+
     def revert_unsaved_changes(self):
         if not self.has_unsaved_changes():
             return True
@@ -2674,22 +2803,15 @@ class NamingWorkspace(ttk.Frame):
         except (AttributeError, IndexError, tk.TclError):
             transcript_scroll = None
         baseline = copy.deepcopy(self._clean_baseline)
-        try:
-            speakers_data = json.loads(self.speakers_json.read_text(encoding="utf-8"))
-            segments_data = json.loads(self.segments_json.read_text(encoding="utf-8"))
-            if not isinstance(speakers_data, dict) or not isinstance(segments_data, dict):
-                raise ValueError("speaker and segment files must contain JSON objects")
-            disk_names = dict(
-                speakers_data.get("names") or speakers_data.get("name_map") or {}
-            )
-            disk_segments = copy.deepcopy(segments_data.get("segments") or [])
-        except Exception as exc:
-            messagebox.showerror(
-                "Revert failed",
-                f"Could not reload the saved review data:\n{exc}",
-                parent=self.winfo_toplevel(),
-            )
+        result_preflight = self._preflight_current_disk_result("revert")
+        if result_preflight is None:
             return False
+        speakers_data = result_preflight.speakers_data
+        segments_data = result_preflight.segments_data
+        disk_names = dict(
+            speakers_data.get("names") or speakers_data.get("name_map") or {}
+        )
+        disk_segments = copy.deepcopy(segments_data.get("segments") or [])
 
         self._dirty_tracking_suspended = True
         try:
@@ -2706,6 +2828,7 @@ class NamingWorkspace(ttk.Frame):
                 for name, variable in self._review_option_variables():
                     variable.set(bool(option_values[name]))
                 self.manual_corrections_pending = False
+                self.result_identity = result_preflight.identity
                 self._refresh_transcript_preview()
                 if transcript_scroll is not None:
                     self.text.yview_moveto(transcript_scroll)
@@ -3646,9 +3769,13 @@ class NamingWorkspace(ttk.Frame):
                         pass
 
     def apply_changes(self):
+        if self._preflight_current_disk_result("apply changes") is None:
+            self._update_dirty_state()
+            return False
         try:
             applied = self._apply_changes_impl()
         except Exception as exc:
+            self._refresh_result_identity_after_own_write()
             messagebox.showerror(
                 "Apply failed",
                 f"Could not finish applying the Review & Name changes:\n{exc}",
@@ -3656,6 +3783,8 @@ class NamingWorkspace(ttk.Frame):
             )
             self._update_dirty_state()
             return False
+        if not applied:
+            self._refresh_result_identity_after_own_write()
         if applied and self._on_apply_complete is not None:
             self._on_apply_complete()
         return bool(applied)
@@ -3795,6 +3924,10 @@ class NamingWorkspace(ttk.Frame):
                 persistent_warning,
                 parent=self.winfo_toplevel(),
             )
+        self.result_identity = _preflight_review_result(
+            self.speakers_json,
+            self.segments_json,
+        ).identity
         self.saved_names = dict(mapping)
         self.manual_corrections_pending = False
         self._capture_clean_baseline()
@@ -3853,13 +3986,16 @@ class ReviewNamePage(ttk.Frame):
         open_latest_callback,
         back_to_transcribe_callback,
         apply_complete_callback=None,
+        report_callback=None,
     ):
         super().__init__(master)
         self._open_latest_callback = open_latest_callback
         self._back_to_transcribe_callback = back_to_transcribe_callback
         self._apply_complete_callback = apply_complete_callback
+        self._report_callback = report_callback
         self.workspace = None
         self.current_result_paths = None
+        self.current_result_identity = None
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
 
@@ -3894,35 +4030,73 @@ class ReviewNamePage(ttk.Frame):
 
     @staticmethod
     def _validated_result_paths(speakers_json, segments_json):
-        speakers_path = Path(speakers_json).resolve()
-        segments_path = Path(segments_json).resolve()
-        if not speakers_path.is_file() or not segments_path.is_file():
-            raise FileNotFoundError("Both speakers.json and segments.json are required.")
-        return speakers_path, segments_path
+        return _preflight_review_result(speakers_json, segments_json).identity.paths
 
     @staticmethod
-    def _result_key(paths):
+    def _validated_result_identity(speakers_json, segments_json):
+        return _preflight_review_result(speakers_json, segments_json).identity
+
+    @staticmethod
+    def _result_key(result):
+        if isinstance(result, ReviewResultIdentity):
+            return (
+                os.path.normcase(str(result.speakers_json)),
+                os.path.normcase(str(result.segments_json)),
+                result.speakers_sha256,
+                result.segments_sha256,
+            )
+        return tuple(os.path.normcase(str(path)) for path in result)
+
+    @staticmethod
+    def _result_path_key(result):
+        paths = result.paths if isinstance(result, ReviewResultIdentity) else result
         return tuple(os.path.normcase(str(path)) for path in paths)
 
-    def load_result(self, speakers_json, segments_json, *, confirm_replacement=True):
+    def _report(self, message):
+        if self._report_callback is not None:
+            self._report_callback(message)
+
+    def load_result(self, speakers_json, segments_json=None, *, confirm_replacement=True):
+        requested_identity = (
+            speakers_json
+            if isinstance(speakers_json, ReviewResultIdentity) and segments_json is None
+            else None
+        )
+        requested_paths = (
+            requested_identity.paths
+            if requested_identity is not None
+            else (speakers_json, segments_json)
+        )
         try:
-            result_paths = self._validated_result_paths(speakers_json, segments_json)
+            result_preflight = _preflight_review_result(*requested_paths)
         except Exception as exc:
+            self._report(f"[review] Result validation failed: {exc}")
             messagebox.showerror(
                 "Could not open result",
                 f"The selected transcription result is unavailable:\n{exc}",
                 parent=self.winfo_toplevel(),
             )
             return False
+        result_identity = result_preflight.identity
+        result_paths = result_identity.paths
+        if requested_identity is not None and result_identity != requested_identity:
+            self._report(
+                "[review] The pending result changed before loading; using the latest validated revision."
+            )
 
         if (
             self.workspace is not None
-            and self.current_result_paths is not None
-            and self._result_key(result_paths) == self._result_key(self.current_result_paths)
+            and self.current_result_identity is not None
+            and result_identity == self.current_result_identity
         ):
             self.on_activated()
             return True
 
+        same_paths_changed = (
+            self.current_result_identity is not None
+            and self._result_path_key(result_identity)
+            == self._result_path_key(self.current_result_identity)
+        )
         if self.workspace is not None and confirm_replacement:
             if self.workspace.has_unsaved_changes():
                 decision = messagebox.askyesnocancel(
@@ -3937,7 +4111,7 @@ class ReviewNamePage(ttk.Frame):
                     return False
                 if decision and not self.workspace.apply_changes():
                     return False
-            else:
+            elif not same_paths_changed:
                 replace = messagebox.askyesno(
                     "Replace review result",
                     "Another result is already open. Replace it with the selected result?",
@@ -3945,6 +4119,29 @@ class ReviewNamePage(ttk.Frame):
                 )
                 if not replace:
                     return False
+
+        try:
+            verified_preflight = _preflight_review_result(*result_paths)
+        except Exception as exc:
+            self._report(f"[review] Result validation failed before replacement: {exc}")
+            messagebox.showerror(
+                "Could not open result",
+                "The replacement result became unavailable before it could be loaded:\n"
+                f"{exc}\n\nThe current review was left unchanged.",
+                parent=self.winfo_toplevel(),
+            )
+            return False
+        if verified_preflight.identity != result_identity:
+            self._report(
+                "[review] The result changed again while replacement was being confirmed; replacement was cancelled."
+            )
+            messagebox.showwarning(
+                "Result changed",
+                "The transcription result changed again while it was being opened. "
+                "The current review was left unchanged. Open the result again to load its latest revision.",
+                parent=self.winfo_toplevel(),
+            )
+            return False
 
         if self.workspace is not None:
             self._unload_workspace()
@@ -3958,11 +4155,13 @@ class ReviewNamePage(ttk.Frame):
                 on_apply_complete=self._on_workspace_applied,
                 on_discard=self._back_to_transcribe_callback,
                 discard_label="Back to Transcribe",
+                result_preflight=verified_preflight,
             )
             new_workspace.grid(row=0, column=0, sticky="nsew")
             self.empty_state.grid_remove()
             self.workspace = new_workspace
             self.current_result_paths = result_paths
+            self.current_result_identity = verified_preflight.identity
             new_workspace.start()
             return True
         except Exception as exc:
@@ -3974,6 +4173,7 @@ class ReviewNamePage(ttk.Frame):
                     pass
             self.workspace = None
             self.current_result_paths = None
+            self.current_result_identity = None
             self.empty_state.grid()
             messagebox.showerror(
                 "Could not open result",
@@ -3984,6 +4184,8 @@ class ReviewNamePage(ttk.Frame):
 
     def _on_workspace_applied(self):
         if self.workspace is not None:
+            self.current_result_identity = self.workspace.result_identity
+            self.current_result_paths = self.current_result_identity.paths
             self.workspace.refresh_available_subtitles()
         if self._apply_complete_callback is not None:
             self._apply_complete_callback()
@@ -3992,6 +4194,7 @@ class ReviewNamePage(ttk.Frame):
         workspace = self.workspace
         self.workspace = None
         self.current_result_paths = None
+        self.current_result_identity = None
         if workspace is None:
             return
         workspace.shutdown()
@@ -4080,6 +4283,7 @@ class App(ttk.Frame):
             open_latest_callback=self.on_name_speakers,
             back_to_transcribe_callback=lambda: self.show_page("transcribe"),
             apply_complete_callback=lambda: self.show_page("review"),
+            report_callback=self.log,
         )
         self.pages = {
             "transcribe": ttk.Frame(self.notebook, padding=8),
@@ -4844,12 +5048,12 @@ class App(ttk.Frame):
                             self.log(event[1])
                     elif kind == "speakers":
                         try:
-                            self.pending_review_result = ReviewNamePage._validated_result_paths(
+                            self.pending_review_result = ReviewNamePage._validated_result_identity(
                                 event[1],
                                 event[2],
                             )
                         except Exception as exc:
-                            self.log(f"[review] Ignored an incomplete speaker result: {exc}")
+                            self.log(f"[review] Ignored an invalid speaker result: {exc}")
                     elif kind == "process_finished":
                         self.proc = None
                         if self.cancel_requested:
@@ -4968,12 +5172,19 @@ class App(ttk.Frame):
     def _validated_pending_review_result(self):
         if self.pending_review_result is None:
             return None
+        pending = self.pending_review_result
         try:
-            return ReviewNamePage._validated_result_paths(*self.pending_review_result)
+            current = ReviewNamePage._validated_result_identity(*pending.paths)
         except Exception as exc:
             self.pending_review_result = None
-            self.log(f"[review] The pending result is no longer available: {exc}")
+            self.log(f"[review] Rejected the pending result because it is no longer valid: {exc}")
             return None
+        if current != pending:
+            self.pending_review_result = current
+            self.log(
+                "[review] The pending result changed before loading; using its latest validated revision."
+            )
+        return self.pending_review_result
 
     def _open_completed_review_result(self):
         pending = self._validated_pending_review_result()
@@ -4983,7 +5194,7 @@ class App(ttk.Frame):
 
         engine = self._current_ner_engine()
         self.log(f"[ner] Engine set to: {engine}  |  {_ner_device_info(engine)}")
-        if not self.review_page.load_result(*pending):
+        if not self.review_page.load_result(pending):
             self.log(
                 "[review] The completed result is ready and can be opened later from Review & Name."
             )
@@ -5016,8 +5227,26 @@ class App(ttk.Frame):
         if not candidates:
             messagebox.showinfo("Nothing to name", "No speakers.json found in output folders.")
             return None
-        latest = sorted(candidates, key=lambda item: item[0], reverse=True)[0]
-        return latest[1], latest[2]
+        validation_errors = []
+        for _modified, speakers_path, segments_path in sorted(
+            candidates,
+            key=lambda item: item[0],
+            reverse=True,
+        ):
+            try:
+                return ReviewNamePage._validated_result_identity(
+                    speakers_path,
+                    segments_path,
+                )
+            except Exception as exc:
+                validation_errors.append(f"{speakers_path.parent.name}: {exc}")
+                self.log(f"[review] Skipped invalid result in {speakers_path.parent.name}: {exc}")
+        messagebox.showerror(
+            "No valid result",
+            "Completed-result folders were found, but none contained compatible review data.\n\n"
+            + "\n".join(validation_errors[:5]),
+        )
+        return None
 
     def on_name_speakers(self):
         latest = self._latest_review_result()
@@ -5025,12 +5254,12 @@ class App(ttk.Frame):
             return
         engine = self._current_ner_engine()
         self.log(f"[ner] Engine set to: {engine}  |  {_ner_device_info(engine)}")
-        if not self.review_page.load_result(*latest):
+        if not self.review_page.load_result(latest):
             return
         if (
             self.pending_review_result is not None
-            and ReviewNamePage._result_key(latest)
-            == ReviewNamePage._result_key(self.pending_review_result)
+            and self.review_page.current_result_identity
+            == self.pending_review_result
         ):
             self.pending_review_result = None
         self.show_page("review")
