@@ -1280,19 +1280,26 @@ class SegmentCorrectionDialog(tk.Toplevel):
         self.result = None
         self.destroy()
 
-class NamingDialog(tk.Toplevel):
+class NamingWorkspace(ttk.Frame):
     _VIDEO_RATIO_DEFAULT = 0.65
     _VIDEO_RATIO_MIN = 0.35
     _VIDEO_RATIO_MAX = 0.80
     _TRANSCRIPT_FONT_MIN = 8
     _TRANSCRIPT_FONT_MAX = 28
 
-    def __init__(self, master, speakers_json: Path, segments_json: Path):
+    def __init__(
+        self,
+        master,
+        speakers_json: Path,
+        segments_json: Path,
+        *,
+        on_apply_complete=None,
+        on_discard=None,
+    ):
         super().__init__(master)
-        self.title("Name Speakers")
-        self.geometry("1180x700")
-        self.minsize(960, 600)
-        self.resizable(True, True)
+        self._on_apply_complete = on_apply_complete
+        self._on_discard = on_discard
+        self._started = False
         self._vlc_status = {}
         self._vlc_instance = None
         self._vlc_player = None
@@ -1447,7 +1454,7 @@ class NamingDialog(tk.Toplevel):
                 messagebox.showinfo(
                     "No names suggested",
                     "No empty fields for the first two speakers had an available name suggestion.",
-                    parent=self,
+                    parent=self.winfo_toplevel(),
                 )
 
         tb.Button(
@@ -1545,8 +1552,8 @@ class NamingDialog(tk.Toplevel):
 
         btns = ttk.Frame(left)
         btns.grid(row=3, column=0, sticky="ew")
-        tb.Button(btns, text="Apply", command=self.on_apply, bootstyle="success", padding=(16, 6)).pack(side="right")
-        tb.Button(btns, text="Cancel", command=self.destroy, bootstyle="secondary-outline", padding=(14, 6)).pack(side="right", padx=(0, 8))
+        tb.Button(btns, text="Apply", command=self.apply_changes, bootstyle="success", padding=(16, 6)).pack(side="right")
+        tb.Button(btns, text="Cancel", command=self.discard_changes, bootstyle="secondary-outline", padding=(14, 6)).pack(side="right", padx=(0, 8))
 
         toolbar = ttk.LabelFrame(right, text="Search", padding=10)
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
@@ -1735,8 +1742,13 @@ class NamingDialog(tk.Toplevel):
             initial = self.speakers[0] if self.speakers else "SPEAKER_00"
         self.find_var.set(initial)
         self._highlight_query(initial)
-        self.protocol("WM_DELETE_WINDOW", self.destroy)
-        self.bind("<Destroy>", self._on_dialog_destroyed, add="+")
+        self.bind("<Destroy>", self._on_workspace_destroyed, add="+")
+
+    def start(self):
+        """Start host-dependent services after the workspace has been placed."""
+        if self._started or self._player_closing:
+            return
+        self._started = True
         self._initialize_embedded_player()
         self._preview_ratio_after = self.after(100, self._apply_initial_preview_ratio)
 
@@ -2003,7 +2015,11 @@ class NamingDialog(tk.Toplevel):
 
     def _video_play_pause(self):
         if self._vlc_player is None or self._loaded_video_path is None:
-            messagebox.showinfo("Video Preview", "Load a video from a transcript hit first.", parent=self)
+            messagebox.showinfo(
+                "Video Preview",
+                "Load a video from a transcript hit first.",
+                parent=self.winfo_toplevel(),
+            )
             return
         try:
             if self._vlc_player.is_playing():
@@ -2017,7 +2033,11 @@ class NamingDialog(tk.Toplevel):
                 self._schedule_selected_subtitle_after_play()
                 self._schedule_word_synchronization()
         except Exception as exc:
-            messagebox.showerror("Video Preview", f"Could not control playback:\n{exc}", parent=self)
+            messagebox.showerror(
+                "Video Preview",
+                f"Could not control playback:\n{exc}",
+                parent=self.winfo_toplevel(),
+            )
 
     def _video_back(self):
         if self._vlc_player is None:
@@ -2131,7 +2151,11 @@ class NamingDialog(tk.Toplevel):
             ]
             self.subtitle_selector.configure(values=self._subtitle_choices)
         if not self._player_closing:
-            messagebox.showwarning("Video subtitles", message, parent=self)
+            messagebox.showwarning(
+                "Video subtitles",
+                message,
+                parent=self.winfo_toplevel(),
+            )
 
     def _available_vlc_subtitle_track_ids(self):
         track_ids = set()
@@ -2364,16 +2388,16 @@ class NamingDialog(tk.Toplevel):
             except Exception:
                 pass
 
-    def destroy(self):
+    def shutdown(self):
         self._release_embedded_player()
-        try:
-            super().destroy()
-        except tk.TclError:
-            pass
 
-    def _on_dialog_destroyed(self, event):
+    def _on_workspace_destroyed(self, event):
         if event.widget is self:
-            self._release_embedded_player()
+            self.shutdown()
+
+    def discard_changes(self):
+        if self._on_discard is not None:
+            self._on_discard()
 
     def _current_name_mapping(self):
         return {
@@ -2384,15 +2408,20 @@ class NamingDialog(tk.Toplevel):
 
     def open_segment_corrections(self):
         if not self.segments:
-            messagebox.showinfo("No transcript segments", "There are no transcript segments to review.", parent=self)
+            messagebox.showinfo(
+                "No transcript segments",
+                "There are no transcript segments to review.",
+                parent=self.winfo_toplevel(),
+            )
             return
+        owner = self.winfo_toplevel()
         dialog = SegmentCorrectionDialog(
-            self,
+            owner,
             self.segments,
             self.speakers,
             self._current_name_mapping(),
         )
-        self.wait_window(dialog)
+        owner.wait_window(dialog)
         if dialog.result is None:
             return
         self.segments = dialog.result
@@ -2867,11 +2896,15 @@ class NamingDialog(tk.Toplevel):
     def _play_timed_word(self, record):
         if self._vlc_player is None or self._vlc_instance is None:
             reason = self._vlc_status.get("reason") or "Embedded VLC playback is unavailable."
-            messagebox.showinfo("Video Preview", reason, parent=self)
+            messagebox.showinfo("Video Preview", reason, parent=self.winfo_toplevel())
             return
         video_path, unavailable_reason = self._video_path_for_timed_word()
         if video_path is None:
-            messagebox.showinfo("Video Preview", unavailable_reason, parent=self)
+            messagebox.showinfo(
+                "Video Preview",
+                unavailable_reason,
+                parent=self.winfo_toplevel(),
+            )
             return
         try:
             self._enable_transcript_following()
@@ -2882,7 +2915,11 @@ class NamingDialog(tk.Toplevel):
             self._load_embedded_video(video_path, max(0.0, float(record["media_start"])))
         except Exception as exc:
             self._rebase_interpolated_playback_clock_from_player()
-            messagebox.showwarning("Video Preview", f"Could not play the selected word:\n{exc}", parent=self)
+            messagebox.showwarning(
+                "Video Preview",
+                f"Could not play the selected word:\n{exc}",
+                parent=self.winfo_toplevel(),
+            )
 
     def _on_clickable_word_click(self, event):
         record = self._word_record_at_event(event)
@@ -3030,31 +3067,52 @@ class NamingDialog(tk.Toplevel):
         if self.txt_path and self.txt_path.exists():
             os.startfile(str(self.txt_path))
         else:
-            messagebox.showinfo("No .txt file", "Transcript .txt not found on disk; showing generated preview only.")
+            messagebox.showinfo(
+                "No .txt file",
+                "Transcript .txt not found on disk; showing generated preview only.",
+                parent=self.winfo_toplevel(),
+            )
 
     def _select_srt_hit_for_preview(self):
         query = (self.find_var.get() if hasattr(self, "find_var") else "").strip()
         if not query:
-            messagebox.showinfo("Jump by SRT", "Type something in the Find box first, then try again.")
+            messagebox.showinfo(
+                "Jump by SRT",
+                "Type something in the Find box first, then try again.",
+                parent=self.winfo_toplevel(),
+            )
             return None
         out_dir = self.speakers_json.parent
         srt_path = out_dir / f"{self.title_name}.srt"
         if not srt_path.exists():
-            messagebox.showinfo("Jump by SRT", f"SRT not found:\n{srt_path.name}\n\nRun transcription first or enable SRT output.")
+            messagebox.showinfo(
+                "Jump by SRT",
+                f"SRT not found:\n{srt_path.name}\n\nRun transcription first or enable SRT output.",
+                parent=self.winfo_toplevel(),
+            )
             return None
         try:
             segments = parse_srt_segments(srt_path)
         except Exception as exc:
-            messagebox.showerror("Jump by SRT", f"Could not read SRT:\n{exc}")
+            messagebox.showerror(
+                "Jump by SRT",
+                f"Could not read SRT:\n{exc}",
+                parent=self.winfo_toplevel(),
+            )
             return None
         hits = find_segments_matching_query(segments, query)
         if not hits:
-            messagebox.showinfo("Jump by SRT", f"No SRT lines matched:\n\"{query}\"")
+            messagebox.showinfo(
+                "Jump by SRT",
+                f"No SRT lines matched:\n\"{query}\"",
+                parent=self.winfo_toplevel(),
+            )
             return None
         if len(hits) == 1:
             return srt_path, hits[0]
-        dialog = _SrtHitsDialog(self, hits)
-        self.wait_window(dialog)
+        owner = self.winfo_toplevel()
+        dialog = _SrtHitsDialog(owner, hits)
+        owner.wait_window(dialog)
         if dialog.result is None:
             return None
         return srt_path, dialog.result
@@ -3068,6 +3126,7 @@ class NamingDialog(tk.Toplevel):
         if video_path:
             return Path(video_path)
         selected = filedialog.askopenfilename(
+            parent=self.winfo_toplevel(),
             title=f"Locate original video for {self.title_name}",
             filetypes=[("Video files", "*.mp4 *.mkv *.mov *.avi *.webm *.m4v"), ("All Files", "*.*")],
         )
@@ -3083,6 +3142,7 @@ class NamingDialog(tk.Toplevel):
                 jump_video_to_srt_time(srt_path, start, vlc_path=vlc_path)
             except FileNotFoundError:
                 video_path = filedialog.askopenfilename(
+                    parent=self.winfo_toplevel(),
                     title=f"Locate original video for {self.title_name}",
                     filetypes=[("Video files", "*.mp4 *.mkv *.mov *.avi *.webm *.m4v"), ("All Files", "*.*")],
                 )
@@ -3092,7 +3152,11 @@ class NamingDialog(tk.Toplevel):
                 if not _open_in_vlc(video_path, start, vlc_path=vlc_path):
                     _open_in_ffplay(video_path, start)
         except Exception as exc:
-            messagebox.showerror("Jump by SRT", f"Failed to open player:\n{exc}")
+            messagebox.showerror(
+                "Jump by SRT",
+                f"Failed to open player:\n{exc}",
+                parent=self.winfo_toplevel(),
+            )
 
     def preview_video_at_query(self):
         selected_hit = self._select_srt_hit_for_preview()
@@ -3104,7 +3168,7 @@ class NamingDialog(tk.Toplevel):
             if messagebox.askyesno(
                 "Embedded video unavailable",
                 f"{reason}\n\nOpen this hit in the external video player instead?",
-                parent=self,
+                parent=self.winfo_toplevel(),
             ):
                 self._open_selected_hit_externally(srt_path, chosen)
             return
@@ -3115,30 +3179,51 @@ class NamingDialog(tk.Toplevel):
             start = max(0.0, float(chosen["start"]))
             self._load_embedded_video(video_path, start)
         except Exception as exc:
-            messagebox.showerror("Video Preview", f"Failed to preview video:\n{exc}", parent=self)
+            messagebox.showerror(
+                "Video Preview",
+                f"Failed to preview video:\n{exc}",
+                parent=self.winfo_toplevel(),
+            )
 
     def open_video_at_query(self):
         query = (self.find_var.get() if hasattr(self, "find_var") else "").strip()
         if not query:
-            messagebox.showinfo("Jump by SRT", "Type something in the Find box first, then try again.")
+            messagebox.showinfo(
+                "Jump by SRT",
+                "Type something in the Find box first, then try again.",
+                parent=self.winfo_toplevel(),
+            )
             return
         out_dir = self.speakers_json.parent
         srt_path = out_dir / f"{self.title_name}.srt"
         if not srt_path.exists():
-            messagebox.showinfo("Jump by SRT", f"SRT not found:\n{srt_path.name}\n\nRun transcription first or enable SRT output.")
+            messagebox.showinfo(
+                "Jump by SRT",
+                f"SRT not found:\n{srt_path.name}\n\nRun transcription first or enable SRT output.",
+                parent=self.winfo_toplevel(),
+            )
             return
         try:
             segs = parse_srt_segments(srt_path)
         except Exception as e:
-            messagebox.showerror("Jump by SRT", f"Could not read SRT:\n{e}")
+            messagebox.showerror(
+                "Jump by SRT",
+                f"Could not read SRT:\n{e}",
+                parent=self.winfo_toplevel(),
+            )
             return
         hits = find_segments_matching_query(segs, query)
         if not hits:
-            messagebox.showinfo("Jump by SRT", f"No SRT lines matched:\n“{query}”")
+            messagebox.showinfo(
+                "Jump by SRT",
+                f"No SRT lines matched:\n“{query}”",
+                parent=self.winfo_toplevel(),
+            )
             return
         if len(hits) > 1:
-            dlg = _SrtHitsDialog(self, hits)
-            self.wait_window(dlg)
+            owner = self.winfo_toplevel()
+            dlg = _SrtHitsDialog(owner, hits)
+            owner.wait_window(dlg)
             if not dlg.result:
                 return
             chosen = dlg.result
@@ -3157,6 +3242,7 @@ class NamingDialog(tk.Toplevel):
             except FileNotFoundError:
                 # If automatic fails, ask user to point to file
                 vid = filedialog.askopenfilename(
+                    parent=self.winfo_toplevel(),
                     title=f"Locate original video for {self.title_name}",
                     filetypes=[("Video files", "*.mp4 *.mkv *.mov *.avi *.webm *.m4v"), ("All Files", "*.*")]
                 )
@@ -3168,7 +3254,11 @@ class NamingDialog(tk.Toplevel):
                 else:
                     return # User cancelled
         except Exception as e:
-            messagebox.showerror("Jump by SRT", f"Failed to open player:\n{e}")
+            messagebox.showerror(
+                "Jump by SRT",
+                f"Failed to open player:\n{e}",
+                parent=self.winfo_toplevel(),
+            )
             return
 
     def _prefill_first_two(self, per_spk_counts: dict, global_counts: list, title_counts: list):
@@ -3231,7 +3321,7 @@ class NamingDialog(tk.Toplevel):
                     except:
                         pass
 
-    def on_apply(self):
+    def apply_changes(self):
         mapping = self._current_name_mapping()
         try:
             _spk = json.loads(self.speakers_json.read_text(encoding='utf-8'))
@@ -3240,7 +3330,11 @@ class NamingDialog(tk.Toplevel):
         except:
             pass
         if not mapping and not self.manual_corrections_pending:
-            messagebox.showwarning("Nothing to apply", "Please enter at least one name.")
+            messagebox.showwarning(
+                "Nothing to apply",
+                "Please enter at least one name.",
+                parent=self.winfo_toplevel(),
+            )
             return
         segments = self.segments
         seg_data = self.segments_data
@@ -3254,7 +3348,11 @@ class NamingDialog(tk.Toplevel):
                 )
                 self.segments_data = seg_data
             except Exception as e:
-                messagebox.showerror("Save corrections failed", f"Could not update segments.json:\n{e}")
+                messagebox.showerror(
+                    "Save corrections failed",
+                    f"Could not update segments.json:\n{e}",
+                    parent=self.winfo_toplevel(),
+                )
                 return
         out_dir = self.speakers_json.parent
         title = seg_data.get("title") or out_dir.name
@@ -3347,11 +3445,62 @@ class NamingDialog(tk.Toplevel):
             try:
                 self._rename_tree(out_dir, mapping)
             except Exception as e:
-                messagebox.showwarning("Rename issue", f"Some files could not be renamed:\n{e}")
+                messagebox.showwarning(
+                    "Rename issue",
+                    f"Some files could not be renamed:\n{e}",
+                    parent=self.winfo_toplevel(),
+                )
         if persistent_warning:
-            messagebox.showwarning("Speaker names not persisted", persistent_warning)
-        messagebox.showinfo("Done", "Updated files:\n" + txt_tmp.name + "\n" + srt_tmp.name + ("\n\nExports:\n" + "\n".join(export_created) if export_created else "") + "\n\nSaved mapping: " + names_yaml.name)
+            messagebox.showwarning(
+                "Speaker names not persisted",
+                persistent_warning,
+                parent=self.winfo_toplevel(),
+            )
+        messagebox.showinfo(
+            "Done",
+            "Updated files:\n" + txt_tmp.name + "\n" + srt_tmp.name + ("\n\nExports:\n" + "\n".join(export_created) if export_created else "") + "\n\nSaved mapping: " + names_yaml.name,
+            parent=self.winfo_toplevel(),
+        )
+        if self._on_apply_complete is not None:
+            self._on_apply_complete()
+
+
+class NamingDialog(tk.Toplevel):
+    """Compatibility window hosting the reusable Name Speakers workspace."""
+
+    def __init__(self, master, speakers_json: Path, segments_json: Path):
+        super().__init__(master)
+        self.title("Name Speakers")
+        self.geometry("1180x700")
+        self.minsize(960, 600)
+        self.resizable(True, True)
+        self._closing = False
+        self.workspace = NamingWorkspace(
+            self,
+            speakers_json,
+            segments_json,
+            on_apply_complete=self._close_from_workspace,
+            on_discard=self._close_from_workspace,
+        )
+        self.workspace.pack(fill="both", expand=True)
+        self.workspace.start()
+        self.protocol("WM_DELETE_WINDOW", self.workspace.discard_changes)
+
+    def _close_from_workspace(self):
         self.destroy()
+
+    def destroy(self):
+        if self._closing:
+            return
+        self._closing = True
+        workspace = getattr(self, "workspace", None)
+        if workspace is not None:
+            workspace.shutdown()
+        try:
+            super().destroy()
+        except tk.TclError:
+            pass
+
 
 class App(ttk.Frame):
     def __init__(self, master):
