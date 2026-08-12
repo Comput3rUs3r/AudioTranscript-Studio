@@ -4317,6 +4317,7 @@ class App(ttk.Frame):
             self._set_runtime_state("Failed")
             messagebox.showerror("Run failed", str(e))
             return
+        self.pending_review_result = None
         self._set_runtime_state("Running")
         threading.Thread(target=self._reader, daemon=True).start()
 
@@ -4384,14 +4385,15 @@ class App(ttk.Frame):
                                 event[1],
                                 event[2],
                             )
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            self.log(f"[review] Ignored an incomplete speaker result: {exc}")
                     elif kind == "process_finished":
                         self.proc = None
                         if self.cancel_requested:
                             self._set_runtime_state("Cancelled")
                         elif event[1] == 0:
                             self._set_runtime_state("Complete")
+                            self._open_completed_review_result()
                         else:
                             self._set_runtime_state("Failed")
                 else:
@@ -4500,7 +4502,40 @@ class App(ttk.Frame):
         ttk.Button(btns, text="Copy", command=copy_all).pack(side="right")
         ttk.Button(btns, text="Close", command=win.destroy).pack(side="right", padx=6)
 
+    def _validated_pending_review_result(self):
+        if self.pending_review_result is None:
+            return None
+        try:
+            return ReviewNamePage._validated_result_paths(*self.pending_review_result)
+        except Exception as exc:
+            self.pending_review_result = None
+            self.log(f"[review] The pending result is no longer available: {exc}")
+            return None
+
+    def _open_completed_review_result(self):
+        pending = self._validated_pending_review_result()
+        if pending is None:
+            self.log("[review] Processing completed, but no valid speaker-review result was reported.")
+            return False
+
+        engine = self._current_ner_engine()
+        self.log(f"[ner] Engine set to: {engine}  |  {_ner_device_info(engine)}")
+        if not self.review_page.load_result(*pending):
+            self.log(
+                "[review] The completed result is ready and can be opened later from Review & Name."
+            )
+            return False
+
+        self.pending_review_result = None
+        self.show_page("review")
+        self.log("[review] Loaded the final completed result.")
+        return True
+
     def _latest_review_result(self):
+        pending = self._validated_pending_review_result()
+        if pending is not None:
+            return pending
+
         out = output_root()
         if not out.exists():
             messagebox.showinfo("No output", f"No output folder {out}")
@@ -4515,14 +4550,6 @@ class App(ttk.Frame):
                         (child / "segments.json").resolve(),
                     )
                 )
-        if self.pending_review_result is not None:
-            try:
-                pending = ReviewNamePage._validated_result_paths(*self.pending_review_result)
-                pending_key = ReviewNamePage._result_key(pending)
-                if not any(ReviewNamePage._result_key(item[1:]) == pending_key for item in candidates):
-                    candidates.append((pending[0].parent.stat().st_mtime, *pending))
-            except Exception:
-                pass
         if not candidates:
             messagebox.showinfo("Nothing to name", "No speakers.json found in output folders.")
             return None
