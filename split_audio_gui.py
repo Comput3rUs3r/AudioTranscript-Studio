@@ -1296,10 +1296,12 @@ class NamingWorkspace(ttk.Frame):
         *,
         on_apply_complete=None,
         on_discard=None,
+        discard_label="Cancel",
     ):
         super().__init__(master)
         self._on_apply_complete = on_apply_complete
         self._on_discard = on_discard
+        self._discard_label = discard_label
         self._started = False
         self._vlc_status = {}
         self._vlc_instance = None
@@ -1332,6 +1334,7 @@ class NamingWorkspace(ttk.Frame):
         self._view_preferences_saved = False
         self._preview_ratio_after = None
         self._preview_ratio_applied = False
+        self._video_reattach_after = None
         try:
             self._naming_cfg = read_yaml(conf_path())
             if not isinstance(self._naming_cfg, dict):
@@ -1350,20 +1353,7 @@ class NamingWorkspace(ttk.Frame):
         self.saved_names = dict(spk_data.get("names") or spk_data.get("name_map") or {})
         self.segments_data = copy.deepcopy(seg_data)
         self.segments = copy.deepcopy(seg_data.get("segments") or [])
-        subtitle_title = seg_data.get("title") or speakers_json.parent.name
-        subtitle_candidates = (
-            ("SRT", speakers_json.parent / f"{subtitle_title}.srt"),
-            ("ASS (plain)", speakers_json.parent / f"{subtitle_title}.plain.ass"),
-            ("ASS (word highlighting)", speakers_json.parent / f"{subtitle_title}.words.ass"),
-        )
-        self._subtitle_paths = {
-            label: path
-            for label, path in subtitle_candidates
-            if path.is_file()
-        }
-        self._subtitle_choices = ["Off"] + [
-            label for label, _path in subtitle_candidates if label in self._subtitle_paths
-        ]
+        self._subtitle_paths, self._subtitle_choices = self._discover_subtitle_files()
         self.manual_corrections_pending = False
         global_counts = Counter(_extract_candidates_from_text(" ".join(str(s.get("text","")) for s in self.segments)))
         # Do not use the file title as a strong name source. Titles are usually topics, not speakers.
@@ -1554,7 +1544,13 @@ class NamingWorkspace(ttk.Frame):
         btns = ttk.Frame(left)
         btns.grid(row=3, column=0, sticky="ew")
         tb.Button(btns, text="Apply", command=self.apply_changes, bootstyle="success", padding=(16, 6)).pack(side="right")
-        tb.Button(btns, text="Cancel", command=self.discard_changes, bootstyle="secondary-outline", padding=(14, 6)).pack(side="right", padx=(0, 8))
+        tb.Button(
+            btns,
+            text=self._discard_label,
+            command=self.discard_changes,
+            bootstyle="secondary-outline",
+            padding=(14, 6),
+        ).pack(side="right", padx=(0, 8))
 
         toolbar = ttk.LabelFrame(right, text="Search", padding=10)
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
@@ -1752,6 +1748,35 @@ class NamingWorkspace(ttk.Frame):
         self._started = True
         self._initialize_embedded_player()
         self._preview_ratio_after = self.after(100, self._apply_initial_preview_ratio)
+
+    def on_host_activated(self):
+        """Reattach the existing video output after an embedded host is remapped."""
+        if (
+            os.name != "nt"
+            or self._player_closing
+            or self._vlc_player is None
+            or self._video_reattach_after is not None
+        ):
+            return
+
+        def reattach():
+            self._video_reattach_after = None
+            if self._player_closing or self._vlc_player is None:
+                return
+            try:
+                if not self.winfo_exists() or not self.video_surface.winfo_exists():
+                    return
+                self.video_surface.update_idletasks()
+                self._vlc_player.set_hwnd(self.video_surface.winfo_id())
+            except (AttributeError, tk.TclError):
+                pass
+            except Exception:
+                pass
+
+        try:
+            self._video_reattach_after = self.after_idle(reattach)
+        except tk.TclError:
+            self._video_reattach_after = None
 
     def _validated_video_ratio(self, value):
         if isinstance(value, bool):
@@ -2139,6 +2164,40 @@ class NamingWorkspace(ttk.Frame):
                 pass
         self._applied_subtitle_choice = "Off"
 
+    def _subtitle_file_candidates(self):
+        subtitle_title = self.segments_data.get("title") or self.speakers_json.parent.name
+        output_dir = self.speakers_json.parent
+        return (
+            ("SRT", output_dir / f"{subtitle_title}.srt"),
+            ("ASS (plain)", output_dir / f"{subtitle_title}.plain.ass"),
+            ("ASS (word highlighting)", output_dir / f"{subtitle_title}.words.ass"),
+        )
+
+    def _discover_subtitle_files(self):
+        candidates = self._subtitle_file_candidates()
+        paths = {label: path for label, path in candidates if path.is_file()}
+        choices = ["Off"] + [label for label, _path in candidates if label in paths]
+        return paths, choices
+
+    def refresh_available_subtitles(self):
+        """Rediscover generated subtitle files without disturbing player state."""
+        previous_choice = self.subtitle_var.get() or "Off"
+        previous_paths = self._subtitle_paths
+        self._subtitle_paths, self._subtitle_choices = self._discover_subtitle_files()
+        self.subtitle_selector.configure(values=self._subtitle_choices)
+        if previous_choice in self._subtitle_choices:
+            self.subtitle_var.set(previous_choice)
+            return
+        if previous_choice != "Off":
+            missing_path = previous_paths.get(previous_choice) or "the selected subtitle file"
+            self._report_subtitle_failure(
+                previous_choice,
+                f"The subtitle file is no longer available:\n{missing_path}\n\nVideo playback will continue without subtitles.",
+            )
+            return
+        self.subtitle_var.set("Off")
+        self._set_subtitles_off()
+
     def _report_subtitle_failure(self, choice, message, remove_choice=False):
         self._subtitle_track_ids.pop(choice, None)
         self._set_subtitles_off()
@@ -2364,6 +2423,12 @@ class NamingWorkspace(ttk.Frame):
         self._reset_interpolated_playback_clock()
         self._cancel_pending_video_seek()
         self._cancel_pending_subtitle_apply()
+        if self._video_reattach_after is not None:
+            try:
+                self.after_cancel(self._video_reattach_after)
+            except (AttributeError, tk.TclError):
+                pass
+            self._video_reattach_after = None
         if self._video_update_after is not None:
             try:
                 self.after_cancel(self._video_update_after)
@@ -3503,6 +3568,158 @@ class NamingDialog(tk.Toplevel):
             pass
 
 
+class ReviewNamePage(ttk.Frame):
+    """Persistent host for at most one embedded Name Speakers workspace."""
+
+    def __init__(
+        self,
+        master,
+        *,
+        open_latest_callback,
+        back_to_transcribe_callback,
+        apply_complete_callback=None,
+    ):
+        super().__init__(master)
+        self._open_latest_callback = open_latest_callback
+        self._back_to_transcribe_callback = back_to_transcribe_callback
+        self._apply_complete_callback = apply_complete_callback
+        self.workspace = None
+        self.current_result_paths = None
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+
+        self.empty_state = ttk.Frame(self, padding=16)
+        self.empty_state.grid(row=0, column=0, sticky="nsew")
+        self.empty_state.columnconfigure(0, weight=1)
+        self.empty_state.rowconfigure(2, weight=1)
+        ttk.Label(
+            self.empty_state,
+            text="Review & Name",
+            font=("Segoe UI", 18, "bold"),
+        ).grid(row=0, column=0, sticky="w", pady=(0, 10))
+        empty_card = ttk.LabelFrame(self.empty_state, text="Completed Results", padding=16)
+        empty_card.grid(row=1, column=0, sticky="ew")
+        empty_card.columnconfigure(0, weight=1)
+        ttk.Label(
+            empty_card,
+            text=(
+                "No result is loaded. Open the latest completed transcription to review "
+                "speaker assignments, playback, and transcript exports."
+            ),
+            wraplength=760,
+            justify="left",
+        ).grid(row=0, column=0, sticky="w")
+        tb.Button(
+            empty_card,
+            text="Open latest result",
+            command=self._open_latest_callback,
+            bootstyle="primary-outline",
+            padding=(16, 6),
+        ).grid(row=1, column=0, sticky="w", pady=(12, 0))
+
+    @staticmethod
+    def _validated_result_paths(speakers_json, segments_json):
+        speakers_path = Path(speakers_json).resolve()
+        segments_path = Path(segments_json).resolve()
+        if not speakers_path.is_file() or not segments_path.is_file():
+            raise FileNotFoundError("Both speakers.json and segments.json are required.")
+        return speakers_path, segments_path
+
+    @staticmethod
+    def _result_key(paths):
+        return tuple(os.path.normcase(str(path)) for path in paths)
+
+    def load_result(self, speakers_json, segments_json, *, confirm_replacement=True):
+        try:
+            result_paths = self._validated_result_paths(speakers_json, segments_json)
+        except Exception as exc:
+            messagebox.showerror(
+                "Could not open result",
+                f"The selected transcription result is unavailable:\n{exc}",
+                parent=self.winfo_toplevel(),
+            )
+            return False
+
+        if (
+            self.workspace is not None
+            and self.current_result_paths is not None
+            and self._result_key(result_paths) == self._result_key(self.current_result_paths)
+        ):
+            self.on_activated()
+            return True
+
+        if self.workspace is not None and confirm_replacement:
+            replace = messagebox.askyesno(
+                "Replace review result",
+                "Another result is already open. Replace it with the selected result?\n\n"
+                "Any unapplied in-memory edits in the current review will be lost.",
+                parent=self.winfo_toplevel(),
+            )
+            if not replace:
+                return False
+
+        if self.workspace is not None:
+            self._unload_workspace()
+
+        new_workspace = None
+        try:
+            new_workspace = NamingWorkspace(
+                self,
+                result_paths[0],
+                result_paths[1],
+                on_apply_complete=self._on_workspace_applied,
+                on_discard=self._back_to_transcribe_callback,
+                discard_label="Back to Transcribe",
+            )
+            new_workspace.grid(row=0, column=0, sticky="nsew")
+            self.empty_state.grid_remove()
+            self.workspace = new_workspace
+            self.current_result_paths = result_paths
+            new_workspace.start()
+            return True
+        except Exception as exc:
+            if new_workspace is not None:
+                new_workspace.shutdown()
+                try:
+                    new_workspace.destroy()
+                except tk.TclError:
+                    pass
+            self.workspace = None
+            self.current_result_paths = None
+            self.empty_state.grid()
+            messagebox.showerror(
+                "Could not open result",
+                f"The transcription result could not be loaded:\n{exc}",
+                parent=self.winfo_toplevel(),
+            )
+            return False
+
+    def _on_workspace_applied(self):
+        if self.workspace is not None:
+            self.workspace.refresh_available_subtitles()
+        if self._apply_complete_callback is not None:
+            self._apply_complete_callback()
+
+    def _unload_workspace(self):
+        workspace = self.workspace
+        self.workspace = None
+        self.current_result_paths = None
+        if workspace is None:
+            return
+        workspace.shutdown()
+        try:
+            workspace.destroy()
+        except tk.TclError:
+            pass
+
+    def on_activated(self):
+        if self.workspace is not None:
+            self.workspace.on_host_activated()
+
+    def shutdown(self):
+        self._unload_workspace()
+
+
 class App(ttk.Frame):
     def __init__(self, master):
         super().__init__(master, padding=8)
@@ -3514,6 +3731,8 @@ class App(ttk.Frame):
         self.cancel_requested = False
         self.queue = queue.Queue()
         self.input_files = []
+        self.pending_review_result = None
+        self._application_closing = False
         self.var_model = tk.StringVar(value=_DEFAULTS["model"])
         self.var_lang = tk.StringVar(value=_DEFAULTS["language"])
         self.var_output = tk.StringVar(value=_DEFAULTS["output_format"])
@@ -3538,6 +3757,7 @@ class App(ttk.Frame):
         self._build_ui()
         self._load_conf_to_ui()
         self._update_title_with_conf_path()
+        self.master.protocol("WM_DELETE_WINDOW", self.close_application)
         self.after(120, self._poll_queue)
 
     def _build_ui(self):
@@ -3546,9 +3766,15 @@ class App(ttk.Frame):
 
         self.notebook = ttk.Notebook(self)
         self.notebook.grid(row=0, column=0, sticky="nsew")
+        self.review_page = ReviewNamePage(
+            self.notebook,
+            open_latest_callback=self.on_name_speakers,
+            back_to_transcribe_callback=lambda: self.show_page("transcribe"),
+            apply_complete_callback=lambda: self.show_page("review"),
+        )
         self.pages = {
             "transcribe": ttk.Frame(self.notebook, padding=8),
-            "review": ttk.Frame(self.notebook, padding=8),
+            "review": self.review_page,
             "activity": ttk.Frame(self.notebook, padding=8),
             "settings": ttk.Frame(self.notebook, padding=8),
         }
@@ -3556,6 +3782,7 @@ class App(ttk.Frame):
         self.notebook.add(self.pages["review"], text="Review & Name")
         self.notebook.add(self.pages["activity"], text="Activity")
         self.notebook.add(self.pages["settings"], text="Settings")
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed, add="+")
 
         transcribe = self.pages["transcribe"]
         transcribe.columnconfigure(0, weight=1)
@@ -3693,32 +3920,6 @@ class App(ttk.Frame):
         self.lbl_conf = ttk.Label(utilities, text="Configuration: conf.yaml", foreground="#666")
         self.lbl_conf.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
-        review = self.pages["review"]
-        review.columnconfigure(0, weight=1)
-        review.rowconfigure(2, weight=1)
-        ttk.Label(review, text="Review & Name", font=("Segoe UI", 18, "bold")).grid(
-            row=0, column=0, sticky="w", padx=8, pady=(4, 10)
-        )
-        review_intro = ttk.LabelFrame(review, text="Completed Results", padding=16)
-        review_intro.grid(row=1, column=0, sticky="ew", padx=8)
-        review_intro.columnconfigure(0, weight=1)
-        ttk.Label(
-            review_intro,
-            text=(
-                "Completed transcription results can be reviewed and named here. "
-                "During Stage 2, the existing Name Speakers window will still open separately."
-            ),
-            wraplength=760,
-            justify="left",
-        ).grid(row=0, column=0, sticky="w")
-        tb.Button(
-            review_intro,
-            text="Open latest result",
-            command=self.on_name_speakers,
-            bootstyle="primary-outline",
-            padding=(16, 6),
-        ).grid(row=1, column=0, sticky="w", pady=(12, 0))
-
         activity_page = self.pages["activity"]
         activity_page.columnconfigure(0, weight=1)
         activity_page.rowconfigure(1, weight=1)
@@ -3744,6 +3945,24 @@ class App(ttk.Frame):
         if page is None:
             raise KeyError(f"Unknown workspace page: {page_name}")
         self.notebook.select(page)
+        if page_name == "review":
+            self.review_page.on_activated()
+
+    def _on_notebook_tab_changed(self, _event=None):
+        if self.notebook.select() == str(self.review_page):
+            self.review_page.on_activated()
+
+    def close_application(self):
+        if self._application_closing:
+            return
+        self._application_closing = True
+        try:
+            self.review_page.shutdown()
+        finally:
+            try:
+                self.master.destroy()
+            except tk.TclError:
+                pass
 
     def _current_ner_engine(self) -> str:
         engine = self.var_ner_engine.get().strip().lower()
@@ -4160,7 +4379,13 @@ class App(ttk.Frame):
                         if not self._handle_progress_line(event[1]):
                             self.log(event[1])
                     elif kind == "speakers":
-                        NamingDialog(self.master, event[1], event[2])
+                        try:
+                            self.pending_review_result = ReviewNamePage._validated_result_paths(
+                                event[1],
+                                event[2],
+                            )
+                        except Exception:
+                            pass
                     elif kind == "process_finished":
                         self.proc = None
                         if self.cancel_requested:
@@ -4275,22 +4500,50 @@ class App(ttk.Frame):
         ttk.Button(btns, text="Copy", command=copy_all).pack(side="right")
         ttk.Button(btns, text="Close", command=win.destroy).pack(side="right", padx=6)
 
-    def on_name_speakers(self):
+    def _latest_review_result(self):
         out = output_root()
         if not out.exists():
             messagebox.showinfo("No output", f"No output folder {out}")
-            return
+            return None
         candidates = []
         for child in out.iterdir():
             if child.is_dir() and (child / "speakers.json").exists() and (child / "segments.json").exists():
-                candidates.append((child.stat().st_mtime, child))
+                candidates.append(
+                    (
+                        child.stat().st_mtime,
+                        (child / "speakers.json").resolve(),
+                        (child / "segments.json").resolve(),
+                    )
+                )
+        if self.pending_review_result is not None:
+            try:
+                pending = ReviewNamePage._validated_result_paths(*self.pending_review_result)
+                pending_key = ReviewNamePage._result_key(pending)
+                if not any(ReviewNamePage._result_key(item[1:]) == pending_key for item in candidates):
+                    candidates.append((pending[0].parent.stat().st_mtime, *pending))
+            except Exception:
+                pass
         if not candidates:
             messagebox.showinfo("Nothing to name", "No speakers.json found in output folders.")
+            return None
+        latest = sorted(candidates, key=lambda item: item[0], reverse=True)[0]
+        return latest[1], latest[2]
+
+    def on_name_speakers(self):
+        latest = self._latest_review_result()
+        if latest is None:
             return
-        latest = sorted(candidates, key=lambda x: x[0], reverse=True)[0][1]
         engine = self._current_ner_engine()
         self.log(f"[ner] Engine set to: {engine}  |  {_ner_device_info(engine)}")
-        NamingDialog(self.master, latest / "speakers.json", latest / "segments.json")
+        if not self.review_page.load_result(*latest):
+            return
+        if (
+            self.pending_review_result is not None
+            and ReviewNamePage._result_key(latest)
+            == ReviewNamePage._result_key(self.pending_review_result)
+        ):
+            self.pending_review_result = None
+        self.show_page("review")
 
 def main():
     root = tb.Window(themename="litera")
