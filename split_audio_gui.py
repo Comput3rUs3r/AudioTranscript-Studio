@@ -570,6 +570,7 @@ _DEFAULTS = {
     "output_format": "both","srt": True,"txt": True,"compute_type": "float16","tf32": "off",
     "padding_seconds": 0.25,"hf_token": "",
     "diarization_speaker_mode": "auto", "min_speakers": 2, "max_speakers": 2,
+    "ner_engine": "auto",
 }
 _MODEL_CHOICES = ["tiny","base","small","medium","large-v2","large-v3","large-v3-turbo","distil-large-v3"]
 _COMPUTE_CHOICES = ["float16","float32"]
@@ -3533,6 +3534,7 @@ class App(ttk.Frame):
         self.var_speaker_mode = tk.StringVar(value=_SPEAKER_MODE_LABELS[_DEFAULTS["diarization_speaker_mode"]])
         self.var_min_speakers = tk.StringVar(value=str(_DEFAULTS["min_speakers"]))
         self.var_max_speakers = tk.StringVar(value=str(_DEFAULTS["max_speakers"]))
+        self.var_ner_engine = tk.StringVar(value=_DEFAULTS["ner_engine"])
         self._build_ui()
         self._load_conf_to_ui()
         self._update_title_with_conf_path()
@@ -3540,9 +3542,26 @@ class App(ttk.Frame):
 
     def _build_ui(self):
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(6, weight=1)
+        self.rowconfigure(0, weight=1)
 
-        header = ttk.Frame(self, padding=(8, 4, 8, 8))
+        self.notebook = ttk.Notebook(self)
+        self.notebook.grid(row=0, column=0, sticky="nsew")
+        self.pages = {
+            "transcribe": ttk.Frame(self.notebook, padding=8),
+            "review": ttk.Frame(self.notebook, padding=8),
+            "activity": ttk.Frame(self.notebook, padding=8),
+            "settings": ttk.Frame(self.notebook, padding=8),
+        }
+        self.notebook.add(self.pages["transcribe"], text="Transcribe")
+        self.notebook.add(self.pages["review"], text="Review & Name")
+        self.notebook.add(self.pages["activity"], text="Activity")
+        self.notebook.add(self.pages["settings"], text="Settings")
+
+        transcribe = self.pages["transcribe"]
+        transcribe.columnconfigure(0, weight=1)
+        transcribe.rowconfigure(4, weight=1)
+
+        header = ttk.Frame(transcribe, padding=(8, 4, 8, 8))
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(0, weight=1)
         ttk.Label(header, text="AudioTranscript Studio", font=("Segoe UI", 18, "bold")).grid(row=0, column=0, sticky="w")
@@ -3550,31 +3569,31 @@ class App(ttk.Frame):
         self.lbl_status = tb.Label(header, text="Ready", bootstyle="secondary")
         self.lbl_status.grid(row=0, column=1, rowspan=2, sticky="e", padx=(12, 0))
 
-        files = ttk.LabelFrame(self, text="Files", padding=12)
+        files = ttk.LabelFrame(transcribe, text="Files", padding=12)
         files.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         tb.Button(files, text="Select Files", command=self.select_input_files, bootstyle="primary-outline").grid(row=0, column=0, sticky="w")
         tb.Button(files, text="Open Output", command=self.open_output_folder, bootstyle="secondary-outline").grid(row=0, column=1, sticky="w", padx=(8, 0))
         tb.Button(files, text="Clear Output", command=self.on_clear_output, bootstyle="danger-outline").grid(row=0, column=2, sticky="w", padx=(8, 0))
 
-        settings = ttk.LabelFrame(self, text="Transcription Settings", padding=12)
-        settings.grid(row=2, column=0, sticky="ew", pady=(0, 8))
-        settings.columnconfigure(7, weight=1)
-        ttk.Label(settings, text="Model").grid(row=0, column=0, sticky="w", padx=(0, 6))
-        self.cmb_model = ttk.Combobox(settings, textvariable=self.var_model, values=_MODEL_CHOICES, width=18, state="readonly")
+        transcription_settings = ttk.LabelFrame(transcribe, text="Transcription Settings", padding=12)
+        transcription_settings.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        transcription_settings.columnconfigure(7, weight=1)
+        ttk.Label(transcription_settings, text="Model").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.cmb_model = ttk.Combobox(transcription_settings, textvariable=self.var_model, values=_MODEL_CHOICES, width=18, state="readonly")
         self.cmb_model.grid(row=0, column=1, sticky="w", padx=(0, 16))
         self.cmb_model.bind("<<ComboboxSelected>>", self._on_model_changed)
-        ttk.Label(settings, text="Language").grid(row=0, column=2, sticky="w", padx=(0, 6))
-        ttk.Entry(settings, textvariable=self.var_lang, width=10).grid(row=0, column=3, sticky="w", padx=(0, 16))
-        ttk.Checkbutton(settings, text="Identify speakers", variable=self.var_diar).grid(row=0, column=4, sticky="w", padx=(0, 16))
-        ttk.Label(settings, text="Output").grid(row=0, column=5, sticky="w", padx=(0, 6))
-        output_options = ttk.Frame(settings)
+        ttk.Label(transcription_settings, text="Language").grid(row=0, column=2, sticky="w", padx=(0, 6))
+        ttk.Entry(transcription_settings, textvariable=self.var_lang, width=10).grid(row=0, column=3, sticky="w", padx=(0, 16))
+        ttk.Checkbutton(transcription_settings, text="Identify speakers", variable=self.var_diar).grid(row=0, column=4, sticky="w", padx=(0, 16))
+        ttk.Label(transcription_settings, text="Output").grid(row=0, column=5, sticky="w", padx=(0, 6))
+        output_options = ttk.Frame(transcription_settings)
         output_options.grid(row=0, column=6, sticky="w")
         ttk.Radiobutton(output_options, text="Both", variable=self.var_output, value="both").pack(side="left")
         ttk.Radiobutton(output_options, text="SRT", variable=self.var_output, value="srt").pack(side="left", padx=(8, 0))
         ttk.Radiobutton(output_options, text="TXT", variable=self.var_output, value="txt").pack(side="left", padx=(8, 0))
-        ttk.Frame(settings).grid(row=0, column=7, sticky="ew")
+        ttk.Frame(transcription_settings).grid(row=0, column=7, sticky="ew")
 
-        actions = ttk.Frame(self, padding=(0, 2, 0, 10))
+        actions = ttk.Frame(transcribe, padding=(0, 2, 0, 10))
         actions.grid(row=3, column=0, sticky="ew")
         self.btn_start = tb.Button(actions, text="Start Transcription", command=self.on_run, bootstyle="success", padding=(20, 8))
         self.btn_start.pack(side="left")
@@ -3595,20 +3614,19 @@ class App(ttk.Frame):
         self._last_progress = 0
         self._set_runtime_state("Ready")
 
-        advanced = ttk.Frame(self)
-        advanced.grid(row=4, column=0, sticky="ew", pady=(0, 8))
-        advanced.columnconfigure(0, weight=1)
-        self._advanced_expanded = False
-        self.btn_advanced = tb.Button(
-            advanced,
-            text="Advanced Settings  ▸",
-            command=self._toggle_advanced_settings,
-            bootstyle="secondary-outline",
+        settings_page = self.pages["settings"]
+        settings_page.columnconfigure(0, weight=1)
+        settings_page.rowconfigure(4, weight=1)
+        ttk.Label(settings_page, text="Settings", font=("Segoe UI", 18, "bold")).grid(
+            row=0, column=0, sticky="w", padx=8, pady=(4, 10)
         )
-        self.btn_advanced.grid(row=0, column=0, sticky="ew")
 
-        self.advanced_content = ttk.Frame(advanced, padding=(12, 10, 12, 4))
-        self.advanced_content.grid(row=1, column=0, sticky="ew")
+        self.advanced_content = ttk.LabelFrame(
+            settings_page,
+            text="Advanced Settings",
+            padding=12,
+        )
+        self.advanced_content.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
         self.advanced_content.columnconfigure(7, weight=1)
         ttk.Checkbutton(self.advanced_content, text="Slice audio", variable=self.var_slice).grid(row=0, column=0, sticky="w")
         ttk.Checkbutton(self.advanced_content, text="Slice video", variable=self.var_slice_video).grid(row=0, column=1, sticky="w", padx=(16, 0))
@@ -3651,20 +3669,66 @@ class App(ttk.Frame):
         ttk.Entry(self.advanced_content, textvariable=self.var_player, width=48).grid(row=3, column=1, columnspan=5, sticky="w", padx=(6, 8), pady=(10, 0))
         tb.Button(self.advanced_content, text="Browse", command=self.browse_player, bootstyle="secondary-outline").grid(row=3, column=6, sticky="w", pady=(10, 0))
         ttk.Frame(self.advanced_content).grid(row=0, column=7, rowspan=4, sticky="ew")
-        self.advanced_content.grid_remove()
 
-        utilities = ttk.LabelFrame(self, text="Utilities", padding=10)
-        utilities.grid(row=5, column=0, sticky="ew", pady=(0, 8))
+        ner_settings = ttk.LabelFrame(settings_page, text="Name Detection", padding=12)
+        ner_settings.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
+        ner_settings.columnconfigure(3, weight=1)
+        ttk.Label(ner_settings, text="NER engine").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.cmb_ner_engine = ttk.Combobox(
+            ner_settings,
+            textvariable=self.var_ner_engine,
+            values=_NER_CHOICES,
+            state="readonly",
+            width=16,
+        )
+        self.cmb_ner_engine.grid(row=0, column=1, sticky="w", padx=(0, 12))
+        self.cmb_ner_engine.bind("<<ComboboxSelected>>", self._on_ner_engine_changed)
+        self.lbl_ner_info = ttk.Label(ner_settings, text="")
+        self.lbl_ner_info.grid(row=0, column=2, sticky="w")
+
+        utilities = ttk.LabelFrame(settings_page, text="Utilities", padding=10)
+        utilities.grid(row=3, column=0, sticky="ew", padx=8)
         ttk.Button(utilities, text="Save config", command=self.on_save).grid(row=0, column=0, sticky="w")
-        ttk.Button(utilities, text="Copy log", command=self.copy_log).grid(row=0, column=1, sticky="w", padx=(8, 0))
-        ttk.Button(utilities, text="Clear log", command=self.clear_log).grid(row=0, column=2, sticky="w", padx=(8, 0))
-        ttk.Button(utilities, text="About", command=self.on_about).grid(row=0, column=3, sticky="w", padx=(8, 0))
-        ttk.Button(utilities, text="Name speakers…", command=self.on_name_speakers).grid(row=0, column=4, sticky="w", padx=(8, 0))
+        ttk.Button(utilities, text="About", command=self.on_about).grid(row=0, column=1, sticky="w", padx=(8, 0))
         self.lbl_conf = ttk.Label(utilities, text="Configuration: conf.yaml", foreground="#666")
-        self.lbl_conf.grid(row=1, column=0, columnspan=5, sticky="w", pady=(8, 0))
+        self.lbl_conf.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
-        activity = ttk.LabelFrame(self, text="Activity", padding=8)
-        activity.grid(row=6, column=0, sticky="nsew")
+        review = self.pages["review"]
+        review.columnconfigure(0, weight=1)
+        review.rowconfigure(2, weight=1)
+        ttk.Label(review, text="Review & Name", font=("Segoe UI", 18, "bold")).grid(
+            row=0, column=0, sticky="w", padx=8, pady=(4, 10)
+        )
+        review_intro = ttk.LabelFrame(review, text="Completed Results", padding=16)
+        review_intro.grid(row=1, column=0, sticky="ew", padx=8)
+        review_intro.columnconfigure(0, weight=1)
+        ttk.Label(
+            review_intro,
+            text=(
+                "Completed transcription results can be reviewed and named here. "
+                "During Stage 2, the existing Name Speakers window will still open separately."
+            ),
+            wraplength=760,
+            justify="left",
+        ).grid(row=0, column=0, sticky="w")
+        tb.Button(
+            review_intro,
+            text="Open latest result",
+            command=self.on_name_speakers,
+            bootstyle="primary-outline",
+            padding=(16, 6),
+        ).grid(row=1, column=0, sticky="w", pady=(12, 0))
+
+        activity_page = self.pages["activity"]
+        activity_page.columnconfigure(0, weight=1)
+        activity_page.rowconfigure(1, weight=1)
+        activity_toolbar = ttk.Frame(activity_page, padding=(0, 0, 0, 8))
+        activity_toolbar.grid(row=0, column=0, sticky="ew")
+        ttk.Label(activity_toolbar, text="Activity", font=("Segoe UI", 18, "bold")).pack(side="left")
+        ttk.Button(activity_toolbar, text="Clear Log", command=self.clear_log).pack(side="right")
+        ttk.Button(activity_toolbar, text="Copy Log", command=self.copy_log).pack(side="right", padx=(0, 8))
+        activity = ttk.LabelFrame(activity_page, text="Processing Log", padding=8)
+        activity.grid(row=1, column=0, sticky="nsew")
         activity.rowconfigure(0, weight=1)
         activity.columnconfigure(0, weight=1)
         self.txt = tk.Text(activity, height=16, wrap="word")
@@ -3673,14 +3737,28 @@ class App(ttk.Frame):
         log_scrollbar.grid(row=0, column=1, sticky="ns")
         self.txt.configure(yscrollcommand=log_scrollbar.set)
 
-    def _toggle_advanced_settings(self):
-        self._advanced_expanded = not self._advanced_expanded
-        if self._advanced_expanded:
-            self.advanced_content.grid()
-            self.btn_advanced.configure(text="Advanced Settings  ▾")
-        else:
-            self.advanced_content.grid_remove()
-            self.btn_advanced.configure(text="Advanced Settings  ▸")
+        self.show_page("transcribe")
+
+    def show_page(self, page_name: str):
+        page = self.pages.get(page_name)
+        if page is None:
+            raise KeyError(f"Unknown workspace page: {page_name}")
+        self.notebook.select(page)
+
+    def _current_ner_engine(self) -> str:
+        engine = self.var_ner_engine.get().strip().lower()
+        if engine not in _NER_CHOICES:
+            engine = _DEFAULTS["ner_engine"]
+            self.var_ner_engine.set(engine)
+        _set_ner_settings(engine=engine)
+        return engine
+
+    def _update_ner_engine_info(self):
+        engine = self._current_ner_engine()
+        self.lbl_ner_info.configure(text=f"{engine} — {_ner_device_info(engine)}")
+
+    def _on_ner_engine_changed(self, *_):
+        self._update_ner_engine_info()
 
     def _update_speaker_count_controls(self, *_):
         self.speaker_exact_fields.pack_forget()
@@ -3817,7 +3895,9 @@ class App(ttk.Frame):
 
     def _load_conf_to_ui(self):
         cfg = read_yaml(conf_path())
-        if not cfg: return
+        if not cfg:
+            self._update_ner_engine_info()
+            return
         self.var_lang.set(cfg.get("language", self.var_lang.get()))
         self.var_model.set(cfg.get("model", self.var_model.get()))
         self.var_diar.set(bool(cfg.get("diarize", self.var_diar.get())))
@@ -3841,6 +3921,9 @@ class App(ttk.Frame):
         self.var_speaker_mode.set(_SPEAKER_MODE_LABELS[mode])
         self.var_min_speakers.set(str(cfg.get("min_speakers", _DEFAULTS["min_speakers"])))
         self.var_max_speakers.set(str(cfg.get("max_speakers", _DEFAULTS["max_speakers"])))
+        engine = str(cfg.get("ner_engine", _DEFAULTS["ner_engine"])).strip().lower()
+        self.var_ner_engine.set(engine if engine in _NER_CHOICES else _DEFAULTS["ner_engine"])
+        self._update_ner_engine_info()
         self._update_speaker_count_controls()
 
     def _collect_ui_to_conf(self) -> dict:
@@ -3871,6 +3954,7 @@ class App(ttk.Frame):
             "diarization_speaker_mode": speaker_mode,
             "min_speakers": min_speakers,
             "max_speakers": max_speakers,
+            "ner_engine": self._current_ner_engine(),
         }
 
     def on_save(self):
@@ -4204,13 +4288,7 @@ class App(ttk.Frame):
             messagebox.showinfo("Nothing to name", "No speakers.json found in output folders.")
             return
         latest = sorted(candidates, key=lambda x: x[0], reverse=True)[0][1]
-        default_engine = _NER_SETTINGS.get("engine","auto")
-        dlg = NERSelectDialog(self.master, initial=default_engine)
-        self.wait_window(dlg)
-        engine = dlg.result or default_engine
-        if engine not in _NER_CHOICES:
-            engine = default_engine
-        _set_ner_settings(engine=engine)
+        engine = self._current_ner_engine()
         self.log(f"[ner] Engine set to: {engine}  |  {_ner_device_info(engine)}")
         NamingDialog(self.master, latest / "speakers.json", latest / "segments.json")
 
