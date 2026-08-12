@@ -165,7 +165,7 @@ def check_ffmpeg():
     print("  winget install Gyan.FFmpeg")
 
 def main():
-    print("AudioTranscript Studio CUDA installer")
+    print("Transcript Studio CUDA installer")
     print("------------------------------------")
 
     create_virtual_environment()
@@ -181,7 +181,7 @@ def main():
     print("Install complete.")
     print("Next steps:")
     print("1. Open conf.yaml and add your Hugging Face token if you want speaker diarization.")
-    print("2. Run run-gui.bat to start AudioTranscript Studio.")
+    print("2. Run run-gui.bat to start Transcript Studio.")
 
 
 if __name__ == "__main__":

@@ -527,6 +527,9 @@ def get_pkg_version(dist_name: str) -> str:
 
 def gather_about_info() -> str:
     lines = []
+    lines.append("Transcript Studio")
+    lines.append("Local transcription, speaker review, and subtitle tools")
+    lines.append("")
     lines.append(f"GUI version: {APP_VER} (build {app_build_id()})")
     lines.append(f"Config file: {conf_path()}")
     lines.append("")
@@ -4651,7 +4654,7 @@ class ReviewNamePage(ttk.Frame):
             "The current review has unsaved changes.\n\n"
             "Yes: Apply the changes, then close.\n"
             "No: Discard the changes and close.\n"
-            "Cancel: Keep AudioTranscript Studio open.",
+            "Cancel: Keep Transcript Studio open.",
             parent=self.winfo_toplevel(),
         )
         if decision is None:
@@ -4739,8 +4742,8 @@ class App(ttk.Frame):
         header = ttk.Frame(transcribe, padding=(8, 4, 8, 8))
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(0, weight=1)
-        ttk.Label(header, text="AudioTranscript Studio", font=("Segoe UI", 18, "bold")).grid(row=0, column=0, sticky="w")
-        ttk.Label(header, text="Local transcription and speaker tools").grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ttk.Label(header, text="Transcript Studio", font=("Segoe UI", 18, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Label(header, text="Local transcription, speaker review, and subtitle tools").grid(row=1, column=0, sticky="w", pady=(2, 0))
         self.lbl_status = tb.Label(header, text="Ready", bootstyle="secondary")
         self.lbl_status.grid(row=0, column=1, rowspan=2, sticky="e", padx=(12, 0))
 
@@ -5172,7 +5175,7 @@ class App(ttk.Frame):
         self.txt.see("end")
 
     def _update_title_with_conf_path(self):
-        self.master.title("AudioTranscript Studio")
+        self.master.title("Transcript Studio")
         self.lbl_conf.configure(text="Configuration: conf.yaml")
 
     @staticmethod
@@ -5585,7 +5588,7 @@ class App(ttk.Frame):
             self.log(line)
         self.log("-------------")
         win = tk.Toplevel(self.master)
-        win.title("About - AudioTranscript Studio")
+        win.title("About - Transcript Studio")
         win.geometry("820x460")
         frm = ttk.Frame(win, padding=8)
         frm.pack(fill="both", expand=True)
@@ -5701,7 +5704,7 @@ class App(ttk.Frame):
 
 def main():
     root = tb.Window(themename="litera")
-    root.title("AudioTranscript Studio")
+    root.title("Transcript Studio")
     app = App(root)
     root.mainloop()
 

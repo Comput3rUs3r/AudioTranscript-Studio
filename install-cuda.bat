@@ -1,7 +1,7 @@
 @echo off
 cd /d "%~dp0"
 
-echo AudioTranscript Studio CUDA Installer
+echo Transcript Studio CUDA Installer
 echo ------------------------------------
 echo.
 

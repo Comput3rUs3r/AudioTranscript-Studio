@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AudioTranscript Studio + WhisperX pipeline (v1.6.0)
+Transcript Studio + WhisperX pipeline (v1.6.0)
 - OPTIMIZATION: Configurable worker count via CLI.
 - ROBUSTNESS: Better error logging from FFmpeg (captures stderr).
 - PARALLEL PROCESSING: Cuts multiple segments at once.
@@ -226,7 +226,7 @@ def build_id() -> str:
         return "unknown"
 
 def print_version() -> None:
-    print(f"AudioTranscript Studio pipeline {PIPELINE_VERSION} (build {build_id()})")
+    print(f"Transcript Studio pipeline {PIPELINE_VERSION} (build {build_id()})")
     try:
         import importlib.metadata as md
     except Exception:
