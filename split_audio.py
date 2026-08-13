@@ -11,7 +11,7 @@ Transcript Studio + WhisperX pipeline (v1.6.0)
 from __future__ import annotations
 
 import os, sys, math, time, shlex, yaml, json, subprocess, hashlib, datetime, concurrent.futures, argparse, tempfile
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -309,6 +309,8 @@ class Conf:
     diarization_speaker_mode: str = "auto"
     min_speakers: int = 2
     max_speakers: int = 2
+    transcription_backend: str = "whisperx"
+    crisperwhisper: Dict[str, Any] = field(default_factory=dict)
 
 def load_conf(path: Path) -> Tuple[Conf, Optional[str]]:
     if not path.exists():
@@ -472,8 +474,20 @@ def transcribe_whisperx(
         model_a, metadata = whisperx.load_align_model(language_code=cfg.language, device=device)
         result = whisperx.align(result["segments"], model_a, metadata, str(audio_path), device)
         print(">>Performed alignment.")
+    return apply_diarization(result, audio_path, device, cfg, progress_callback)
+
+def apply_diarization(
+    result: Dict[str, Any],
+    audio_path: Path,
+    device: str,
+    cfg: Conf,
+    progress_callback: Optional[Callable[[str, str, float], None]] = None,
+) -> Dict[str, Any]:
+    """Apply the existing WhisperX/pyannote speaker assignment to timed words."""
+
     diar_ok = False
     if cfg.diarize:
+        import whisperx
         speaker_kwargs = diarization_speaker_kwargs(cfg)
         if not speaker_kwargs:
             print("[diarization] Speaker count: automatic")
@@ -525,6 +539,84 @@ def transcribe_whisperx(
             diar_ok = False
     result["__diar_ok__"] = diar_ok
     return result
+
+def transcribe_configured_backend(
+    audio_path: Path,
+    device: str,
+    cfg: Conf,
+    progress_callback: Optional[Callable[[str, str, float], None]] = None,
+    *,
+    crisper_backend=None,
+    crisper_settings: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    """Transcribe one WAV through the explicitly selected backend."""
+
+    from crisperwhisper_backend import (
+        CrisperWhisperBackend,
+        normalize_backend_name,
+        normalize_worker_result,
+        resolve_crisperwhisper_settings,
+    )
+
+    backend_name = normalize_backend_name(cfg.transcription_backend)
+    if backend_name == "whisperx":
+        if progress_callback:
+            progress_callback("loading_model", "Loading WhisperX model", 12)
+        model = load_asr_model(device, cfg)
+        return transcribe_whisperx(
+            model,
+            audio_path,
+            device,
+            cfg,
+            progress_callback=progress_callback,
+        ), None
+
+    settings = crisper_settings or resolve_crisperwhisper_settings(
+        cfg.crisperwhisper,
+        cfg.language,
+    )
+    family = settings["model"]["family"]
+    mode = settings["transcription"]["mode"]
+    if progress_callback:
+        progress_callback(
+            "loading_model",
+            f"Loading CrisperWhisper {family}",
+            12,
+        )
+
+    adapter = crisper_backend or CrisperWhisperBackend(ROOT)
+
+    def worker_status(stage: str, _message: str) -> None:
+        if not progress_callback:
+            return
+        if stage == "loading_model":
+            progress_callback(
+                "loading_model",
+                f"Loading CrisperWhisper {family}",
+                12,
+            )
+        elif stage == "transcribing":
+            progress_callback(
+                "transcribing",
+                f"Transcribing with CrisperWhisper {family}, {mode}",
+                25,
+            )
+
+    worker_response = adapter.transcribe(
+        audio_path,
+        settings,
+        status_callback=worker_status,
+    )
+    normalized = normalize_worker_result(worker_response)
+    result = {"segments": normalized["segments"]}
+    result = apply_diarization(
+        result,
+        audio_path,
+        device,
+        cfg,
+        progress_callback=progress_callback,
+    )
+    return result, normalized["transcription"]
 
 def srt_timestamp(t: float) -> str:
     if t < 0: t = 0.0
@@ -633,6 +725,12 @@ def run_pipeline(explicit_files: List[str] = None, explicit_workers: int = None)
     print("Starting processing...")
     pipeline_start = time.perf_counter()
     cfg, hf_token = load_conf(ROOT / "conf.yaml")
+    from crisperwhisper_backend import (
+        CrisperWhisperBackend,
+        normalize_backend_name,
+        resolve_crisperwhisper_settings,
+    )
+    backend_name = normalize_backend_name(cfg.transcription_backend)
     if cfg.diarize:
         try:
             diarization_speaker_kwargs(cfg)
@@ -661,6 +759,14 @@ def run_pipeline(explicit_files: List[str] = None, explicit_workers: int = None)
 
     print(f"Found {len(sources)} file(s) to process:")
     for p in sources: print(f" - {print_rel_or_abs(p)}")
+
+    crisper_backend = None
+    crisper_settings = None
+    if backend_name == "crisperwhisper":
+        crisper_settings = resolve_crisperwhisper_settings(cfg.crisperwhisper, cfg.language)
+        crisper_backend = CrisperWhisperBackend(ROOT)
+        crisper_backend.probe()
+        print("[crisper] Isolated CrisperWhisper runtime is ready.")
     
     file_total = len(sources)
     for idx, src in enumerate(sources, 1):
@@ -692,9 +798,14 @@ def run_pipeline(explicit_files: List[str] = None, explicit_workers: int = None)
         dur = probe_duration_seconds(wav_path)
         if dur is not None: print(f"  Media duration: {hhmmss(int(dur))} ({dur:.2f} s)")
         
-        file_progress("loading_model", "Loading WhisperX model", 12)
-        model = load_asr_model(device, cfg)
-        result = transcribe_whisperx(model, wav_path, device, cfg, progress_callback=file_progress)
+        result, transcription_metadata = transcribe_configured_backend(
+            wav_path,
+            device,
+            cfg,
+            progress_callback=file_progress,
+            crisper_backend=crisper_backend,
+            crisper_settings=crisper_settings,
+        )
         segments = result.get("segments") or []
         diar_ok = bool(result.get("__diar_ok__", False)) or any((s.get("speaker") or "") for s in segments)
         speakers = sorted({(s.get("speaker") or "SPEAKER_00") for s in segments if (s.get("speaker") or diar_ok)})
@@ -704,8 +815,15 @@ def run_pipeline(explicit_files: List[str] = None, explicit_workers: int = None)
         elif saved_names:
             print("[names] No saved names matched the current speaker IDs.")
         
-        file_progress("writing_json", "Writing JSON outputs", 80)
+        writing_json_label = (
+            "Writing CrisperWhisper outputs"
+            if backend_name == "crisperwhisper"
+            else "Writing JSON outputs"
+        )
+        file_progress("writing_json", writing_json_label, 80)
         seg_json = {"title": title, "segments": segments, "source_path": str(src.resolve())}
+        if transcription_metadata is not None:
+            seg_json["transcription"] = transcription_metadata
         spk_json = {"title": title, "diarization": diar_ok, "speakers": speakers}
         if restored_names:
             spk_json["names"] = restored_names
@@ -714,7 +832,12 @@ def run_pipeline(explicit_files: List[str] = None, explicit_workers: int = None)
         print(f"[segments-json] {print_rel_or_abs(title_dir / 'segments.json')}")
         print(f"[speakers-json] {print_rel_or_abs(title_dir / 'speakers.json')}")
         
-        file_progress("writing_transcripts", "Writing SRT/TXT", 84)
+        writing_transcripts_label = (
+            "Writing CrisperWhisper outputs"
+            if backend_name == "crisperwhisper"
+            else "Writing SRT/TXT"
+        )
+        file_progress("writing_transcripts", writing_transcripts_label, 84)
         fmt = (cfg.output_format or "both").lower().strip()
         srt_path = title_dir / f"{title}.srt"; txt_path = title_dir / f"{title}.txt"
         if fmt in ("srt", "both"): write_srt(segments, srt_path)

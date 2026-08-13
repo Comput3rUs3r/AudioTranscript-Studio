@@ -25,6 +25,8 @@ from pathlib import Path
 import signal
 import sys
 import tempfile
+import threading
+import time
 from typing import Any, Callable
 
 
@@ -198,7 +200,7 @@ def _validate_model_settings(model: dict[str, Any]) -> None:
     if family not in SUPPORTED_MODEL_FAMILIES:
         if family in OFFICIAL_MODEL_IDS:
             raise UnsupportedSettingError(f"Model family '{family}' is not supported by this worker stage.")
-        raise UnsupportedSettingError(f"Unknown or custom model family '{family}' is not supported.")
+        raise UnsupportedSettingError("Unknown or custom model families are not supported.")
 
     expected_model_id = OFFICIAL_MODEL_IDS[family]
     if model_id != expected_model_id:
@@ -461,8 +463,10 @@ def _serialize_words(words: Any, full_text: str) -> list[dict[str, Any]]:
             raise TranscriptionError("CrisperWhisper returned a word without speech text.")
         start = _finite_result_number(_value(word, "start"), "word start time")
         end = _finite_result_number(_value(word, "end"), "word end time")
-        if end < start:
-            raise TranscriptionError("CrisperWhisper returned a word whose end precedes its start.")
+        if end <= start:
+            raise TranscriptionError(
+                "CrisperWhisper returned a word whose end does not follow its start."
+            )
         if start < previous_start:
             raise TranscriptionError("CrisperWhisper returned word timestamps out of order.")
         previous_start = start
@@ -726,21 +730,88 @@ def _install_signal_handlers() -> None:
         signal.signal(signal.SIGTERM, _termination_handler)
 
 
+def _start_parent_watch(args: argparse.Namespace) -> None:
+    """Exit if the adapter process disappears while the worker is active."""
+
+    parent_pid = getattr(args, "parent_pid", None)
+    if parent_pid is None:
+        return
+
+    cleanup_root = None
+    request_path = getattr(args, "request", None)
+    output_path = getattr(args, "output", None)
+    output_existed = bool(output_path and Path(output_path).exists())
+    if request_path and output_path:
+        request_parent = Path(request_path).resolve().parent
+        output_parent = Path(output_path).resolve().parent
+        if request_parent == output_parent and request_parent.name.startswith("ats-crisper-"):
+            cleanup_root = request_parent
+
+    def parent_is_alive() -> bool:
+        if os.name == "nt":
+            try:
+                import ctypes
+
+                synchronize = 0x00100000
+                wait_timeout = 0x00000102
+                kernel32 = ctypes.windll.kernel32
+                handle = kernel32.OpenProcess(synchronize, False, parent_pid)
+                if not handle:
+                    return False
+                try:
+                    return kernel32.WaitForSingleObject(handle, 0) == wait_timeout
+                finally:
+                    kernel32.CloseHandle(handle)
+            except Exception:
+                return False
+        try:
+            os.kill(parent_pid, 0)
+            return True
+        except OSError:
+            return False
+
+    def watch_parent() -> None:
+        while parent_is_alive():
+            time.sleep(0.5)
+        if cleanup_root is not None:
+            try:
+                Path(request_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+            if not output_existed:
+                try:
+                    Path(output_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            try:
+                for partial in cleanup_root.glob(f".{Path(output_path).name}.*.tmp"):
+                    partial.unlink(missing_ok=True)
+                cleanup_root.rmdir()
+            except OSError:
+                pass
+        os._exit(WorkerCancelled.exit_code)
+
+    threading.Thread(target=watch_parent, name="crisper-parent-watch", daemon=True).start()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Transcript Studio CrisperWhisper worker")
     subparsers = parser.add_subparsers(dest="operation", required=True)
 
     probe_parser = subparsers.add_parser("probe", help="Report isolated runtime capabilities")
     probe_parser.add_argument("--output", type=Path, help="Optionally write the probe response JSON")
+    probe_parser.add_argument("--parent-pid", type=int, help=argparse.SUPPRESS)
 
     transcribe_parser = subparsers.add_parser("transcribe", help="Run one transcription job")
     transcribe_parser.add_argument("--request", type=Path, required=True, help="Protocol-v1 job JSON")
     transcribe_parser.add_argument("--output", type=Path, required=True, help="Atomic result JSON target")
+    transcribe_parser.add_argument("--parent-pid", type=int, help=argparse.SUPPRESS)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    _start_parent_watch(args)
     operation = args.operation
     try:
         if operation == "probe":
