@@ -1,8 +1,10 @@
 # split_audio_gui.py — v1.11.0 (Stop Button + Worker Control)
-import os, sys, stat, json, yaml, queue, shutil, threading, subprocess, tkinter as tk, hashlib, datetime, re, signal, copy, math, time
+import os, sys, stat, json, yaml, queue, shutil, threading, subprocess, tkinter as tk, hashlib, datetime, re, signal, copy, math, time, tempfile
 import ttkbootstrap as tb
+from ttkbootstrap.style import ThemeDefinition
 from tkinter import ttk, messagebox, filedialog, font as tkfont
 from pathlib import Path
+from dataclasses import dataclass
 from collections import Counter
 from bisect import bisect_right
 from split_audio import (
@@ -11,8 +13,530 @@ from split_audio import (
     VIDEO_EXTS as _PIPELINE_VIDEO_EXTS,
     build_source_identity,
     discover_sources,
-    write_speaker_name_record,
+    speaker_name_record_path,
 )
+
+
+MIDNIGHTSTUDIO_THEME_NAME = "midnightstudio"
+MIDNIGHTSTUDIO_THEME_COLORS = {
+    "primary": "#2EC4B6",
+    "secondary": "#52667A",
+    "success": "#49B982",
+    "info": "#4FA3C7",
+    "warning": "#DFA84A",
+    "danger": "#C96A73",
+    "light": "#D8E3EC",
+    "dark": "#071513",
+    "bg": "#0B1220",
+    "fg": "#E6EDF3",
+    "selectbg": "#2EC4B6",
+    "selectfg": "#071513",
+    "border": "#304258",
+    "inputfg": "#E6EDF3",
+    "inputbg": "#0F1927",
+    "active": "#1B293A",
+}
+MIDNIGHTSTUDIO_TOKENS = {
+    "surface": "#151F2E",
+    "surface_active": "#1B293A",
+    "text_secondary": "#9AAEC1",
+    "border": "#304258",
+    "focus": "#2EC4B6",
+    "disabled_bg": "#182331",
+    "disabled_fg": "#7E91A6",
+    "video_bg": "#000000",
+    "video_message_fg": "#AAB7C4",
+    "find_match_bg": "#5E4824",
+    "find_match_fg": "#FFE0A3",
+    "playback_word_bg": "#F2B84B",
+    "playback_word_fg": "#071513",
+}
+MIDNIGHTSTUDIO_STYLES = {
+    "shell": "MidnightStudio.TFrame",
+    "page": "MidnightStudio.Page.TFrame",
+    "card": "MidnightStudio.Card.TLabelframe",
+    "card_frame": "MidnightStudio.Card.TFrame",
+    "card_label": "MidnightStudio.Card.TLabel",
+    "card_secondary": "MidnightStudio.Card.Secondary.TLabel",
+    "card_checkbutton": "MidnightStudio.Card.TCheckbutton",
+    "card_radiobutton": "MidnightStudio.Card.TRadiobutton",
+    "card_entry": "MidnightStudio.Card.TEntry",
+    "card_combobox": "MidnightStudio.Card.TCombobox",
+    "card_spinbox": "MidnightStudio.Card.TSpinbox",
+    "title": "MidnightStudio.Title.TLabel",
+    "subtitle": "MidnightStudio.Subtitle.TLabel",
+    "secondary": "MidnightStudio.Secondary.TLabel",
+    "notebook": "MidnightStudio.TNotebook",
+    "notebook_tab": "MidnightStudio.TNotebook.Tab",
+    "review_title": "MidnightStudio.Review.Title.TLabel",
+    "review_paned": "MidnightStudio.Horizontal.TPanedwindow",
+    "review_scrollbar": "MidnightStudio.Vertical.TScrollbar",
+    "dialog_hscrollbar": "MidnightStudio.Horizontal.TScrollbar",
+    "review_scale": "MidnightStudio.Horizontal.TScale",
+    "dialog_warning": "MidnightStudio.Dialog.Warning.TLabel",
+    "srt_tree": "MidnightStudio.SrtMatches.Treeview",
+    "segment_tree": "MidnightStudio.SegmentCorrection.Treeview",
+}
+
+
+def register_midnightstudio_theme(root):
+    """Register and activate the application's dark ttkbootstrap theme."""
+    style = root.style
+    if MIDNIGHTSTUDIO_THEME_NAME not in style.theme_names():
+        style.register_theme(
+            ThemeDefinition(
+                MIDNIGHTSTUDIO_THEME_NAME,
+                MIDNIGHTSTUDIO_THEME_COLORS,
+                mode="dark",
+            )
+        )
+    style.theme_use(MIDNIGHTSTUDIO_THEME_NAME)
+    _configure_midnightstudio_styles(style)
+    root.configure(background=MIDNIGHTSTUDIO_THEME_COLORS["bg"])
+    root.option_add(
+        "*TCombobox*Listbox.background",
+        MIDNIGHTSTUDIO_THEME_COLORS["inputbg"],
+    )
+    root.option_add(
+        "*TCombobox*Listbox.foreground",
+        MIDNIGHTSTUDIO_THEME_COLORS["inputfg"],
+    )
+    root.option_add(
+        "*TCombobox*Listbox.selectBackground",
+        MIDNIGHTSTUDIO_THEME_COLORS["selectbg"],
+    )
+    root.option_add(
+        "*TCombobox*Listbox.selectForeground",
+        MIDNIGHTSTUDIO_THEME_COLORS["selectfg"],
+    )
+    return style
+
+
+def _configure_midnightstudio_styles(style):
+    colors = MIDNIGHTSTUDIO_THEME_COLORS
+    tokens = MIDNIGHTSTUDIO_TOKENS
+    styles = MIDNIGHTSTUDIO_STYLES
+
+    style.configure(styles["shell"], background=colors["bg"])
+    style.configure(styles["page"], background=colors["bg"])
+    style.configure(
+        styles["title"],
+        background=colors["bg"],
+        foreground=colors["fg"],
+        font=("Segoe UI", 18, "bold"),
+    )
+    style.configure(
+        styles["subtitle"],
+        background=colors["bg"],
+        foreground=tokens["text_secondary"],
+    )
+    style.configure(
+        styles["review_title"],
+        background=colors["bg"],
+        foreground=colors["fg"],
+        font=("Segoe UI", 16, "bold"),
+    )
+    style.configure(
+        styles["secondary"],
+        foreground=tokens["text_secondary"],
+    )
+
+    style.configure(
+        styles["notebook"],
+        background=colors["bg"],
+        borderwidth=0,
+        tabmargins=(4, 4, 4, 0),
+    )
+    style.configure(
+        styles["notebook_tab"],
+        background=tokens["surface"],
+        foreground=tokens["text_secondary"],
+        bordercolor=tokens["border"],
+        focuscolor=tokens["focus"],
+        padding=(18, 10),
+        font=("Segoe UI", 10, "bold"),
+    )
+    style.map(
+        styles["notebook_tab"],
+        background=[
+            ("selected", colors["primary"]),
+            ("active", tokens["surface_active"]),
+            ("focus", tokens["surface_active"]),
+        ],
+        foreground=[
+            ("selected", colors["selectfg"]),
+            ("disabled", tokens["disabled_fg"]),
+            ("active", colors["fg"]),
+            ("focus", colors["fg"]),
+        ],
+        bordercolor=[
+            ("selected", colors["primary"]),
+            ("focus", tokens["focus"]),
+            ("active", tokens["focus"]),
+        ],
+        lightcolor=[("selected", colors["primary"]), ("focus", tokens["focus"])],
+        darkcolor=[("selected", colors["primary"]), ("focus", tokens["focus"])],
+    )
+    style.configure(
+        styles["review_paned"],
+        background=tokens["border"],
+        bordercolor=tokens["border"],
+        sashrelief="flat",
+        sashwidth=8,
+    )
+    style.map(
+        styles["review_paned"],
+        background=[("focus", tokens["focus"]), ("active", tokens["surface_active"])],
+        bordercolor=[("focus", tokens["focus"]), ("active", tokens["focus"])],
+    )
+    style.configure(
+        styles["review_scrollbar"],
+        background=colors["secondary"],
+        troughcolor=tokens["surface"],
+        bordercolor=tokens["border"],
+        arrowcolor=colors["fg"],
+        lightcolor=colors["secondary"],
+        darkcolor=colors["secondary"],
+    )
+    style.map(
+        styles["review_scrollbar"],
+        background=[
+            ("disabled", tokens["disabled_bg"]),
+            ("pressed", colors["primary"]),
+            ("active", colors["primary"]),
+        ],
+        arrowcolor=[
+            ("disabled", tokens["disabled_fg"]),
+            ("pressed", colors["selectfg"]),
+            ("active", colors["selectfg"]),
+        ],
+    )
+    style.configure(
+        styles["dialog_hscrollbar"],
+        background=colors["secondary"],
+        troughcolor=tokens["surface"],
+        bordercolor=tokens["border"],
+        arrowcolor=colors["fg"],
+        lightcolor=colors["secondary"],
+        darkcolor=colors["secondary"],
+    )
+    style.map(
+        styles["dialog_hscrollbar"],
+        background=[
+            ("disabled", tokens["disabled_bg"]),
+            ("pressed", colors["primary"]),
+            ("active", colors["primary"]),
+        ],
+        arrowcolor=[
+            ("disabled", tokens["disabled_fg"]),
+            ("pressed", colors["selectfg"]),
+            ("active", colors["selectfg"]),
+        ],
+    )
+    style.configure(
+        styles["review_scale"],
+        background=colors["primary"],
+        troughcolor=colors["inputbg"],
+        bordercolor=tokens["border"],
+        lightcolor=colors["primary"],
+        darkcolor=colors["primary"],
+    )
+    style.map(
+        styles["review_scale"],
+        background=[
+            ("disabled", tokens["disabled_fg"]),
+            ("pressed", colors["warning"]),
+            ("active", colors["warning"]),
+        ],
+        bordercolor=[("focus", tokens["focus"])],
+    )
+    style.configure(
+        styles["dialog_warning"],
+        background=tokens["surface_active"],
+        foreground=colors["warning"],
+        bordercolor=tokens["border"],
+        relief="solid",
+        borderwidth=1,
+        padding=(8, 6),
+        font=("Segoe UI", 9, "bold"),
+    )
+
+    for tree_style in (styles["srt_tree"], styles["segment_tree"]):
+        style.configure(
+            tree_style,
+            background=colors["inputbg"],
+            foreground=colors["inputfg"],
+            fieldbackground=colors["inputbg"],
+            bordercolor=tokens["border"],
+            lightcolor=tokens["border"],
+            darkcolor=tokens["border"],
+            rowheight=25,
+            relief="flat",
+        )
+        style.map(
+            tree_style,
+            background=[
+                ("selected", colors["selectbg"]),
+                ("disabled", tokens["disabled_bg"]),
+            ],
+            foreground=[
+                ("selected", colors["selectfg"]),
+                ("disabled", tokens["disabled_fg"]),
+            ],
+            bordercolor=[("focus", tokens["focus"])],
+            lightcolor=[("focus", tokens["focus"])],
+            darkcolor=[("focus", tokens["focus"])],
+        )
+        heading_style = f"{tree_style}.Heading"
+        style.configure(
+            heading_style,
+            background=tokens["surface_active"],
+            foreground=colors["fg"],
+            bordercolor=tokens["border"],
+            lightcolor=tokens["border"],
+            darkcolor=tokens["border"],
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            padding=(8, 6),
+        )
+        style.map(
+            heading_style,
+            background=[
+                ("pressed", colors["primary"]),
+                ("active", colors["secondary"]),
+            ],
+            foreground=[("pressed", colors["selectfg"]), ("active", colors["fg"])],
+            bordercolor=[("focus", tokens["focus"]), ("active", tokens["focus"])],
+        )
+
+    style.configure(
+        styles["card"],
+        background=tokens["surface"],
+        bordercolor=tokens["border"],
+        lightcolor=tokens["border"],
+        darkcolor=tokens["border"],
+        relief="solid",
+        borderwidth=1,
+    )
+    style.configure(
+        f"{styles['card']}.Label",
+        background=tokens["surface"],
+        foreground=colors["fg"],
+        font=("Segoe UI", 10, "bold"),
+    )
+    style.configure(styles["card_frame"], background=tokens["surface"])
+    style.configure(
+        styles["card_label"],
+        background=tokens["surface"],
+        foreground=colors["fg"],
+    )
+    style.configure(
+        styles["card_secondary"],
+        background=tokens["surface"],
+        foreground=tokens["text_secondary"],
+    )
+    for widget_style in (styles["card_checkbutton"], styles["card_radiobutton"]):
+        style.configure(
+            widget_style,
+            background=tokens["surface"],
+            foreground=colors["fg"],
+            focuscolor=tokens["focus"],
+        )
+        style.map(
+            widget_style,
+            background=[
+                ("disabled", tokens["surface"]),
+                ("active", tokens["surface_active"]),
+            ],
+            foreground=[
+                ("disabled", tokens["disabled_fg"]),
+                ("active", colors["fg"]),
+            ],
+        )
+
+    for widget_style in (
+        styles["card_entry"],
+        styles["card_combobox"],
+        styles["card_spinbox"],
+    ):
+        style.configure(
+            widget_style,
+            fieldbackground=colors["inputbg"],
+            background=colors["inputbg"],
+            foreground=colors["inputfg"],
+            bordercolor=tokens["border"],
+            lightcolor=tokens["border"],
+            darkcolor=tokens["border"],
+            insertcolor=colors["fg"],
+            arrowcolor=tokens["text_secondary"],
+        )
+        style.map(
+            widget_style,
+            fieldbackground=[
+                ("disabled", tokens["disabled_bg"]),
+                ("readonly", colors["inputbg"]),
+            ],
+            background=[("disabled", tokens["disabled_bg"])],
+            foreground=[
+                ("disabled", tokens["disabled_fg"]),
+                ("readonly", colors["inputfg"]),
+            ],
+            bordercolor=[
+                ("focus", tokens["focus"]),
+                ("invalid", colors["danger"]),
+            ],
+            lightcolor=[("focus", tokens["focus"])],
+            darkcolor=[("focus", tokens["focus"])],
+            arrowcolor=[
+                ("disabled", tokens["disabled_fg"]),
+                ("active", colors["primary"]),
+            ],
+        )
+
+    for widget_style in ("TEntry", "TCombobox", "TSpinbox"):
+        style.map(
+            widget_style,
+            fieldbackground=[("disabled", tokens["disabled_bg"])],
+            foreground=[("disabled", tokens["disabled_fg"])],
+            bordercolor=[("focus", tokens["focus"]), ("invalid", colors["danger"])],
+            lightcolor=[("focus", tokens["focus"])],
+            darkcolor=[("focus", tokens["focus"])],
+        )
+    for widget_style in ("TButton", "TCheckbutton", "TRadiobutton"):
+        style.map(widget_style, foreground=[("disabled", tokens["disabled_fg"])])
+
+
+def apply_midnightstudio_card_style(container):
+    """Apply surface-aware styles to a card and its non-button ttk children."""
+    styles = MIDNIGHTSTUDIO_STYLES
+    container.configure(style=styles["card"])
+    widget_styles = (
+        (ttk.LabelFrame, styles["card"]),
+        (ttk.Frame, styles["card_frame"]),
+        (ttk.Label, styles["card_label"]),
+        (ttk.Checkbutton, styles["card_checkbutton"]),
+        (ttk.Radiobutton, styles["card_radiobutton"]),
+        (ttk.Combobox, styles["card_combobox"]),
+        (ttk.Spinbox, styles["card_spinbox"]),
+        (ttk.Entry, styles["card_entry"]),
+    )
+    for child in container.winfo_children():
+        for widget_type, widget_style in widget_styles:
+            if isinstance(child, widget_type):
+                child.configure(style=widget_style)
+                break
+        if not isinstance(child, (ttk.Button, ttk.Scrollbar)):
+            apply_midnightstudio_descendant_styles(child, widget_styles)
+
+
+def apply_midnightstudio_descendant_styles(container, widget_styles):
+    for child in container.winfo_children():
+        for widget_type, widget_style in widget_styles:
+            if isinstance(child, widget_type):
+                child.configure(style=widget_style)
+                break
+        if not isinstance(child, (ttk.Button, ttk.Scrollbar)):
+            apply_midnightstudio_descendant_styles(child, widget_styles)
+
+
+def reinforce_midnightstudio_control_states(style):
+    """Add accessible disabled/focus states without replacing hover/press maps."""
+    tokens = MIDNIGHTSTUDIO_TOKENS
+    button_styles = (
+        "TButton",
+        "primary.TButton",
+        "primary.Outline.TButton",
+        "secondary.Outline.TButton",
+        "success.TButton",
+        "warning.Outline.TButton",
+        "danger.Outline.TButton",
+    )
+
+    def prepend_state(widget_style, option, state, value):
+        existing = style.map(widget_style, query_opt=option)
+        retained = [item for item in existing if state not in item[:-1]]
+        style.map(widget_style, **{option: [(state, value), *retained]})
+
+    for widget_style in button_styles:
+        prepend_state(widget_style, "foreground", "disabled", tokens["disabled_fg"])
+        prepend_state(widget_style, "background", "disabled", tokens["disabled_bg"])
+        prepend_state(widget_style, "bordercolor", "focus", tokens["focus"])
+        prepend_state(widget_style, "lightcolor", "focus", tokens["focus"])
+        prepend_state(widget_style, "darkcolor", "focus", tokens["focus"])
+
+
+def style_midnightstudio_text(text_widget, *, readonly=False):
+    colors = MIDNIGHTSTUDIO_THEME_COLORS
+    tokens = MIDNIGHTSTUDIO_TOKENS
+    text_widget.configure(
+        background=tokens["disabled_bg"] if readonly else colors["inputbg"],
+        foreground=tokens["disabled_fg"] if readonly else colors["fg"],
+        insertbackground=tokens["focus"],
+        selectbackground=colors["selectbg"],
+        selectforeground=colors["selectfg"],
+        relief="flat",
+        borderwidth=0,
+        highlightthickness=1,
+        highlightbackground=tokens["border"],
+        highlightcolor=tokens["focus"],
+    )
+
+
+def style_midnightstudio_canvas(canvas):
+    tokens = MIDNIGHTSTUDIO_TOKENS
+    canvas.configure(
+        background=tokens["surface"],
+        highlightthickness=1,
+        highlightbackground=tokens["border"],
+        highlightcolor=tokens["focus"],
+        borderwidth=0,
+        takefocus=True,
+    )
+
+
+def style_midnightstudio_listbox(listbox):
+    colors = MIDNIGHTSTUDIO_THEME_COLORS
+    tokens = MIDNIGHTSTUDIO_TOKENS
+    listbox.configure(
+        background=colors["inputbg"],
+        foreground=colors["fg"],
+        selectbackground=colors["selectbg"],
+        selectforeground=colors["selectfg"],
+        disabledforeground=tokens["disabled_fg"],
+        activestyle="dotbox",
+        relief="flat",
+        borderwidth=0,
+        highlightthickness=1,
+        highlightbackground=tokens["border"],
+        highlightcolor=tokens["focus"],
+        takefocus=True,
+    )
+
+
+def style_midnightstudio_native_panedwindow(panedwindow):
+    tokens = MIDNIGHTSTUDIO_TOKENS
+    panedwindow.configure(
+        background=tokens["border"],
+        proxybackground=tokens["focus"],
+        proxyborderwidth=0,
+        sashrelief="flat",
+        sashcursor="sb_v_double_arrow",
+    )
+
+
+def style_midnightstudio_toplevel(window):
+    """Apply the centralized dark shell to an application-created Toplevel."""
+    window.configure(background=MIDNIGHTSTUDIO_THEME_COLORS["bg"])
+
+
+def style_midnightstudio_review_buttons(container):
+    """Give otherwise unstyled Review buttons a quiet secondary treatment."""
+    for child in container.winfo_children():
+        if isinstance(child, ttk.Button):
+            current_style = str(child.cget("style") or "")
+            if current_style in ("", "TButton"):
+                child.configure(style="secondary.Outline.TButton")
+        style_midnightstudio_review_buttons(child)
 
 # === word-level exporters (VTT, ASS, and HTML player) ========================
 def _has_word_level(segments):
@@ -526,6 +1050,9 @@ def get_pkg_version(dist_name: str) -> str:
 
 def gather_about_info() -> str:
     lines = []
+    lines.append("Transcript Studio")
+    lines.append("Local transcription, speaker review, and subtitle tools")
+    lines.append("")
     lines.append(f"GUI version: {APP_VER} (build {app_build_id()})")
     lines.append(f"Config file: {conf_path()}")
     lines.append("")
@@ -570,6 +1097,7 @@ _DEFAULTS = {
     "output_format": "both","srt": True,"txt": True,"compute_type": "float16","tf32": "off",
     "padding_seconds": 0.25,"hf_token": "",
     "diarization_speaker_mode": "auto", "min_speakers": 2, "max_speakers": 2,
+    "ner_engine": "auto",
 }
 _MODEL_CHOICES = ["tiny","base","small","medium","large-v2","large-v3","large-v3-turbo","distil-large-v3"]
 _COMPUTE_CHOICES = ["float16","float32"]
@@ -915,22 +1443,44 @@ def _ner_device_info(engine: str) -> str:
 class NERSelectDialog(tk.Toplevel):
     def __init__(self, master, initial: str = "auto"):
         super().__init__(master)
+        style_midnightstudio_toplevel(self)
         self.title("NER Engine")
         self.geometry("340x180")
         self.resizable(False, False)
         self.result = None
-        frm = ttk.Frame(self, padding=10)
+        frm = ttk.Frame(
+            self,
+            padding=10,
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
         frm.pack(fill="both", expand=True)
         ttk.Label(frm, text="Choose NER engine:").pack(anchor="w")
         self.var_engine = tk.StringVar(value=initial)
-        self.cb = ttk.Combobox(frm, textvariable=self.var_engine, values=_NER_CHOICES, state="readonly", width=16)
+        self.cb = ttk.Combobox(
+            frm,
+            textvariable=self.var_engine,
+            values=_NER_CHOICES,
+            state="readonly",
+            width=16,
+            style=MIDNIGHTSTUDIO_STYLES["card_combobox"],
+        )
         self.cb.pack(anchor="w", pady=(6, 8))
-        self.lbl = ttk.Label(frm, text="", foreground="#555")
+        self.lbl = ttk.Label(
+            frm,
+            text="",
+            style=MIDNIGHTSTUDIO_STYLES["secondary"],
+        )
         self.lbl.pack(anchor="w")
-        btns = ttk.Frame(frm)
+        btns = ttk.Frame(frm, style=MIDNIGHTSTUDIO_STYLES["page"])
         btns.pack(fill="x", pady=(10, 0))
-        ttk.Button(btns, text="OK", command=self._accept).pack(side="right")
-        ttk.Button(btns, text="Cancel", command=self._cancel).pack(side="right", padx=6)
+        tb.Button(btns, text="OK", command=self._accept, bootstyle="primary").pack(side="right")
+        tb.Button(
+            btns,
+            text="Cancel",
+            command=self._cancel,
+            bootstyle="secondary-outline",
+        ).pack(side="right", padx=6)
+        reinforce_midnightstudio_control_states(tb.Style.get_instance() or tb.Style())
         self.transient(master)
         self.grab_set()
         self.protocol("WM_DELETE_WINDOW", self._cancel)
@@ -952,6 +1502,7 @@ class NERSelectDialog(tk.Toplevel):
 class _SrtHitsDialog(tk.Toplevel):
     def __init__(self, parent, hits):
         super().__init__(parent)
+        style_midnightstudio_toplevel(self)
         self.title("SRT Matches")
         self.resizable(True, True)
         self.transient(parent)
@@ -959,24 +1510,15 @@ class _SrtHitsDialog(tk.Toplevel):
         self.result = None
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
-        frame = ttk.Frame(self, padding=8)
+        frame = ttk.Frame(
+            self,
+            padding=8,
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
         frame.grid(row=0, column=0, sticky="nsew")
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
-        tree_style_name = "SrtMatches.Treeview"
-        tree_style = tb.Style.get_instance() or tb.Style()
-        colors = tree_style.colors
-        tree_style.configure(
-            tree_style_name,
-            background=colors.inputbg,
-            foreground=colors.inputfg,
-            fieldbackground=colors.inputbg,
-        )
-        tree_style.map(
-            tree_style_name,
-            background=[("selected", colors.primary)],
-            foreground=[("selected", colors.get_foreground("primary"))],
-        )
+        tree_style_name = MIDNIGHTSTUDIO_STYLES["srt_tree"]
         self.tree = ttk.Treeview(
             frame,
             columns=("time","text"),
@@ -990,7 +1532,12 @@ class _SrtHitsDialog(tk.Toplevel):
         self.tree.column("time", width=110, anchor="w")
         self.tree.column("text", width=680, anchor="w")
         self.tree.grid(row=0, column=0, sticky="nsew")
-        ybar = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        ybar = ttk.Scrollbar(
+            frame,
+            orient="vertical",
+            command=self.tree.yview,
+            style=MIDNIGHTSTUDIO_STYLES["review_scrollbar"],
+        )
         self.tree.configure(yscrollcommand=ybar.set)
         ybar.grid(row=0, column=1, sticky="ns")
         for i, h in enumerate(self.hits):
@@ -1003,11 +1550,22 @@ class _SrtHitsDialog(tk.Toplevel):
             self.tree.selection_set(first_item[0])
             self.tree.focus(first_item[0])
             self.tree.see(first_item[0])
-        btns = ttk.Frame(frame)
+        btns = ttk.Frame(frame, style=MIDNIGHTSTUDIO_STYLES["page"])
         btns.grid(row=1, column=0, columnspan=2, sticky="e", pady=(8,0))
-        self.btn_open = ttk.Button(btns, text="Open at time", command=self._on_open)
+        self.btn_open = tb.Button(
+            btns,
+            text="Open at time",
+            command=self._on_open,
+            bootstyle="primary",
+        )
         self.btn_open.pack(side="right", padx=(0,8))
-        ttk.Button(btns, text="Cancel", command=self._on_cancel).pack(side="right")
+        tb.Button(
+            btns,
+            text="Cancel",
+            command=self._on_cancel,
+            bootstyle="secondary-outline",
+        ).pack(side="right")
+        reinforce_midnightstudio_control_states(tb.Style.get_instance() or tb.Style())
         self.tree.bind("<ButtonRelease-1>", self._select_clicked_row, add="+")
         self.tree.bind("<Double-1>", lambda e: self._on_open())
         self.bind("<Return>", lambda e: self._on_open())
@@ -1087,6 +1645,7 @@ def _write_corrected_segments_json(
 class SegmentCorrectionDialog(tk.Toplevel):
     def __init__(self, parent, segments, speakers, name_mapping):
         super().__init__(parent)
+        style_midnightstudio_toplevel(self)
         self.title("Review Speaker Segments")
         self.geometry("1100x650")
         self.minsize(820, 480)
@@ -1122,39 +1681,34 @@ class SegmentCorrectionDialog(tk.Toplevel):
         search_entry = ttk.Entry(filters, textvariable=self.var_search, width=34)
         search_entry.grid(row=0, column=3, sticky="w")
         search_entry.bind("<KeyRelease>", self._populate_tree)
-        tb.Label(
+        self.lbl_segment_warning = ttk.Label(
             filters,
             text=(
                 "Whole-segment correction only: each row is one indivisible segments.json entry. "
                 "If a row contains dialogue from more than one real speaker, this version cannot split "
                 "the text inside it. Assigning changes the entire row."
             ),
-            bootstyle="warning",
-            font=("Segoe UI", 9, "bold"),
+            style=MIDNIGHTSTUDIO_STYLES["dialog_warning"],
             justify="left",
             wraplength=1000,
-            padding=(8, 6),
-        ).grid(row=1, column=0, columnspan=5, sticky="ew", pady=(8, 0))
+        )
+        self.lbl_segment_warning.grid(
+            row=1,
+            column=0,
+            columnspan=5,
+            sticky="ew",
+            pady=(8, 0),
+        )
 
-        tree_frame = ttk.Frame(self, padding=(12, 0))
+        tree_frame = ttk.Frame(
+            self,
+            padding=(12, 0),
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
         tree_frame.grid(row=1, column=0, sticky="nsew")
         tree_frame.columnconfigure(0, weight=1)
         tree_frame.rowconfigure(0, weight=1)
-        tree_style_name = "SegmentCorrection.Treeview"
-        tree_style = tb.Style.get_instance() or tb.Style()
-        colors = tree_style.colors
-        tree_style.configure(
-            tree_style_name,
-            background=colors.inputbg,
-            foreground=colors.inputfg,
-            fieldbackground=colors.inputbg,
-            rowheight=25,
-        )
-        tree_style.map(
-            tree_style_name,
-            background=[("selected", colors.primary)],
-            foreground=[("selected", colors.get_foreground("primary"))],
-        )
+        tree_style_name = MIDNIGHTSTUDIO_STYLES["segment_tree"]
         self.tree = ttk.Treeview(
             tree_frame,
             columns=("start", "speaker", "transcript"),
@@ -1169,8 +1723,18 @@ class SegmentCorrectionDialog(tk.Toplevel):
         self.tree.column("speaker", width=210, minwidth=150, stretch=False, anchor="w")
         self.tree.column("transcript", width=700, minwidth=300, stretch=True, anchor="w")
         self.tree.grid(row=0, column=0, sticky="nsew")
-        yscroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
-        xscroll = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
+        yscroll = ttk.Scrollbar(
+            tree_frame,
+            orient="vertical",
+            command=self.tree.yview,
+            style=MIDNIGHTSTUDIO_STYLES["review_scrollbar"],
+        )
+        xscroll = ttk.Scrollbar(
+            tree_frame,
+            orient="horizontal",
+            command=self.tree.xview,
+            style=MIDNIGHTSTUDIO_STYLES["dialog_hscrollbar"],
+        )
         self.tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
         yscroll.grid(row=0, column=1, sticky="ns")
         xscroll.grid(row=1, column=0, sticky="ew")
@@ -1195,10 +1759,20 @@ class SegmentCorrectionDialog(tk.Toplevel):
             bootstyle="primary",
         ).grid(row=0, column=2, sticky="w")
 
-        buttons = ttk.Frame(self, padding=12)
+        buttons = ttk.Frame(
+            self,
+            padding=12,
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
         buttons.grid(row=3, column=0, sticky="e")
         tb.Button(buttons, text="Save Corrections", command=self._save, bootstyle="success", padding=(16, 6)).pack(side="right")
         tb.Button(buttons, text="Cancel", command=self._cancel, bootstyle="secondary-outline", padding=(14, 6)).pack(side="right", padx=(0, 8))
+        for card in (filters, assignment):
+            apply_midnightstudio_card_style(card)
+        self.lbl_segment_warning.configure(
+            style=MIDNIGHTSTUDIO_STYLES["dialog_warning"]
+        )
+        reinforce_midnightstudio_control_states(tb.Style.get_instance() or tb.Style())
 
         self.tree.bind("<Control-a>", self._select_all_visible)
         self.tree.bind("<Control-A>", self._select_all_visible)
@@ -1280,19 +1854,125 @@ class SegmentCorrectionDialog(tk.Toplevel):
         self.result = None
         self.destroy()
 
-class NamingDialog(tk.Toplevel):
+
+@dataclass(frozen=True)
+class ReviewResultIdentity:
+    speakers_json: Path
+    segments_json: Path
+    speakers_sha256: str
+    segments_sha256: str
+
+    @property
+    def paths(self):
+        return self.speakers_json, self.segments_json
+
+
+@dataclass(frozen=True)
+class _ReviewResultPreflight:
+    identity: ReviewResultIdentity
+    speakers_data: dict
+    segments_data: dict
+
+
+def _read_review_json(path: Path, label: str):
+    try:
+        raw = path.read_bytes()
+    except Exception as exc:
+        raise ValueError(f"Could not read {label}: {exc}") from exc
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        raise ValueError(f"{label} is not valid UTF-8 JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"{label} must contain a top-level JSON object.")
+    return data, hashlib.sha256(raw).hexdigest()
+
+
+def _preflight_review_result(speakers_json, segments_json):
+    speakers_path = Path(speakers_json).resolve()
+    segments_path = Path(segments_json).resolve()
+    if not speakers_path.is_file():
+        raise FileNotFoundError(f"Missing speakers.json: {speakers_path}")
+    if not segments_path.is_file():
+        raise FileNotFoundError(f"Missing segments.json: {segments_path}")
+
+    speakers_data, speakers_sha256 = _read_review_json(speakers_path, "speakers.json")
+    segments_data, segments_sha256 = _read_review_json(segments_path, "segments.json")
+
+    speakers = speakers_data.get("speakers")
+    if not isinstance(speakers, list):
+        raise ValueError("speakers.json must contain a 'speakers' list.")
+    if any(not isinstance(speaker, str) or not speaker.strip() for speaker in speakers):
+        raise ValueError("Every speakers.json speaker entry must be a non-empty string.")
+    if len(set(speakers)) != len(speakers):
+        raise ValueError("speakers.json contains duplicate speaker IDs.")
+    for mapping_key in ("names", "name_map"):
+        mapping = speakers_data.get(mapping_key)
+        if mapping is not None and not isinstance(mapping, dict):
+            raise ValueError(f"speakers.json '{mapping_key}' must be an object when present.")
+
+    segments = segments_data.get("segments")
+    if not isinstance(segments, list):
+        raise ValueError("segments.json must contain a 'segments' list.")
+    for segment_index, segment in enumerate(segments):
+        if not isinstance(segment, dict):
+            raise ValueError(
+                f"segments.json segment {segment_index + 1} must be a JSON object."
+            )
+        speaker = segment.get("speaker")
+        if speaker is not None and not isinstance(speaker, str):
+            raise ValueError(
+                f"segments.json segment {segment_index + 1} has an invalid speaker value."
+            )
+        words = segment.get("words")
+        if words is not None:
+            if not isinstance(words, list):
+                raise ValueError(
+                    f"segments.json segment {segment_index + 1} has a non-list words value."
+                )
+            if any(not isinstance(word, dict) for word in words):
+                raise ValueError(
+                    f"segments.json segment {segment_index + 1} contains an invalid word entry."
+                )
+
+    identity = ReviewResultIdentity(
+        speakers_json=speakers_path,
+        segments_json=segments_path,
+        speakers_sha256=speakers_sha256,
+        segments_sha256=segments_sha256,
+    )
+    return _ReviewResultPreflight(identity, speakers_data, segments_data)
+
+
+class NamingWorkspace(ttk.Frame):
+    _LEFT_RATIO_DEFAULT = 0.40
+    _LEFT_RATIO_MIN = 0.10
+    _LEFT_RATIO_MAX = 0.50
     _VIDEO_RATIO_DEFAULT = 0.65
     _VIDEO_RATIO_MIN = 0.35
     _VIDEO_RATIO_MAX = 0.80
     _TRANSCRIPT_FONT_MIN = 8
     _TRANSCRIPT_FONT_MAX = 28
 
-    def __init__(self, master, speakers_json: Path, segments_json: Path):
-        super().__init__(master)
-        self.title("Name Speakers")
-        self.geometry("1180x700")
-        self.minsize(960, 600)
-        self.resizable(True, True)
+    def __init__(
+        self,
+        master,
+        speakers_json: Path,
+        segments_json: Path,
+        *,
+        on_apply_complete=None,
+        on_discard=None,
+        discard_label="Cancel",
+        result_preflight=None,
+    ):
+        super().__init__(master, style=MIDNIGHTSTUDIO_STYLES["page"])
+        self._on_apply_complete = on_apply_complete
+        self._on_discard = on_discard
+        self._discard_label = discard_label
+        self._started = False
+        self._clean_baseline = None
+        self._dirty_tracking_suspended = False
+        self._dirty_trace_ids = []
         self._vlc_status = {}
         self._vlc_instance = None
         self._vlc_player = None
@@ -1301,6 +1981,7 @@ class NamingDialog(tk.Toplevel):
         self._video_update_after = None
         self._pending_seek_after = None
         self._pending_subtitle_after = None
+        self._apply_player_restore_after = None
         self._seek_dragging = False
         self._video_duration_seconds = 0.0
         self._player_closing = False
@@ -1324,38 +2005,38 @@ class NamingDialog(tk.Toplevel):
         self._view_preferences_saved = False
         self._preview_ratio_after = None
         self._preview_ratio_applied = False
+        self._video_reattach_after = None
         try:
             self._naming_cfg = read_yaml(conf_path())
             if not isinstance(self._naming_cfg, dict):
                 self._naming_cfg = {}
         except Exception:
             self._naming_cfg = {}
-        self._preview_video_ratio = self._validated_video_ratio(
-            self._naming_cfg.get("name_speakers_video_ratio")
+        self._preview_video_ratio = self._validated_saved_pane_ratio(
+            self._naming_cfg.get("name_speakers_video_ratio"),
+            self._VIDEO_RATIO_DEFAULT,
+            self._VIDEO_RATIO_MIN,
+            self._VIDEO_RATIO_MAX,
         )
-        self.speakers_json = speakers_json
-        self.segments_json = segments_json
-        spk_data = json.loads(speakers_json.read_text(encoding="utf-8"))
-        seg_data = json.loads(segments_json.read_text(encoding="utf-8"))
-        self.title_name = spk_data.get("title") or speakers_json.parent.name
+        self._workspace_left_ratio = self._validated_saved_pane_ratio(
+            self._naming_cfg.get("name_speakers_left_ratio"),
+            self._LEFT_RATIO_DEFAULT,
+            self._LEFT_RATIO_MIN,
+            self._LEFT_RATIO_MAX,
+        )
+        if result_preflight is None:
+            result_preflight = _preflight_review_result(speakers_json, segments_json)
+        self.result_identity = result_preflight.identity
+        self.speakers_json = self.result_identity.speakers_json
+        self.segments_json = self.result_identity.segments_json
+        spk_data = copy.deepcopy(result_preflight.speakers_data)
+        seg_data = copy.deepcopy(result_preflight.segments_data)
+        self.title_name = spk_data.get("title") or self.speakers_json.parent.name
         self.speakers = list(spk_data.get("speakers") or [])
         self.saved_names = dict(spk_data.get("names") or spk_data.get("name_map") or {})
         self.segments_data = copy.deepcopy(seg_data)
         self.segments = copy.deepcopy(seg_data.get("segments") or [])
-        subtitle_title = seg_data.get("title") or speakers_json.parent.name
-        subtitle_candidates = (
-            ("SRT", speakers_json.parent / f"{subtitle_title}.srt"),
-            ("ASS (plain)", speakers_json.parent / f"{subtitle_title}.plain.ass"),
-            ("ASS (word highlighting)", speakers_json.parent / f"{subtitle_title}.words.ass"),
-        )
-        self._subtitle_paths = {
-            label: path
-            for label, path in subtitle_candidates
-            if path.is_file()
-        }
-        self._subtitle_choices = ["Off"] + [
-            label for label, _path in subtitle_candidates if label in self._subtitle_paths
-        ]
+        self._subtitle_paths, self._subtitle_choices = self._discover_subtitle_files()
         self.manual_corrections_pending = False
         global_counts = Counter(_extract_candidates_from_text(" ".join(str(s.get("text","")) for s in self.segments)))
         # Do not use the file title as a strong name source. Titles are usually topics, not speakers.
@@ -1366,24 +2047,50 @@ class NamingDialog(tk.Toplevel):
             c = Counter(_extract_candidates_from_text(" ".join(str(s.get("text","")) for s in self.segments if (s.get("speaker") == spk))))
             c.update(addressed_counts.get(spk, Counter()))
             per_spk_counts[spk] = c
-        main = ttk.Frame(self, padding=14)
+        main = ttk.Frame(
+            self,
+            padding=14,
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
         main.pack(fill="both", expand=True)
         main.columnconfigure(0, weight=1)
         main.rowconfigure(2, weight=1)
-        ttk.Label(main, text="Name Speakers", font=("Segoe UI", 16, "bold")).grid(row=0, column=0, sticky="w")
-        ttk.Label(main, text=f"{self.title_name} — assign names and review the transcript").grid(row=1, column=0, sticky="w", pady=(2, 10))
-        paned = ttk.PanedWindow(main, orient="horizontal")
-        paned.grid(row=2, column=0, sticky="nsew")
-        left = ttk.Frame(paned, padding=(0, 0, 6, 0))
-        right = ttk.Frame(paned, padding=(6, 0, 0, 0))
-        paned.add(left, weight=2)
-        paned.add(right, weight=3)
+        ttk.Label(
+            main,
+            text="Name Speakers",
+            style=MIDNIGHTSTUDIO_STYLES["review_title"],
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            main,
+            text=f"{self.title_name} — assign names and review the transcript",
+            style=MIDNIGHTSTUDIO_STYLES["subtitle"],
+        ).grid(row=1, column=0, sticky="w", pady=(2, 10))
+        self._workspace_paned = ttk.PanedWindow(
+            main,
+            orient="horizontal",
+            style=MIDNIGHTSTUDIO_STYLES["review_paned"],
+            takefocus=True,
+        )
+        self._workspace_paned.grid(row=2, column=0, sticky="nsew")
+        left = ttk.Frame(
+            self._workspace_paned,
+            padding=(0, 0, 6, 0),
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
+        right = ttk.Frame(
+            self._workspace_paned,
+            padding=(6, 0, 0, 0),
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
+        self._workspace_paned.add(left, weight=2)
+        self._workspace_paned.add(right, weight=3)
         left.columnconfigure(0, weight=1)
         left.rowconfigure(0, weight=1, minsize=150)
         left.rowconfigure(1, weight=1, minsize=125)
         right.columnconfigure(0, weight=1)
         right.rowconfigure(1, weight=1)
         self.inputs = {}
+        self.name_vars = {}
         self.selected_speaker = tk.StringVar(value=self.speakers[0] if self.speakers else "")
 
         assignments = ttk.LabelFrame(left, text="Speaker Assignments", padding=8)
@@ -1398,7 +2105,14 @@ class NamingDialog(tk.Toplevel):
         ttk.Label(assignment_headings, text="Assigned name", font=("Segoe UI", 9, "bold")).grid(row=0, column=2, sticky="w")
 
         speaker_canvas = tk.Canvas(assignments, height=155, highlightthickness=0, borderwidth=0)
-        speaker_scroll = ttk.Scrollbar(assignments, orient="vertical", command=speaker_canvas.yview)
+        self.speaker_canvas = speaker_canvas
+        style_midnightstudio_canvas(speaker_canvas)
+        speaker_scroll = ttk.Scrollbar(
+            assignments,
+            orient="vertical",
+            command=speaker_canvas.yview,
+            style=MIDNIGHTSTUDIO_STYLES["review_scrollbar"],
+        )
         speaker_canvas.configure(yscrollcommand=speaker_scroll.set)
         speaker_canvas.grid(row=1, column=0, sticky="nsew")
         speaker_scroll.grid(row=1, column=1, sticky="ns")
@@ -1420,7 +2134,14 @@ class NamingDialog(tk.Toplevel):
             if saved and saved not in suggestions:
                 suggestions = [saved] + suggestions
 
-            cb = ttk.Combobox(grid, values=suggestions, width=30, state="normal")
+            name_var = tk.StringVar()
+            cb = ttk.Combobox(
+                grid,
+                textvariable=name_var,
+                values=suggestions,
+                width=30,
+                state="normal",
+            )
             cb.grid(row=r, column=2, sticky="ew", pady=4)
 
             cb.bind("<FocusIn>", lambda e, spk=spk: self.selected_speaker.set(spk))
@@ -1430,6 +2151,7 @@ class NamingDialog(tk.Toplevel):
                 cb.set(saved)
 
             self.inputs[spk] = cb
+            self.name_vars[spk] = name_var
 
         grid.columnconfigure(2, weight=1)
         grid.bind("<Configure>", lambda event: speaker_canvas.configure(scrollregion=speaker_canvas.bbox("all")))
@@ -1447,7 +2169,7 @@ class NamingDialog(tk.Toplevel):
                 messagebox.showinfo(
                     "No names suggested",
                     "No empty fields for the first two speakers had an available name suggestion.",
-                    parent=self,
+                    parent=self.winfo_toplevel(),
                 )
 
         tb.Button(
@@ -1477,7 +2199,13 @@ class NamingDialog(tk.Toplevel):
         pool_inner.rowconfigure(0, weight=1)
 
         self.name_pool = tk.Listbox(pool_inner, height=6, exportselection=False)
-        pool_scroll = ttk.Scrollbar(pool_inner, orient="vertical", command=self.name_pool.yview)
+        style_midnightstudio_listbox(self.name_pool)
+        pool_scroll = ttk.Scrollbar(
+            pool_inner,
+            orient="vertical",
+            command=self.name_pool.yview,
+            style=MIDNIGHTSTUDIO_STYLES["review_scrollbar"],
+        )
         self.name_pool.configure(yscrollcommand=pool_scroll.set)
 
         self.name_pool.grid(row=0, column=0, sticky="nsew")
@@ -1513,6 +2241,7 @@ class NamingDialog(tk.Toplevel):
             existing = [self.name_pool.get(i) for i in range(self.name_pool.size())]
             if nm not in existing:
                 self.name_pool.insert("end", nm)
+                self._update_dirty_state()
 
         self.name_pool.bind("<Double-1>", assign_selected_name)
 
@@ -1543,10 +2272,26 @@ class NamingDialog(tk.Toplevel):
         ttk.Checkbutton(opts, text="Word-level LRC (CapCut)", variable=self.var_export_lrc).grid(row=7, column=0, sticky="w", pady=(2, 0))
         ttk.Checkbutton(opts, text="ASS (plain, no karaoke)", variable=self.var_export_ass_plain).grid(row=8, column=0, sticky="w", pady=(2, 0))
 
-        btns = ttk.Frame(left)
+        btns = ttk.Frame(left, style=MIDNIGHTSTUDIO_STYLES["page"])
         btns.grid(row=3, column=0, sticky="ew")
-        tb.Button(btns, text="Apply", command=self.on_apply, bootstyle="success", padding=(16, 6)).pack(side="right")
-        tb.Button(btns, text="Cancel", command=self.destroy, bootstyle="secondary-outline", padding=(14, 6)).pack(side="right", padx=(0, 8))
+        tb.Button(btns, text="Apply", command=self.apply_changes, bootstyle="primary", padding=(16, 6)).pack(side="right")
+        tb.Button(
+            btns,
+            text=self._discard_label,
+            command=self.discard_changes,
+            bootstyle="secondary-outline",
+            padding=(14, 6),
+        ).pack(side="right", padx=(0, 8))
+        self.lbl_dirty_status = tb.Label(btns, text="Saved", bootstyle="success")
+        self.lbl_dirty_status.pack(side="left")
+        self.btn_revert = tb.Button(
+            btns,
+            text="Revert Unsaved Changes",
+            command=self.revert_unsaved_changes,
+            bootstyle="warning-outline",
+            state="disabled",
+        )
+        self.btn_revert.pack(side="left", padx=(8, 0))
 
         toolbar = ttk.LabelFrame(right, text="Search", padding=10)
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
@@ -1577,6 +2322,7 @@ class NamingDialog(tk.Toplevel):
             opaqueresize=True,
             borderwidth=0,
         )
+        style_midnightstudio_native_panedwindow(self._preview_paned)
         self._preview_paned.grid(row=1, column=0, sticky="nsew")
 
         video = ttk.LabelFrame(self._preview_paned, text="Video Preview", padding=8)
@@ -1593,7 +2339,7 @@ class NamingDialog(tk.Toplevel):
             video_host,
             width=480,
             height=270,
-            background="black",
+            background=MIDNIGHTSTUDIO_TOKENS["video_bg"],
             highlightthickness=0,
             borderwidth=0,
         )
@@ -1601,8 +2347,8 @@ class NamingDialog(tk.Toplevel):
         self.video_message = tk.Label(
             self.video_surface,
             text="No video loaded",
-            background="black",
-            foreground="#c8c8c8",
+            background=MIDNIGHTSTUDIO_TOKENS["video_bg"],
+            foreground=MIDNIGHTSTUDIO_TOKENS["video_message_fg"],
             justify="center",
             wraplength=430,
         )
@@ -1623,7 +2369,13 @@ class NamingDialog(tk.Toplevel):
         self.lbl_video_time.grid(row=0, column=5, sticky="e")
 
         self.video_seek_var = tk.DoubleVar(value=0.0)
-        self.video_seek = ttk.Scale(player_controls, from_=0.0, to=1.0, variable=self.video_seek_var)
+        self.video_seek = ttk.Scale(
+            player_controls,
+            from_=0.0,
+            to=1.0,
+            variable=self.video_seek_var,
+            style=MIDNIGHTSTUDIO_STYLES["review_scale"],
+        )
         self.video_seek.grid(row=1, column=0, columnspan=6, sticky="ew", pady=(8, 0))
         self.video_seek.bind("<ButtonPress-1>", self._video_seek_started)
         self.video_seek.bind("<ButtonRelease-1>", self._video_seek_released)
@@ -1653,6 +2405,7 @@ class NamingDialog(tk.Toplevel):
             length=120,
             variable=self.video_volume_var,
             command=self._video_volume_changed,
+            style=MIDNIGHTSTUDIO_STYLES["review_scale"],
         )
         self.video_volume.grid(row=0, column=4, sticky="e")
         self._video_controls = [
@@ -1670,6 +2423,12 @@ class NamingDialog(tk.Toplevel):
         viewer.columnconfigure(0, weight=1)
         viewer.rowconfigure(1, weight=1)
         self._preview_paned.add(viewer, minsize=130, stretch="always")
+        self._workspace_paned.bind(
+            "<ButtonRelease-1>", self._pane_divider_released, add="+"
+        )
+        self._preview_paned.bind(
+            "<ButtonRelease-1>", self._pane_divider_released, add="+"
+        )
 
         transcript_controls = ttk.Frame(viewer)
         transcript_controls.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
@@ -1702,6 +2461,7 @@ class NamingDialog(tk.Toplevel):
         ).pack(side="left", padx=(6, 0))
 
         self.text = tk.Text(viewer, wrap="word", height=8)
+        style_midnightstudio_text(self.text)
         self.transcript_font = tkfont.Font(root=self, font=self.text.cget("font"))
         try:
             captured_font_size = abs(int(self.transcript_font.cget("size")))
@@ -1715,10 +2475,20 @@ class NamingDialog(tk.Toplevel):
         initial_font_size = self._validated_transcript_font_size(
             self._naming_cfg.get("name_speakers_transcript_font_size")
         )
-        yscroll = ttk.Scrollbar(viewer, orient="vertical", command=self._on_transcript_scrollbar)
+        yscroll = ttk.Scrollbar(
+            viewer,
+            orient="vertical",
+            command=self._on_transcript_scrollbar,
+            style=MIDNIGHTSTUDIO_STYLES["review_scrollbar"],
+        )
         self.text.configure(yscrollcommand=yscroll.set)
         self.text.grid(row=1, column=0, sticky="nsew")
         yscroll.grid(row=1, column=1, sticky="ns")
+        for card in (assignments, pool_frame, opts, toolbar, video, viewer):
+            apply_midnightstudio_card_style(card)
+        style_midnightstudio_review_buttons(main)
+        self.btn_video_stop.configure(style="danger.Outline.TButton")
+        reinforce_midnightstudio_control_states(tb.Style.get_instance() or tb.Style())
         self._set_transcript_font_size(initial_font_size)
         self.text.bind("<Control-MouseWheel>", self._on_transcript_ctrl_mousewheel)
         self.text.bind("<Control-Button-4>", self._on_transcript_ctrl_mousewheel)
@@ -1735,10 +2505,73 @@ class NamingDialog(tk.Toplevel):
             initial = self.speakers[0] if self.speakers else "SPEAKER_00"
         self.find_var.set(initial)
         self._highlight_query(initial)
-        self.protocol("WM_DELETE_WINDOW", self.destroy)
-        self.bind("<Destroy>", self._on_dialog_destroyed, add="+")
+        self._install_dirty_tracking()
+        self._capture_clean_baseline()
+        self.bind("<Destroy>", self._on_workspace_destroyed, add="+")
+
+    def start(self):
+        """Start host-dependent services after the workspace has been placed."""
+        if self._started or self._player_closing:
+            return
+        self._started = True
+        # A replacement is constructed while dormant. Render once from the fully
+        # populated assignment controls before any host/player callbacks begin.
+        self._refresh_transcript_preview()
         self._initialize_embedded_player()
-        self._preview_ratio_after = self.after(100, self._apply_initial_preview_ratio)
+        self._schedule_initial_pane_ratios(100)
+
+    def on_host_activated(self):
+        """Reattach the existing video output after an embedded host is remapped."""
+        self._schedule_initial_pane_ratios()
+        if (
+            os.name != "nt"
+            or self._player_closing
+            or self._vlc_player is None
+            or self._video_reattach_after is not None
+        ):
+            return
+
+        def reattach():
+            self._video_reattach_after = None
+            if self._player_closing or self._vlc_player is None:
+                return
+            try:
+                if not self.winfo_exists() or not self.video_surface.winfo_exists():
+                    return
+                self.video_surface.update_idletasks()
+                self._vlc_player.set_hwnd(self.video_surface.winfo_id())
+            except (AttributeError, tk.TclError):
+                pass
+            except Exception:
+                pass
+
+        try:
+            self._video_reattach_after = self.after_idle(reattach)
+        except tk.TclError:
+            self._video_reattach_after = None
+
+    def _validated_left_ratio(self, value):
+        if isinstance(value, bool):
+            return self._LEFT_RATIO_DEFAULT
+        try:
+            ratio = float(value)
+        except (TypeError, ValueError):
+            return self._LEFT_RATIO_DEFAULT
+        if not math.isfinite(ratio):
+            return self._LEFT_RATIO_DEFAULT
+        return max(self._LEFT_RATIO_MIN, min(self._LEFT_RATIO_MAX, ratio))
+
+    @staticmethod
+    def _validated_saved_pane_ratio(value, default, minimum, maximum):
+        if isinstance(value, bool):
+            return default
+        try:
+            ratio = float(value)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(ratio) or not minimum <= ratio <= maximum:
+            return default
+        return ratio
 
     def _validated_video_ratio(self, value):
         if isinstance(value, bool):
@@ -1796,25 +2629,61 @@ class NamingDialog(tk.Toplevel):
             self._adjust_transcript_font_size(direction)
         return "break"
 
+    def _schedule_initial_pane_ratios(self, delay=50):
+        if (
+            self._preview_ratio_applied
+            or self._player_closing
+            or self._preview_ratio_after is not None
+        ):
+            return
+        try:
+            self._preview_ratio_after = self.after(
+                delay, self._apply_initial_preview_ratio
+            )
+        except tk.TclError:
+            self._preview_ratio_after = None
+
     def _apply_initial_preview_ratio(self):
         self._preview_ratio_after = None
         if self._preview_ratio_applied or self._player_closing:
             return
         try:
             self.update_idletasks()
-            available_height = self._preview_paned.winfo_height()
-            if available_height <= 1 or len(self._preview_paned.panes()) < 2:
-                self._preview_ratio_after = self.after(50, self._apply_initial_preview_ratio)
+            if not self.winfo_ismapped():
+                self._schedule_initial_pane_ratios()
                 return
-            sash_position = int(round(available_height * self._preview_video_ratio))
-            self._preview_paned.sash_place(0, 0, sash_position)
+            available_width = self._workspace_paned.winfo_width()
+            available_height = self._preview_paned.winfo_height()
+            if (
+                available_width < 500
+                or available_height < 350
+                or len(self._workspace_paned.panes()) < 2
+                or len(self._preview_paned.panes()) < 2
+            ):
+                self._schedule_initial_pane_ratios()
+                return
+            left_sash = int(round(available_width * self._workspace_left_ratio))
+            video_sash = int(round(available_height * self._preview_video_ratio))
+            self._workspace_paned.sashpos(0, left_sash)
+            self._preview_paned.sash_place(0, 0, video_sash)
+            self.update_idletasks()
             self._preview_ratio_applied = True
+            self._remember_current_pane_ratios()
         except (AttributeError, tk.TclError):
             if not self._player_closing:
-                try:
-                    self._preview_ratio_after = self.after(50, self._apply_initial_preview_ratio)
-                except tk.TclError:
-                    self._preview_ratio_after = None
+                self._schedule_initial_pane_ratios()
+
+    def _current_workspace_left_ratio(self):
+        if not self._preview_ratio_applied:
+            return self._workspace_left_ratio
+        try:
+            available_width = self._workspace_paned.winfo_width()
+            if available_width <= 1:
+                return self._workspace_left_ratio
+            sash_position = self._workspace_paned.sashpos(0)
+            return self._validated_left_ratio(sash_position / available_width)
+        except (AttributeError, tk.TclError):
+            return self._workspace_left_ratio
 
     def _current_preview_video_ratio(self):
         if not self._preview_ratio_applied:
@@ -1827,6 +2696,20 @@ class NamingDialog(tk.Toplevel):
             return self._validated_video_ratio(sash_position / available_height)
         except (AttributeError, tk.TclError):
             return self._preview_video_ratio
+
+    def _remember_current_pane_ratios(self):
+        if not self._preview_ratio_applied or self._player_closing:
+            return
+        self._workspace_left_ratio = self._current_workspace_left_ratio()
+        self._preview_video_ratio = self._current_preview_video_ratio()
+
+    def _pane_divider_released(self, _event=None):
+        if not self._preview_ratio_applied or self._player_closing:
+            return
+        try:
+            self.after_idle(self._remember_current_pane_ratios)
+        except tk.TclError:
+            pass
 
     def _cancel_pending_preview_ratio(self):
         if self._preview_ratio_after is None:
@@ -1841,22 +2724,27 @@ class NamingDialog(tk.Toplevel):
         if self._view_preferences_saved:
             return
         self._view_preferences_saved = True
-        ratio = self._current_preview_video_ratio()
+        left_ratio = self._current_workspace_left_ratio()
+        video_ratio = self._current_preview_video_ratio()
         try:
             font_size = int(self.transcript_font.cget("size"))
         except (AttributeError, TypeError, ValueError, tk.TclError):
             font_size = self._transcript_default_font_size
         try:
-            cfg = read_yaml(conf_path())
-            if not isinstance(cfg, dict):
-                return
-            cfg["name_speakers_video_ratio"] = round(ratio, 4)
-            cfg["name_speakers_transcript_font_size"] = max(
-                self._TRANSCRIPT_FONT_MIN,
-                min(self._TRANSCRIPT_FONT_MAX, font_size),
+            cfg = merge_gui_conf(
+                read_yaml(conf_path()),
+                {
+                    "name_speakers_left_ratio": round(left_ratio, 4),
+                    "name_speakers_video_ratio": round(video_ratio, 4),
+                    "name_speakers_transcript_font_size": max(
+                        self._TRANSCRIPT_FONT_MIN,
+                        min(self._TRANSCRIPT_FONT_MAX, font_size),
+                    ),
+                },
             )
             atomic_write_yaml(conf_path(), cfg)
-            self._preview_video_ratio = ratio
+            self._workspace_left_ratio = left_ratio
+            self._preview_video_ratio = video_ratio
         except Exception:
             pass
 
@@ -1978,6 +2866,7 @@ class NamingDialog(tk.Toplevel):
     def _seek_embedded_video(self, seconds):
         if self._vlc_player is None or self._loaded_video_path is None:
             return
+        self._cancel_pending_apply_player_restore()
         try:
             duration_ms = max(0, int(self._vlc_player.get_length()))
             target_ms = max(0, int(float(seconds) * 1000))
@@ -2003,8 +2892,13 @@ class NamingDialog(tk.Toplevel):
 
     def _video_play_pause(self):
         if self._vlc_player is None or self._loaded_video_path is None:
-            messagebox.showinfo("Video Preview", "Load a video from a transcript hit first.", parent=self)
+            messagebox.showinfo(
+                "Video Preview",
+                "Load a video from a transcript hit first.",
+                parent=self.winfo_toplevel(),
+            )
             return
+        self._cancel_pending_apply_player_restore()
         try:
             if self._vlc_player.is_playing():
                 self._vlc_player.pause()
@@ -2017,7 +2911,11 @@ class NamingDialog(tk.Toplevel):
                 self._schedule_selected_subtitle_after_play()
                 self._schedule_word_synchronization()
         except Exception as exc:
-            messagebox.showerror("Video Preview", f"Could not control playback:\n{exc}", parent=self)
+            messagebox.showerror(
+                "Video Preview",
+                f"Could not control playback:\n{exc}",
+                parent=self.winfo_toplevel(),
+            )
 
     def _video_back(self):
         if self._vlc_player is None:
@@ -2038,6 +2936,7 @@ class NamingDialog(tk.Toplevel):
         self._seek_embedded_video(current + 5.0)
 
     def _video_stop(self):
+        self._cancel_pending_apply_player_restore()
         self._cancel_word_synchronization()
         self._clear_current_word()
         self._reset_interpolated_playback_clock()
@@ -2058,6 +2957,7 @@ class NamingDialog(tk.Toplevel):
     def _video_volume_changed(self, _value=None):
         if self._vlc_player is None:
             return
+        self._cancel_pending_apply_player_restore()
         try:
             volume = max(0, min(100, int(round(self.video_volume_var.get()))))
             self._vlc_player.audio_set_volume(volume)
@@ -2072,7 +2972,17 @@ class NamingDialog(tk.Toplevel):
                 pass
             self._pending_subtitle_after = None
 
+    def _cancel_pending_apply_player_restore(self):
+        if self._apply_player_restore_after is None:
+            return
+        try:
+            self.after_cancel(self._apply_player_restore_after)
+        except (AttributeError, tk.TclError):
+            pass
+        self._apply_player_restore_after = None
+
     def _subtitle_selection_changed(self, _event=None):
+        self._cancel_pending_apply_player_restore()
         self._cancel_pending_subtitle_apply()
         self._apply_selected_subtitle(preserve_state=True)
 
@@ -2092,6 +3002,172 @@ class NamingDialog(tk.Toplevel):
         except Exception:
             was_paused = False
         return current_ms, was_playing, was_paused
+
+    def _vlc_may_lock_apply_targets(self, target_paths):
+        if (
+            self._player_closing
+            or self._vlc_player is None
+            or self._vlc_media is None
+            or self._loaded_video_path is None
+        ):
+            return False
+        target_keys = {
+            os.path.normcase(str(Path(path).resolve())) for path in target_paths
+        }
+        subtitle_keys = {
+            os.path.normcase(str(path.resolve()))
+            for _choice, path in self._subtitle_file_candidates()
+        }
+        return bool(target_keys & subtitle_keys)
+
+    def _detach_embedded_player_for_apply(self):
+        player = self._vlc_player
+        media = self._vlc_media
+        if player is None or media is None or self._loaded_video_path is None:
+            return None
+
+        playback_snapshot = self._subtitle_playback_snapshot() or (0, False, False)
+        try:
+            volume = int(player.audio_get_volume())
+            if volume < 0:
+                raise ValueError
+        except Exception:
+            volume = int(round(self.video_volume_var.get()))
+        snapshot = {
+            "player": player,
+            "video_path": Path(self._loaded_video_path),
+            "current_ms": playback_snapshot[0],
+            "was_playing": playback_snapshot[1],
+            "was_paused": playback_snapshot[2],
+            "volume": max(0, min(100, volume)),
+            "subtitle_choice": self.subtitle_var.get() or "Off",
+            "detached": False,
+        }
+
+        self._cancel_pending_apply_player_restore()
+        self._cancel_pending_video_seek()
+        self._cancel_pending_subtitle_apply()
+        self._cancel_word_synchronization()
+        self._reset_interpolated_playback_clock()
+        try:
+            player.stop()
+        except Exception:
+            pass
+        try:
+            player.set_media(None)
+            snapshot["detached"] = True
+            self._vlc_media = None
+            self._subtitle_track_ids.clear()
+            self._applied_subtitle_choice = None
+            try:
+                media.release()
+            except Exception:
+                pass
+        except Exception:
+            self._restore_embedded_player_after_apply(snapshot)
+            raise RuntimeError(
+                "VLC could not release the active subtitle file before Apply."
+            )
+        return snapshot
+
+    def _schedule_apply_player_state_restore(self, snapshot):
+        self._cancel_pending_apply_player_restore()
+        first_update = True
+
+        def restore_state(remaining):
+            nonlocal first_update
+            self._apply_player_restore_after = None
+            player = snapshot["player"]
+            if (
+                self._player_closing
+                or self._vlc_player is not player
+                or self._loaded_video_path is None
+            ):
+                return
+            pending_media_work = (
+                self._pending_seek_after is not None
+                or self._pending_subtitle_after is not None
+            )
+            final_update = not pending_media_work or remaining <= 0
+            try:
+                volume = snapshot["volume"]
+                self.video_volume_var.set(volume)
+                player.audio_set_volume(volume)
+                if first_update or final_update:
+                    target_ms = max(0, int(snapshot["current_ms"]))
+                    duration_ms = max(0, int(player.get_length()))
+                    if duration_ms > 0:
+                        target_ms = min(target_ms, duration_ms)
+                    player.set_time(target_ms)
+                is_playing = bool(player.is_playing())
+                if snapshot["was_paused"]:
+                    if is_playing:
+                        player.pause()
+                    self.btn_video_play.configure(text="Play")
+                elif snapshot["was_playing"]:
+                    if not is_playing:
+                        player.play()
+                    self.btn_video_play.configure(text="Pause")
+                elif final_update:
+                    player.stop()
+                    player.set_time(max(0, int(snapshot["current_ms"])))
+                    self.btn_video_play.configure(text="Play")
+                self._reset_interpolated_playback_clock(
+                    max(0.0, snapshot["current_ms"] / 1000.0)
+                )
+            except Exception:
+                pass
+            first_update = False
+            if pending_media_work and remaining > 0:
+                try:
+                    self._apply_player_restore_after = self.after(
+                        100,
+                        lambda: restore_state(remaining - 1),
+                    )
+                except tk.TclError:
+                    self._apply_player_restore_after = None
+            else:
+                self._schedule_word_synchronization()
+
+        try:
+            self._apply_player_restore_after = self.after(
+                100,
+                lambda: restore_state(30),
+            )
+        except tk.TclError:
+            self._apply_player_restore_after = None
+
+    def _restore_embedded_player_after_apply(self, snapshot):
+        if snapshot is None:
+            return
+        player = snapshot["player"]
+        if self._player_closing or self._vlc_player is not player:
+            return
+        try:
+            self.video_volume_var.set(snapshot["volume"])
+            self.refresh_available_subtitles()
+            choice = snapshot["subtitle_choice"]
+            self.subtitle_var.set(
+                choice if choice in self._subtitle_choices else "Off"
+            )
+            if snapshot["detached"]:
+                self._load_embedded_video(
+                    snapshot["video_path"],
+                    max(0.0, snapshot["current_ms"] / 1000.0),
+                )
+            else:
+                try:
+                    player.play()
+                except Exception:
+                    pass
+            self._schedule_apply_player_state_restore(snapshot)
+        except Exception as exc:
+            messagebox.showwarning(
+                "Video Preview",
+                "Apply finished, but the embedded video preview could not be fully restored:\n"
+                f"{exc}",
+                parent=self.winfo_toplevel(),
+            )
 
     def _restore_subtitle_playback_state(self, snapshot):
         if snapshot is None or self._vlc_player is None or self._player_closing:
@@ -2118,6 +3194,40 @@ class NamingDialog(tk.Toplevel):
                 pass
         self._applied_subtitle_choice = "Off"
 
+    def _subtitle_file_candidates(self):
+        subtitle_title = self.segments_data.get("title") or self.speakers_json.parent.name
+        output_dir = self.speakers_json.parent
+        return (
+            ("SRT", output_dir / f"{subtitle_title}.srt"),
+            ("ASS (plain)", output_dir / f"{subtitle_title}.plain.ass"),
+            ("ASS (word highlighting)", output_dir / f"{subtitle_title}.words.ass"),
+        )
+
+    def _discover_subtitle_files(self):
+        candidates = self._subtitle_file_candidates()
+        paths = {label: path for label, path in candidates if path.is_file()}
+        choices = ["Off"] + [label for label, _path in candidates if label in paths]
+        return paths, choices
+
+    def refresh_available_subtitles(self):
+        """Rediscover generated subtitle files without disturbing player state."""
+        previous_choice = self.subtitle_var.get() or "Off"
+        previous_paths = self._subtitle_paths
+        self._subtitle_paths, self._subtitle_choices = self._discover_subtitle_files()
+        self.subtitle_selector.configure(values=self._subtitle_choices)
+        if previous_choice in self._subtitle_choices:
+            self.subtitle_var.set(previous_choice)
+            return
+        if previous_choice != "Off":
+            missing_path = previous_paths.get(previous_choice) or "the selected subtitle file"
+            self._report_subtitle_failure(
+                previous_choice,
+                f"The subtitle file is no longer available:\n{missing_path}\n\nVideo playback will continue without subtitles.",
+            )
+            return
+        self.subtitle_var.set("Off")
+        self._set_subtitles_off()
+
     def _report_subtitle_failure(self, choice, message, remove_choice=False):
         self._subtitle_track_ids.pop(choice, None)
         self._set_subtitles_off()
@@ -2131,7 +3241,11 @@ class NamingDialog(tk.Toplevel):
             ]
             self.subtitle_selector.configure(values=self._subtitle_choices)
         if not self._player_closing:
-            messagebox.showwarning("Video subtitles", message, parent=self)
+            messagebox.showwarning(
+                "Video subtitles",
+                message,
+                parent=self.winfo_toplevel(),
+            )
 
     def _available_vlc_subtitle_track_ids(self):
         track_ids = set()
@@ -2291,6 +3405,7 @@ class NamingDialog(tk.Toplevel):
         if self._vlc_player is None or self._vlc_instance is None:
             raise RuntimeError(self._vlc_status.get("reason") or "Embedded VLC playback is unavailable.")
 
+        self._cancel_pending_apply_player_restore()
         video_path = Path(video_path).resolve()
         if not video_path.is_file():
             raise FileNotFoundError(f"Video file not found: {video_path}")
@@ -2328,10 +3443,11 @@ class NamingDialog(tk.Toplevel):
         self._schedule_selected_subtitle_after_play()
         self._schedule_word_synchronization()
 
-    def _release_embedded_player(self):
+    def _release_embedded_player(self, *, save_view_preferences=True):
         if self._player_closing:
             return
-        self._save_name_speakers_view_preferences()
+        if save_view_preferences:
+            self._save_name_speakers_view_preferences()
         self._player_closing = True
         self._cancel_pending_preview_ratio()
         self._cancel_word_synchronization()
@@ -2339,6 +3455,13 @@ class NamingDialog(tk.Toplevel):
         self._reset_interpolated_playback_clock()
         self._cancel_pending_video_seek()
         self._cancel_pending_subtitle_apply()
+        self._cancel_pending_apply_player_restore()
+        if self._video_reattach_after is not None:
+            try:
+                self.after_cancel(self._video_reattach_after)
+            except (AttributeError, tk.TclError):
+                pass
+            self._video_reattach_after = None
         if self._video_update_after is not None:
             try:
                 self.after_cancel(self._video_update_after)
@@ -2364,16 +3487,280 @@ class NamingDialog(tk.Toplevel):
             except Exception:
                 pass
 
-    def destroy(self):
-        self._release_embedded_player()
+    def _suspend_embedded_player_for_replacement(self):
+        """Release the old player for a one-player-at-a-time workspace handoff."""
+        player = self._vlc_player
+        media = self._vlc_media
+        playback_snapshot = self._subtitle_playback_snapshot()
         try:
-            super().destroy()
-        except tk.TclError:
+            volume = int(player.audio_get_volume()) if player is not None else int(
+                round(self.video_volume_var.get())
+            )
+            if volume < 0:
+                raise ValueError
+        except Exception:
+            volume = int(round(self.video_volume_var.get()))
+        snapshot = {
+            "had_player": player is not None,
+            "video_path": Path(self._loaded_video_path) if self._loaded_video_path else None,
+            "current_ms": playback_snapshot[0] if playback_snapshot else 0,
+            "was_playing": playback_snapshot[1] if playback_snapshot else False,
+            "was_paused": playback_snapshot[2] if playback_snapshot else False,
+            "volume": max(0, min(100, volume)),
+            "subtitle_choice": self.subtitle_var.get() or "Off",
+            "pane_ratio_pending": self._preview_ratio_after is not None,
+        }
+
+        self._cancel_pending_preview_ratio()
+        self._cancel_word_synchronization()
+        self._cancel_pending_video_seek()
+        self._cancel_pending_subtitle_apply()
+        self._cancel_pending_apply_player_restore()
+        if self._video_reattach_after is not None:
+            try:
+                self.after_cancel(self._video_reattach_after)
+            except (AttributeError, tk.TclError):
+                pass
+            self._video_reattach_after = None
+        if self._video_update_after is not None:
+            try:
+                self.after_cancel(self._video_update_after)
+            except (AttributeError, tk.TclError):
+                pass
+            self._video_update_after = None
+
+        self._vlc_player = None
+        self._vlc_media = None
+        if player is not None:
+            try:
+                player.stop()
+            except Exception:
+                pass
+            try:
+                player.release()
+            except Exception:
+                pass
+        if media is not None:
+            try:
+                media.release()
+            except Exception:
+                pass
+        return snapshot
+
+    def _resume_after_failed_replacement(self, snapshot):
+        """Best-effort restoration after a replacement could not be activated."""
+        if self._player_closing:
+            return False, "The previous Review workspace is already closing."
+        if snapshot.get("pane_ratio_pending") and not self._preview_ratio_applied:
+            self._schedule_initial_pane_ratios()
+        if not snapshot.get("had_player"):
+            return True, None
+
+        try:
+            self._initialize_embedded_player()
+            if self._vlc_player is None:
+                reason = self._vlc_status.get("reason") or "Embedded VLC could not be restarted."
+                return False, reason
+
+            volume = snapshot["volume"]
+            self.video_volume_var.set(volume)
+            self._vlc_player.audio_set_volume(volume)
+            selected_subtitle = snapshot["subtitle_choice"]
+            self.subtitle_var.set(
+                selected_subtitle
+                if selected_subtitle in self._subtitle_choices
+                else "Off"
+            )
+            video_path = snapshot.get("video_path")
+            if video_path is not None:
+                if not video_path.is_file():
+                    return False, f"The previously loaded video is no longer available: {video_path}"
+                self._load_embedded_video(
+                    video_path,
+                    max(0.0, snapshot["current_ms"] / 1000.0),
+                )
+                restored_snapshot = dict(snapshot)
+                restored_snapshot["player"] = self._vlc_player
+                self._schedule_apply_player_state_restore(restored_snapshot)
+            return True, None
+        except Exception as exc:
+            return False, str(exc)
+
+    def shutdown(self, *, save_view_preferences=True):
+        self._remove_dirty_tracking()
+        self._release_embedded_player(
+            save_view_preferences=save_view_preferences,
+        )
+
+    def _on_workspace_destroyed(self, event):
+        if event.widget is self:
+            self.shutdown()
+
+    def discard_changes(self):
+        if self._on_discard is not None:
+            self._on_discard()
+
+    def _review_option_variables(self):
+        return (
+            ("overwrite", self.var_overwrite),
+            ("rename_audio", self.var_rename_audio),
+            ("export_vtt", self.var_export_vtt),
+            ("export_ass", self.var_export_ass),
+            ("export_html", self.var_export_html),
+            ("export_lrc", self.var_export_lrc),
+            ("export_ass_plain", self.var_export_ass_plain),
+        )
+
+    def _review_state_snapshot(self):
+        return {
+            "names": {
+                speaker: self.inputs[speaker].get().strip()
+                for speaker in self.speakers
+            },
+            "candidate_pool": tuple(
+                self.name_pool.get(index) for index in range(self.name_pool.size())
+            ),
+            "segments": copy.deepcopy(self.segments),
+            "options": {
+                name: bool(variable.get())
+                for name, variable in self._review_option_variables()
+            },
+        }
+
+    def _set_dirty_indicator(self, dirty):
+        if not hasattr(self, "lbl_dirty_status"):
+            return
+        self.lbl_dirty_status.configure(
+            text="Unsaved changes" if dirty else "Saved",
+            bootstyle="warning" if dirty else "success",
+        )
+        self.btn_revert.configure(state="normal" if dirty else "disabled")
+
+    def _update_dirty_state(self, *_):
+        if self._dirty_tracking_suspended or self._clean_baseline is None:
+            return False
+        dirty = self._review_state_snapshot() != self._clean_baseline
+        if not dirty:
+            self.manual_corrections_pending = False
+        self._set_dirty_indicator(dirty)
+        return dirty
+
+    def has_unsaved_changes(self):
+        return self._update_dirty_state()
+
+    def _capture_clean_baseline(self):
+        self._clean_baseline = self._review_state_snapshot()
+        self.manual_corrections_pending = False
+        self._set_dirty_indicator(False)
+
+    def _install_dirty_tracking(self):
+        variables = list(self.name_vars.values()) + [
+            variable for _name, variable in self._review_option_variables()
+        ]
+        for variable in variables:
+            trace_id = variable.trace_add("write", self._update_dirty_state)
+            self._dirty_trace_ids.append((variable, trace_id))
+
+    def _remove_dirty_tracking(self):
+        traces = self._dirty_trace_ids
+        self._dirty_trace_ids = []
+        for variable, trace_id in traces:
+            try:
+                variable.trace_remove("write", trace_id)
+            except (AttributeError, tk.TclError):
+                pass
+
+    def _preflight_current_disk_result(self, action_label):
+        try:
+            result_preflight = _preflight_review_result(
+                self.speakers_json,
+                self.segments_json,
+            )
+        except Exception as exc:
+            messagebox.showwarning(
+                f"Cannot {action_label}",
+                "The review files are no longer available or valid:\n"
+                f"{exc}\n\nNo review files were changed.",
+                parent=self.winfo_toplevel(),
+            )
+            return None
+        if result_preflight.identity != self.result_identity:
+            messagebox.showwarning(
+                f"Cannot {action_label}",
+                "This transcription result was regenerated after it was loaded. "
+                "The current in-memory review is now an older revision and cannot be written safely.\n\n"
+                "Open the pending result and review the newly generated transcript before applying changes.",
+                parent=self.winfo_toplevel(),
+            )
+            return None
+        return result_preflight
+
+    def _refresh_result_identity_after_own_write(self):
+        try:
+            self.result_identity = _preflight_review_result(
+                self.speakers_json,
+                self.segments_json,
+            ).identity
+        except Exception:
             pass
 
-    def _on_dialog_destroyed(self, event):
-        if event.widget is self:
-            self._release_embedded_player()
+    def revert_unsaved_changes(self):
+        if not self.has_unsaved_changes():
+            return True
+        if not messagebox.askyesno(
+            "Revert unsaved changes",
+            "Discard all unsaved speaker names, candidate-pool changes, segment corrections, and output-option changes?",
+            parent=self.winfo_toplevel(),
+        ):
+            return False
+
+        playback_snapshot = self._subtitle_playback_snapshot()
+        try:
+            transcript_scroll = self.text.yview()[0]
+        except (AttributeError, IndexError, tk.TclError):
+            transcript_scroll = None
+        baseline = copy.deepcopy(self._clean_baseline)
+        result_preflight = self._preflight_current_disk_result("revert")
+        if result_preflight is None:
+            return False
+        speakers_data = result_preflight.speakers_data
+        segments_data = result_preflight.segments_data
+        disk_names = dict(
+            speakers_data.get("names") or speakers_data.get("name_map") or {}
+        )
+        disk_segments = copy.deepcopy(segments_data.get("segments") or [])
+
+        self._dirty_tracking_suspended = True
+        try:
+            try:
+                self.saved_names = disk_names
+                self.segments_data = copy.deepcopy(segments_data)
+                self.segments = disk_segments
+                for speaker in self.speakers:
+                    self.inputs[speaker].set(str(disk_names.get(speaker, "") or ""))
+                self.name_pool.delete(0, "end")
+                for name in baseline["candidate_pool"]:
+                    self.name_pool.insert("end", name)
+                option_values = baseline["options"]
+                for name, variable in self._review_option_variables():
+                    variable.set(bool(option_values[name]))
+                self.manual_corrections_pending = False
+                self.result_identity = result_preflight.identity
+                self._refresh_transcript_preview()
+                if transcript_scroll is not None:
+                    self.text.yview_moveto(transcript_scroll)
+                self._restore_subtitle_playback_state(playback_snapshot)
+                self._capture_clean_baseline()
+            except Exception as exc:
+                messagebox.showerror(
+                    "Revert failed",
+                    f"Could not restore the saved review state:\n{exc}",
+                    parent=self.winfo_toplevel(),
+                )
+                return False
+        finally:
+            self._dirty_tracking_suspended = False
+        return True
 
     def _current_name_mapping(self):
         return {
@@ -2384,31 +3771,31 @@ class NamingDialog(tk.Toplevel):
 
     def open_segment_corrections(self):
         if not self.segments:
-            messagebox.showinfo("No transcript segments", "There are no transcript segments to review.", parent=self)
+            messagebox.showinfo(
+                "No transcript segments",
+                "There are no transcript segments to review.",
+                parent=self.winfo_toplevel(),
+            )
             return
+        owner = self.winfo_toplevel()
         dialog = SegmentCorrectionDialog(
-            self,
+            owner,
             self.segments,
             self.speakers,
             self._current_name_mapping(),
         )
-        self.wait_window(dialog)
+        owner.wait_window(dialog)
         if dialog.result is None:
             return
         self.segments = dialog.result
         self.manual_corrections_pending = dialog.changed or self.manual_corrections_pending
         self._refresh_transcript_preview()
+        self._update_dirty_state()
 
     def _configure_transcript_word_tags(self):
-        try:
-            style = tb.Style.get_instance() or tb.Style()
-            hover_color = style.colors.primary
-            current_background = style.colors.primary
-            current_foreground = style.colors.get_foreground("primary")
-        except Exception:
-            hover_color = "#0d6efd"
-            current_background = "#0d6efd"
-            current_foreground = "#ffffff"
+        hover_color = MIDNIGHTSTUDIO_THEME_COLORS["primary"]
+        current_background = MIDNIGHTSTUDIO_TOKENS["playback_word_bg"]
+        current_foreground = MIDNIGHTSTUDIO_TOKENS["playback_word_fg"]
         self._transcript_default_cursor = self.text.cget("cursor") or "xterm"
         self.text.tag_configure("clickable_word")
         self.text.tag_configure("hover_word", foreground=hover_color, underline=True)
@@ -2867,11 +4254,15 @@ class NamingDialog(tk.Toplevel):
     def _play_timed_word(self, record):
         if self._vlc_player is None or self._vlc_instance is None:
             reason = self._vlc_status.get("reason") or "Embedded VLC playback is unavailable."
-            messagebox.showinfo("Video Preview", reason, parent=self)
+            messagebox.showinfo("Video Preview", reason, parent=self.winfo_toplevel())
             return
         video_path, unavailable_reason = self._video_path_for_timed_word()
         if video_path is None:
-            messagebox.showinfo("Video Preview", unavailable_reason, parent=self)
+            messagebox.showinfo(
+                "Video Preview",
+                unavailable_reason,
+                parent=self.winfo_toplevel(),
+            )
             return
         try:
             self._enable_transcript_following()
@@ -2882,7 +4273,11 @@ class NamingDialog(tk.Toplevel):
             self._load_embedded_video(video_path, max(0.0, float(record["media_start"])))
         except Exception as exc:
             self._rebase_interpolated_playback_clock_from_player()
-            messagebox.showwarning("Video Preview", f"Could not play the selected word:\n{exc}", parent=self)
+            messagebox.showwarning(
+                "Video Preview",
+                f"Could not play the selected word:\n{exc}",
+                parent=self.winfo_toplevel(),
+            )
 
     def _on_clickable_word_click(self, event):
         record = self._word_record_at_event(event)
@@ -2932,7 +4327,20 @@ class NamingDialog(tk.Toplevel):
                 lines.append(transcript)
         return "\n".join(lines)
 
-    def _refresh_transcript_preview(self):
+    def _refresh_transcript_preview(self, *, preserve_view=False):
+        transcript_scroll = None
+        active_word_key = None
+        if preserve_view:
+            try:
+                transcript_scroll = self.text.yview()[0]
+            except (AttributeError, IndexError, tk.TclError):
+                pass
+            active_word = self._word_tag_to_record.get(self._current_word_tag)
+            if active_word is not None:
+                active_word_key = (
+                    active_word["segment_index"],
+                    active_word["word_index"],
+                )
         restart_synchronization = (
             not self._player_closing
             and self._vlc_player is not None
@@ -2943,6 +4351,25 @@ class NamingDialog(tk.Toplevel):
         self._render_transcript_preview()
         query = self.find_var.get().strip() if hasattr(self, "find_var") else ""
         self._highlight_query(query)
+        if active_word_key is not None:
+            replacement_word = next(
+                (
+                    record
+                    for record in self._word_records
+                    if (
+                        record["segment_index"],
+                        record["word_index"],
+                    )
+                    == active_word_key
+                ),
+                None,
+            )
+            self._set_current_word(replacement_word)
+        if transcript_scroll is not None:
+            try:
+                self.text.yview_moveto(transcript_scroll)
+            except (AttributeError, tk.TclError):
+                pass
         if restart_synchronization:
             self._schedule_word_synchronization()
 
@@ -2982,7 +4409,11 @@ class NamingDialog(tk.Toplevel):
 
     def _reset_highlight(self):
         self.text.tag_delete("find")
-        self.text.tag_configure("find", background="#fff59d")
+        self.text.tag_configure(
+            "find",
+            background=MIDNIGHTSTUDIO_TOKENS["find_match_bg"],
+            foreground=MIDNIGHTSTUDIO_TOKENS["find_match_fg"],
+        )
         self.text.tag_raise("current_word")
 
     def _highlight_query(self, query: str):
@@ -3030,31 +4461,52 @@ class NamingDialog(tk.Toplevel):
         if self.txt_path and self.txt_path.exists():
             os.startfile(str(self.txt_path))
         else:
-            messagebox.showinfo("No .txt file", "Transcript .txt not found on disk; showing generated preview only.")
+            messagebox.showinfo(
+                "No .txt file",
+                "Transcript .txt not found on disk; showing generated preview only.",
+                parent=self.winfo_toplevel(),
+            )
 
     def _select_srt_hit_for_preview(self):
         query = (self.find_var.get() if hasattr(self, "find_var") else "").strip()
         if not query:
-            messagebox.showinfo("Jump by SRT", "Type something in the Find box first, then try again.")
+            messagebox.showinfo(
+                "Jump by SRT",
+                "Type something in the Find box first, then try again.",
+                parent=self.winfo_toplevel(),
+            )
             return None
         out_dir = self.speakers_json.parent
         srt_path = out_dir / f"{self.title_name}.srt"
         if not srt_path.exists():
-            messagebox.showinfo("Jump by SRT", f"SRT not found:\n{srt_path.name}\n\nRun transcription first or enable SRT output.")
+            messagebox.showinfo(
+                "Jump by SRT",
+                f"SRT not found:\n{srt_path.name}\n\nRun transcription first or enable SRT output.",
+                parent=self.winfo_toplevel(),
+            )
             return None
         try:
             segments = parse_srt_segments(srt_path)
         except Exception as exc:
-            messagebox.showerror("Jump by SRT", f"Could not read SRT:\n{exc}")
+            messagebox.showerror(
+                "Jump by SRT",
+                f"Could not read SRT:\n{exc}",
+                parent=self.winfo_toplevel(),
+            )
             return None
         hits = find_segments_matching_query(segments, query)
         if not hits:
-            messagebox.showinfo("Jump by SRT", f"No SRT lines matched:\n\"{query}\"")
+            messagebox.showinfo(
+                "Jump by SRT",
+                f"No SRT lines matched:\n\"{query}\"",
+                parent=self.winfo_toplevel(),
+            )
             return None
         if len(hits) == 1:
             return srt_path, hits[0]
-        dialog = _SrtHitsDialog(self, hits)
-        self.wait_window(dialog)
+        owner = self.winfo_toplevel()
+        dialog = _SrtHitsDialog(owner, hits)
+        owner.wait_window(dialog)
         if dialog.result is None:
             return None
         return srt_path, dialog.result
@@ -3068,6 +4520,7 @@ class NamingDialog(tk.Toplevel):
         if video_path:
             return Path(video_path)
         selected = filedialog.askopenfilename(
+            parent=self.winfo_toplevel(),
             title=f"Locate original video for {self.title_name}",
             filetypes=[("Video files", "*.mp4 *.mkv *.mov *.avi *.webm *.m4v"), ("All Files", "*.*")],
         )
@@ -3083,6 +4536,7 @@ class NamingDialog(tk.Toplevel):
                 jump_video_to_srt_time(srt_path, start, vlc_path=vlc_path)
             except FileNotFoundError:
                 video_path = filedialog.askopenfilename(
+                    parent=self.winfo_toplevel(),
                     title=f"Locate original video for {self.title_name}",
                     filetypes=[("Video files", "*.mp4 *.mkv *.mov *.avi *.webm *.m4v"), ("All Files", "*.*")],
                 )
@@ -3092,7 +4546,11 @@ class NamingDialog(tk.Toplevel):
                 if not _open_in_vlc(video_path, start, vlc_path=vlc_path):
                     _open_in_ffplay(video_path, start)
         except Exception as exc:
-            messagebox.showerror("Jump by SRT", f"Failed to open player:\n{exc}")
+            messagebox.showerror(
+                "Jump by SRT",
+                f"Failed to open player:\n{exc}",
+                parent=self.winfo_toplevel(),
+            )
 
     def preview_video_at_query(self):
         selected_hit = self._select_srt_hit_for_preview()
@@ -3104,7 +4562,7 @@ class NamingDialog(tk.Toplevel):
             if messagebox.askyesno(
                 "Embedded video unavailable",
                 f"{reason}\n\nOpen this hit in the external video player instead?",
-                parent=self,
+                parent=self.winfo_toplevel(),
             ):
                 self._open_selected_hit_externally(srt_path, chosen)
             return
@@ -3115,30 +4573,51 @@ class NamingDialog(tk.Toplevel):
             start = max(0.0, float(chosen["start"]))
             self._load_embedded_video(video_path, start)
         except Exception as exc:
-            messagebox.showerror("Video Preview", f"Failed to preview video:\n{exc}", parent=self)
+            messagebox.showerror(
+                "Video Preview",
+                f"Failed to preview video:\n{exc}",
+                parent=self.winfo_toplevel(),
+            )
 
     def open_video_at_query(self):
         query = (self.find_var.get() if hasattr(self, "find_var") else "").strip()
         if not query:
-            messagebox.showinfo("Jump by SRT", "Type something in the Find box first, then try again.")
+            messagebox.showinfo(
+                "Jump by SRT",
+                "Type something in the Find box first, then try again.",
+                parent=self.winfo_toplevel(),
+            )
             return
         out_dir = self.speakers_json.parent
         srt_path = out_dir / f"{self.title_name}.srt"
         if not srt_path.exists():
-            messagebox.showinfo("Jump by SRT", f"SRT not found:\n{srt_path.name}\n\nRun transcription first or enable SRT output.")
+            messagebox.showinfo(
+                "Jump by SRT",
+                f"SRT not found:\n{srt_path.name}\n\nRun transcription first or enable SRT output.",
+                parent=self.winfo_toplevel(),
+            )
             return
         try:
             segs = parse_srt_segments(srt_path)
         except Exception as e:
-            messagebox.showerror("Jump by SRT", f"Could not read SRT:\n{e}")
+            messagebox.showerror(
+                "Jump by SRT",
+                f"Could not read SRT:\n{e}",
+                parent=self.winfo_toplevel(),
+            )
             return
         hits = find_segments_matching_query(segs, query)
         if not hits:
-            messagebox.showinfo("Jump by SRT", f"No SRT lines matched:\n“{query}”")
+            messagebox.showinfo(
+                "Jump by SRT",
+                f"No SRT lines matched:\n“{query}”",
+                parent=self.winfo_toplevel(),
+            )
             return
         if len(hits) > 1:
-            dlg = _SrtHitsDialog(self, hits)
-            self.wait_window(dlg)
+            owner = self.winfo_toplevel()
+            dlg = _SrtHitsDialog(owner, hits)
+            owner.wait_window(dlg)
             if not dlg.result:
                 return
             chosen = dlg.result
@@ -3157,6 +4636,7 @@ class NamingDialog(tk.Toplevel):
             except FileNotFoundError:
                 # If automatic fails, ask user to point to file
                 vid = filedialog.askopenfilename(
+                    parent=self.winfo_toplevel(),
                     title=f"Locate original video for {self.title_name}",
                     filetypes=[("Video files", "*.mp4 *.mkv *.mov *.avi *.webm *.m4v"), ("All Files", "*.*")]
                 )
@@ -3168,7 +4648,11 @@ class NamingDialog(tk.Toplevel):
                 else:
                     return # User cancelled
         except Exception as e:
-            messagebox.showerror("Jump by SRT", f"Failed to open player:\n{e}")
+            messagebox.showerror(
+                "Jump by SRT",
+                f"Failed to open player:\n{e}",
+                parent=self.winfo_toplevel(),
+            )
             return
 
     def _prefill_first_two(self, per_spk_counts: dict, global_counts: list, title_counts: list):
@@ -3231,31 +4715,221 @@ class NamingDialog(tk.Toplevel):
                     except:
                         pass
 
-    def on_apply(self):
-        mapping = self._current_name_mapping()
+    @staticmethod
+    def _write_apply_json(path, data):
+        path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _write_apply_yaml(path, data):
+        with path.open("w", encoding="utf-8", newline="\n") as output_file:
+            yaml.safe_dump(
+                data,
+                output_file,
+                sort_keys=False,
+                allow_unicode=True,
+            )
+
+    @staticmethod
+    def _write_apply_srt(path, segments, mapping):
+        with path.open("w", encoding="utf-8", newline="\n") as output_file:
+            for index, segment in enumerate(segments, 1):
+                start = float(segment.get("start", 0.0))
+                end = float(segment.get("end", start))
+                text = str(segment.get("text", "")).strip()
+                speaker = segment.get("speaker")
+                display = mapping.get(speaker, speaker) if speaker else text
+                line = f"{display}: {text}" if speaker else text
+                output_file.write(str(index))
+                output_file.write("\n")
+                output_file.write(f"{srt_timestamp(start)} --> {srt_timestamp(end)}")
+                output_file.write("\n")
+                output_file.write(line)
+                output_file.write("\n\n")
+
+    @staticmethod
+    def _write_apply_txt(path, segments, mapping):
+        diarized = any((segment.get("speaker") or "") for segment in segments)
+        with path.open("w", encoding="utf-8", newline="\n") as output_file:
+            if diarized:
+                last_speaker = None
+                buffered_text = []
+
+                def flush():
+                    nonlocal buffered_text, last_speaker
+                    if not buffered_text or last_speaker is None:
+                        return
+                    text = " ".join(buffered_text).strip()
+                    if text:
+                        output_file.write(
+                            f"{mapping.get(last_speaker, last_speaker)}: {text}\n"
+                        )
+                    buffered_text = []
+
+                for segment in segments:
+                    text = str(segment.get("text", "")).strip()
+                    if not text:
+                        continue
+                    speaker = segment.get("speaker") or "SPEAKER_00"
+                    if speaker != last_speaker and last_speaker is not None:
+                        flush()
+                    last_speaker = speaker
+                    buffered_text.append(text)
+                flush()
+            else:
+                all_text = " ".join(
+                    str(segment.get("text", "")).strip()
+                    for segment in segments
+                    if segment.get("text")
+                ).strip()
+                if all_text:
+                    output_file.write(all_text + "\n")
+
+    @staticmethod
+    def _validate_staged_apply_file(path, output_kind, expected_data=None):
+        if not path.is_file():
+            raise RuntimeError(f"Staged {output_kind} output was not created.")
+        with path.open("r+b") as staged_file:
+            raw = staged_file.read()
+            staged_file.flush()
+            os.fsync(staged_file.fileno())
         try:
-            _spk = json.loads(self.speakers_json.read_text(encoding='utf-8'))
-            _spk['names'] = mapping
-            self.speakers_json.write_text(json.dumps(_spk, ensure_ascii=False, indent=2), encoding='utf-8')
-        except:
-            pass
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RuntimeError(f"Staged {output_kind} output is not valid UTF-8.") from exc
+
+        if output_kind == "json":
+            parsed = json.loads(text)
+            if not isinstance(parsed, dict):
+                raise RuntimeError("Staged JSON output must contain a top-level object.")
+            if expected_data is not None and parsed != expected_data:
+                raise RuntimeError("Staged JSON output did not preserve the expected data.")
+        elif output_kind == "yaml":
+            parsed = yaml.safe_load(text)
+            if not isinstance(parsed, dict):
+                raise RuntimeError("Staged YAML output must contain a top-level mapping.")
+            if expected_data is not None and parsed != expected_data:
+                raise RuntimeError("Staged YAML output did not preserve the expected data.")
+        elif output_kind == "vtt" and not text.startswith("WEBVTT\n"):
+            raise RuntimeError("Staged VTT output is missing its WEBVTT header.")
+        elif output_kind == "ass" and (
+            "[Script Info]" not in text or "[Events]" not in text
+        ):
+            raise RuntimeError("Staged ASS output is missing required sections.")
+        elif output_kind == "html" and (
+            "<!doctype html>" not in text.lower() or "</html>" not in text.lower()
+        ):
+            raise RuntimeError("Staged HTML output is incomplete.")
+        elif output_kind == "lrc" and (
+            not text.splitlines() or text.splitlines()[0] != "[re:audiosplitter]"
+        ):
+            raise RuntimeError("Staged LRC output is missing its header.")
+
+    def _stage_apply_file(
+        self,
+        staging_dir,
+        staged_files,
+        target_path,
+        output_kind,
+        writer,
+        expected_data=None,
+    ):
+        target_path = Path(target_path).resolve()
+        staged_path = staging_dir / f"{len(staged_files):03d}-{target_path.name}"
+        writer(staged_path)
+        self._validate_staged_apply_file(staged_path, output_kind, expected_data)
+        staged_files.append((target_path, staged_path))
+        return target_path
+
+    def _atomic_replace_staged_apply_file(self, staged_path, target_path):
+        os.replace(staged_path, target_path)
+
+    def _commit_staged_apply_files(self, staging_dir, staged_files):
+        normalized_targets = [os.path.normcase(str(target)) for target, _staged in staged_files]
+        if len(normalized_targets) != len(set(normalized_targets)):
+            raise RuntimeError("The Apply transaction contains duplicate output targets.")
+
+        backup_dir = staging_dir / "backups"
+        backup_dir.mkdir()
+        originals = {}
+        for index, (target_path, _staged_path) in enumerate(staged_files):
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            if target_path.exists():
+                if not target_path.is_file():
+                    raise RuntimeError(f"Apply output target is not a file: {target_path}")
+                backup_path = backup_dir / f"{index:03d}-{target_path.name}"
+                shutil.copy2(target_path, backup_path)
+                originals[target_path] = backup_path
+            else:
+                originals[target_path] = None
+
+        replaced = []
+        try:
+            for target_path, staged_path in staged_files:
+                self._atomic_replace_staged_apply_file(staged_path, target_path)
+                replaced.append(target_path)
+        except Exception as replace_error:
+            rollback_errors = []
+            for target_path in reversed(replaced):
+                backup_path = originals[target_path]
+                try:
+                    if backup_path is None:
+                        target_path.unlink(missing_ok=True)
+                    else:
+                        os.replace(backup_path, target_path)
+                except Exception as rollback_error:
+                    rollback_errors.append(f"{target_path}: {rollback_error}")
+            if rollback_errors:
+                raise RuntimeError(
+                    "Could not commit the staged outputs, and rollback was incomplete: "
+                    + "; ".join(rollback_errors)
+                ) from replace_error
+            raise RuntimeError(
+                f"Could not commit the staged outputs; original files were restored: {replace_error}"
+            ) from replace_error
+
+    def apply_changes(self):
+        if self._preflight_current_disk_result("apply changes") is None:
+            self._update_dirty_state()
+            return False
+        try:
+            applied = self._apply_changes_impl()
+        except Exception as exc:
+            self._refresh_result_identity_after_own_write()
+            messagebox.showerror(
+                "Apply failed",
+                f"Could not finish applying the Review & Name changes:\n{exc}",
+                parent=self.winfo_toplevel(),
+            )
+            self._update_dirty_state()
+            return False
+        if not applied:
+            self._refresh_result_identity_after_own_write()
+        if applied and self._on_apply_complete is not None:
+            self._on_apply_complete()
+        return bool(applied)
+
+    def _apply_changes_impl(self):
+        mapping = self._current_name_mapping()
         if not mapping and not self.manual_corrections_pending:
-            messagebox.showwarning("Nothing to apply", "Please enter at least one name.")
-            return
+            messagebox.showwarning(
+                "Nothing to apply",
+                "Please enter at least one name.",
+                parent=self.winfo_toplevel(),
+            )
+            return False
+
+        current_preflight = self._preflight_current_disk_result("apply changes")
+        if current_preflight is None:
+            return False
+        speakers_data = copy.deepcopy(current_preflight.speakers_data)
+        speakers_data["names"] = mapping
         segments = self.segments
-        seg_data = self.segments_data
+        seg_data = copy.deepcopy(self.segments_data)
         if self.manual_corrections_pending:
-            try:
-                seg_data = _write_corrected_segments_json(
-                    self.segments_json,
-                    self.segments_data,
-                    segments,
-                    create_backup=True,
-                )
-                self.segments_data = seg_data
-            except Exception as e:
-                messagebox.showerror("Save corrections failed", f"Could not update segments.json:\n{e}")
-                return
+            seg_data["segments"] = copy.deepcopy(segments)
         out_dir = self.speakers_json.parent
         title = seg_data.get("title") or out_dir.name
         srt_path = out_dir / f"{title}.srt"
@@ -3266,96 +4940,572 @@ class NamingDialog(tk.Toplevel):
         else:
             srt_tmp = out_dir / f"{title}.named.srt"
             txt_tmp = out_dir / f"{title}.named.txt"
-        with srt_tmp.open("w", encoding="utf-8", newline="\n") as f:
-            for idx, seg in enumerate(segments, 1):
-                start = float(seg.get("start", 0.0))
-                end = float(seg.get("end", start))
-                text = str(seg.get("text", "")).strip()
-                spk = seg.get("speaker")
-                disp = mapping.get(spk, spk) if spk else text
-                line = f"{disp}: {text}" if spk else text
-                f.write(str(idx)); f.write("\n")
-                f.write(f"{srt_timestamp(start)} --> {srt_timestamp(end)}"); f.write("\n")
-                f.write(line); f.write("\n\n")
-        diarized = any((seg.get("speaker") or "") for seg in segments)
-        with txt_tmp.open("w", encoding="utf-8", newline="\n") as f:
-            if diarized:
-                last = None
-                buf = []
-                def flush():
-                    nonlocal buf, last
-                    if not buf or last is None: return
-                    text = " ".join(buf).strip()
-                    if text: f.write(f"{mapping.get(last, last)}: {text}\n")
-                    buf = []
-                for seg in segments:
-                    t = str(seg.get("text", "")).strip()
-                    if not t: continue
-                    sp = seg.get("speaker") or "SPEAKER_00"
-                    if sp != last and last is not None: flush()
-                    last = sp; buf.append(t)
-                flush()
-            else:
-                all_text = " ".join(str(seg.get("text", "")).strip() for seg in segments if seg.get("text")).strip()
-                if all_text: f.write(all_text + "\n")
+
         export_created = []
-        try:
-            if _has_word_level(segments):
-                if self.var_export_vtt.get():
-                    vp = out_dir / f"{title}.words.vtt"
-                    write_word_vtt(vp, segments, mapping)
-                    export_created.append(vp.name)
-                if self.var_export_ass.get():
-                    ap = out_dir / f"{title}.words.ass"
-                    write_word_ass(ap, segments, mapping)
-                    export_created.append(ap.name)
-                if self.var_export_html.get():
-                    sps = sorted({mapping.get(seg.get("speaker"), seg.get("speaker")) for seg in segments if seg.get("speaker")})
-                    hp = out_dir / "word_player.html"
-                    write_word_player_html(hp, sps)
-                    export_created.append(hp.name)
-            if self.var_export_lrc.get():
-                lp = out_dir / f"{title}.lrc"
-                write_lrc(lp, segments, mapping)
-                export_created.append(lp.name)
-            if self.var_export_ass_plain.get():
-                pp = out_dir / f"{title}.plain.ass"
-                write_ass_plain(pp, segments, mapping)
-                export_created.append(pp.name)
-        except:
-            pass
         names_yaml = out_dir / "names.yaml"
         names_data = {"speaker_names": mapping}
         source_identity = build_source_identity(seg_data.get("source_path"))
-        if source_identity is not None:
-            names_data["source_identity"] = source_identity
-        atomic_write_yaml(names_yaml, names_data)
         persistent_warning = None
-        try:
-            persistent_path = write_speaker_name_record(seg_data.get("source_path"), mapping)
+        persistent_path = None
+        persistent_data = None
+        if source_identity is None:
+            persistent_warning = (
+                "The original source file is missing or unavailable. The current outputs were updated, "
+                "but the speaker names could not be saved persistently."
+            )
+        else:
+            names_data["source_identity"] = source_identity
+            persistent_path = speaker_name_record_path(seg_data.get("source_path"))
             if persistent_path is None:
                 persistent_warning = (
                     "The original source file is missing or unavailable. The current outputs were updated, "
                     "but the speaker names could not be saved persistently."
                 )
-        except Exception as e:
-            persistent_warning = (
-                "The current outputs were updated, but the persistent speaker-name record could not be saved:\n"
-                f"{e}"
+            else:
+                persistent_data = {
+                    "source_identity": source_identity,
+                    "speaker_names": dict(mapping),
+                }
+
+        with tempfile.TemporaryDirectory(prefix=".ats-apply-", dir=out_dir) as staging_name:
+            staging_dir = Path(staging_name)
+            staged_files = []
+
+            if self.manual_corrections_pending:
+                backup_path = self.segments_json.with_name(
+                    "segments.before_manual_corrections.json"
+                )
+                if not backup_path.exists():
+                    original_segments = self.segments_json.read_bytes()
+                    if hashlib.sha256(original_segments).hexdigest() != self.result_identity.segments_sha256:
+                        raise RuntimeError(
+                            "segments.json changed while the manual-correction backup was being prepared."
+                        )
+                    self._stage_apply_file(
+                        staging_dir,
+                        staged_files,
+                        backup_path,
+                        "json",
+                        lambda path, data=original_segments: path.write_bytes(data),
+                        expected_data=current_preflight.segments_data,
+                    )
+
+            self._stage_apply_file(
+                staging_dir,
+                staged_files,
+                self.speakers_json,
+                "json",
+                lambda path: self._write_apply_json(path, speakers_data),
+                expected_data=speakers_data,
             )
+            if self.manual_corrections_pending:
+                self._stage_apply_file(
+                    staging_dir,
+                    staged_files,
+                    self.segments_json,
+                    "json",
+                    lambda path: self._write_apply_json(path, seg_data),
+                    expected_data=seg_data,
+                )
+            self._stage_apply_file(
+                staging_dir,
+                staged_files,
+                srt_tmp,
+                "srt",
+                lambda path: self._write_apply_srt(path, segments, mapping),
+            )
+            self._stage_apply_file(
+                staging_dir,
+                staged_files,
+                txt_tmp,
+                "txt",
+                lambda path: self._write_apply_txt(path, segments, mapping),
+            )
+
+            if _has_word_level(segments):
+                if self.var_export_vtt.get():
+                    vp = out_dir / f"{title}.words.vtt"
+                    self._stage_apply_file(
+                        staging_dir,
+                        staged_files,
+                        vp,
+                        "vtt",
+                        lambda path: write_word_vtt(path, segments, mapping),
+                    )
+                    export_created.append(vp.name)
+                if self.var_export_ass.get():
+                    ap = out_dir / f"{title}.words.ass"
+                    self._stage_apply_file(
+                        staging_dir,
+                        staged_files,
+                        ap,
+                        "ass",
+                        lambda path: write_word_ass(path, segments, mapping),
+                    )
+                    export_created.append(ap.name)
+                if self.var_export_html.get():
+                    sps = sorted({mapping.get(seg.get("speaker"), seg.get("speaker")) for seg in segments if seg.get("speaker")})
+                    hp = out_dir / "word_player.html"
+                    self._stage_apply_file(
+                        staging_dir,
+                        staged_files,
+                        hp,
+                        "html",
+                        lambda path: write_word_player_html(path, sps),
+                    )
+                    export_created.append(hp.name)
+            if self.var_export_lrc.get():
+                lp = out_dir / f"{title}.lrc"
+                self._stage_apply_file(
+                    staging_dir,
+                    staged_files,
+                    lp,
+                    "lrc",
+                    lambda path: write_lrc(path, segments, mapping),
+                )
+                export_created.append(lp.name)
+            if self.var_export_ass_plain.get():
+                pp = out_dir / f"{title}.plain.ass"
+                self._stage_apply_file(
+                    staging_dir,
+                    staged_files,
+                    pp,
+                    "ass",
+                    lambda path: write_ass_plain(path, segments, mapping),
+                )
+                export_created.append(pp.name)
+
+            self._stage_apply_file(
+                staging_dir,
+                staged_files,
+                names_yaml,
+                "yaml",
+                lambda path: self._write_apply_yaml(path, names_data),
+                expected_data=names_data,
+            )
+            if persistent_path is not None:
+                self._stage_apply_file(
+                    staging_dir,
+                    staged_files,
+                    persistent_path,
+                    "yaml",
+                    lambda path: self._write_apply_yaml(path, persistent_data),
+                    expected_data=persistent_data,
+                )
+
+            final_preflight = self._preflight_current_disk_result("apply changes")
+            if final_preflight is None:
+                return False
+            player_snapshot = None
+            try:
+                target_paths = [target_path for target_path, _staged_path in staged_files]
+                if self._vlc_may_lock_apply_targets(target_paths):
+                    player_snapshot = self._detach_embedded_player_for_apply()
+                self._commit_staged_apply_files(staging_dir, staged_files)
+            finally:
+                if player_snapshot is not None:
+                    self._restore_embedded_player_after_apply(player_snapshot)
+
+        if self.manual_corrections_pending:
+            self.segments_data = seg_data
         if self.var_rename_audio.get():
             try:
                 self._rename_tree(out_dir, mapping)
             except Exception as e:
-                messagebox.showwarning("Rename issue", f"Some files could not be renamed:\n{e}")
+                messagebox.showwarning(
+                    "Rename issue",
+                    f"Some files could not be renamed:\n{e}",
+                    parent=self.winfo_toplevel(),
+                )
         if persistent_warning:
-            messagebox.showwarning("Speaker names not persisted", persistent_warning)
-        messagebox.showinfo("Done", "Updated files:\n" + txt_tmp.name + "\n" + srt_tmp.name + ("\n\nExports:\n" + "\n".join(export_created) if export_created else "") + "\n\nSaved mapping: " + names_yaml.name)
+            messagebox.showwarning(
+                "Speaker names not persisted",
+                persistent_warning,
+                parent=self.winfo_toplevel(),
+            )
+        self.result_identity = _preflight_review_result(
+            self.speakers_json,
+            self.segments_json,
+        ).identity
+        self.saved_names = dict(mapping)
+        self.manual_corrections_pending = False
+        self._refresh_transcript_preview(preserve_view=True)
+        self._capture_clean_baseline()
+        messagebox.showinfo(
+            "Done",
+            "Updated files:\n" + txt_tmp.name + "\n" + srt_tmp.name + ("\n\nExports:\n" + "\n".join(export_created) if export_created else "") + "\n\nSaved mapping: " + names_yaml.name,
+            parent=self.winfo_toplevel(),
+        )
+        return True
+
+
+class NamingDialog(tk.Toplevel):
+    """Compatibility window hosting the reusable Name Speakers workspace."""
+
+    def __init__(self, master, speakers_json: Path, segments_json: Path):
+        super().__init__(master)
+        style_midnightstudio_toplevel(self)
+        self.title("Name Speakers")
+        self.geometry("1180x700")
+        self.minsize(960, 600)
+        self.resizable(True, True)
+        self._closing = False
+        self.workspace = NamingWorkspace(
+            self,
+            speakers_json,
+            segments_json,
+            on_apply_complete=self._close_from_workspace,
+            on_discard=self._close_from_workspace,
+        )
+        self.workspace.pack(fill="both", expand=True)
+        self.workspace.start()
+        self.protocol("WM_DELETE_WINDOW", self.workspace.discard_changes)
+
+    def _close_from_workspace(self):
         self.destroy()
+
+    def destroy(self):
+        if self._closing:
+            return
+        self._closing = True
+        workspace = getattr(self, "workspace", None)
+        if workspace is not None:
+            workspace.shutdown()
+        try:
+            super().destroy()
+        except tk.TclError:
+            pass
+
+
+class ReviewNamePage(ttk.Frame):
+    """Persistent host for at most one embedded Name Speakers workspace."""
+
+    def __init__(
+        self,
+        master,
+        *,
+        open_latest_callback,
+        back_to_transcribe_callback,
+        apply_complete_callback=None,
+        report_callback=None,
+    ):
+        super().__init__(master, style=MIDNIGHTSTUDIO_STYLES["page"])
+        self._open_latest_callback = open_latest_callback
+        self._back_to_transcribe_callback = back_to_transcribe_callback
+        self._apply_complete_callback = apply_complete_callback
+        self._report_callback = report_callback
+        self.workspace = None
+        self.current_result_paths = None
+        self.current_result_identity = None
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+
+        self.empty_state = ttk.Frame(
+            self,
+            padding=16,
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
+        self.empty_state.grid(row=0, column=0, sticky="nsew")
+        self.empty_state.columnconfigure(0, weight=1)
+        self.empty_state.rowconfigure(2, weight=1)
+        ttk.Label(
+            self.empty_state,
+            text="Review & Name",
+            style=MIDNIGHTSTUDIO_STYLES["title"],
+        ).grid(row=0, column=0, sticky="w", pady=(0, 10))
+        empty_card = ttk.LabelFrame(self.empty_state, text="Completed Results", padding=16)
+        empty_card.grid(row=1, column=0, sticky="ew")
+        empty_card.columnconfigure(0, weight=1)
+        ttk.Label(
+            empty_card,
+            text=(
+                "No result is loaded. Open the latest completed transcription to review "
+                "speaker assignments, playback, and transcript exports."
+            ),
+            wraplength=760,
+            justify="left",
+        ).grid(row=0, column=0, sticky="w")
+        tb.Button(
+            empty_card,
+            text="Open latest result",
+            command=self._open_latest_callback,
+            bootstyle="primary-outline",
+            padding=(16, 6),
+        ).grid(row=1, column=0, sticky="w", pady=(12, 0))
+        apply_midnightstudio_card_style(empty_card)
+
+    @staticmethod
+    def _validated_result_paths(speakers_json, segments_json):
+        return _preflight_review_result(speakers_json, segments_json).identity.paths
+
+    @staticmethod
+    def _validated_result_identity(speakers_json, segments_json):
+        return _preflight_review_result(speakers_json, segments_json).identity
+
+    @staticmethod
+    def _result_key(result):
+        if isinstance(result, ReviewResultIdentity):
+            return (
+                os.path.normcase(str(result.speakers_json)),
+                os.path.normcase(str(result.segments_json)),
+                result.speakers_sha256,
+                result.segments_sha256,
+            )
+        return tuple(os.path.normcase(str(path)) for path in result)
+
+    @staticmethod
+    def _result_path_key(result):
+        paths = result.paths if isinstance(result, ReviewResultIdentity) else result
+        return tuple(os.path.normcase(str(path)) for path in paths)
+
+    def _report(self, message):
+        if self._report_callback is not None:
+            self._report_callback(message)
+
+    @staticmethod
+    def _dispose_workspace(workspace, *, save_view_preferences=True):
+        if workspace is None:
+            return
+        try:
+            workspace.shutdown(
+                save_view_preferences=save_view_preferences,
+            )
+        except Exception:
+            pass
+        try:
+            workspace.destroy()
+        except (AttributeError, tk.TclError):
+            pass
+
+    def load_result(self, speakers_json, segments_json=None, *, confirm_replacement=True):
+        requested_identity = (
+            speakers_json
+            if isinstance(speakers_json, ReviewResultIdentity) and segments_json is None
+            else None
+        )
+        requested_paths = (
+            requested_identity.paths
+            if requested_identity is not None
+            else (speakers_json, segments_json)
+        )
+        try:
+            result_preflight = _preflight_review_result(*requested_paths)
+        except Exception as exc:
+            self._report(f"[review] Result validation failed: {exc}")
+            messagebox.showerror(
+                "Could not open result",
+                f"The selected transcription result is unavailable:\n{exc}",
+                parent=self.winfo_toplevel(),
+            )
+            return False
+        result_identity = result_preflight.identity
+        result_paths = result_identity.paths
+        if requested_identity is not None and result_identity != requested_identity:
+            self._report(
+                "[review] The pending result changed before loading; using the latest validated revision."
+            )
+
+        if (
+            self.workspace is not None
+            and self.current_result_identity is not None
+            and result_identity == self.current_result_identity
+        ):
+            self.on_activated()
+            return True
+
+        same_paths_changed = (
+            self.current_result_identity is not None
+            and self._result_path_key(result_identity)
+            == self._result_path_key(self.current_result_identity)
+        )
+        if self.workspace is not None and confirm_replacement:
+            if self.workspace.has_unsaved_changes():
+                decision = messagebox.askyesnocancel(
+                    "Unsaved Review & Name changes",
+                    "The current review has unsaved changes.\n\n"
+                    "Yes: Apply the current changes, then load the new result.\n"
+                    "No: Discard the current changes and load the new result.\n"
+                    "Cancel: Keep the current result open.",
+                    parent=self.winfo_toplevel(),
+                )
+                if decision is None:
+                    return False
+                if decision and not self.workspace.apply_changes():
+                    return False
+            elif not same_paths_changed:
+                replace = messagebox.askyesno(
+                    "Replace review result",
+                    "Another result is already open. Replace it with the selected result?",
+                    parent=self.winfo_toplevel(),
+                )
+                if not replace:
+                    return False
+
+        try:
+            verified_preflight = _preflight_review_result(*result_paths)
+        except Exception as exc:
+            self._report(f"[review] Result validation failed before replacement: {exc}")
+            messagebox.showerror(
+                "Could not open result",
+                "The replacement result became unavailable before it could be loaded:\n"
+                f"{exc}\n\nThe current review was left unchanged.",
+                parent=self.winfo_toplevel(),
+            )
+            return False
+        if verified_preflight.identity != result_identity:
+            self._report(
+                "[review] The result changed again while replacement was being confirmed; replacement was cancelled."
+            )
+            messagebox.showwarning(
+                "Result changed",
+                "The transcription result changed again while it was being opened. "
+                "The current review was left unchanged. Open the result again to load its latest revision.",
+                parent=self.winfo_toplevel(),
+            )
+            return False
+
+        old_workspace = self.workspace
+        old_result_paths = self.current_result_paths
+        old_result_identity = self.current_result_identity
+        existing_children = set(self.winfo_children())
+        new_workspace = None
+        try:
+            new_workspace = NamingWorkspace(
+                self,
+                result_paths[0],
+                result_paths[1],
+                on_apply_complete=self._on_workspace_applied,
+                on_discard=self._back_to_transcribe_callback,
+                discard_label="Back to Transcribe",
+                result_preflight=verified_preflight,
+            )
+        except Exception as exc:
+            if new_workspace is not None:
+                self._dispose_workspace(
+                    new_workspace,
+                    save_view_preferences=False,
+                )
+            else:
+                for child in self.winfo_children():
+                    if child not in existing_children:
+                        try:
+                            child.destroy()
+                        except tk.TclError:
+                            pass
+            self._report(
+                f"[review] Replacement workspace construction failed; the current review was preserved: {exc}"
+            )
+            messagebox.showerror(
+                "Could not open result",
+                "The replacement Review workspace could not be prepared:\n"
+                f"{exc}\n\nThe current review was left unchanged and the result can be opened again later.",
+                parent=self.winfo_toplevel(),
+            )
+            return False
+
+        old_player_snapshot = None
+        try:
+            if old_workspace is not None:
+                old_player_snapshot = old_workspace._suspend_embedded_player_for_replacement()
+            new_workspace.grid(row=0, column=0, sticky="nsew")
+            new_workspace.start()
+        except Exception as exc:
+            self._dispose_workspace(
+                new_workspace,
+                save_view_preferences=False,
+            )
+
+            restored = True
+            restore_reason = None
+            if old_workspace is not None and old_player_snapshot is not None:
+                restored, restore_reason = old_workspace._resume_after_failed_replacement(
+                    old_player_snapshot
+                )
+            self.workspace = old_workspace
+            self.current_result_paths = old_result_paths
+            self.current_result_identity = old_result_identity
+            if old_workspace is None:
+                self.empty_state.grid()
+
+            report = (
+                f"[review] Replacement workspace activation failed; the current review was "
+                f"{'restored' if restored else 'retained without full video restoration'}: {exc}"
+            )
+            if restore_reason:
+                report += f" ({restore_reason})"
+            self._report(report)
+            restore_note = (
+                "The current review was restored unchanged."
+                if restored
+                else "The current review data was retained, but its video preview could not be fully restored."
+            )
+            messagebox.showerror(
+                "Could not open result",
+                "The replacement Review workspace could not be activated:\n"
+                f"{exc}\n\n{restore_note} The result can be opened again later.",
+                parent=self.winfo_toplevel(),
+            )
+            return False
+
+        if old_workspace is not None:
+            self._dispose_workspace(old_workspace)
+        self.empty_state.grid_remove()
+        self.workspace = new_workspace
+        self.current_result_paths = result_paths
+        self.current_result_identity = verified_preflight.identity
+        return True
+
+    def _on_workspace_applied(self):
+        if self.workspace is not None:
+            self.current_result_identity = self.workspace.result_identity
+            self.current_result_paths = self.current_result_identity.paths
+            self.workspace.refresh_available_subtitles()
+        if self._apply_complete_callback is not None:
+            self._apply_complete_callback()
+
+    def _unload_workspace(self):
+        workspace = self.workspace
+        self.workspace = None
+        self.current_result_paths = None
+        self.current_result_identity = None
+        if workspace is None:
+            return
+        workspace.shutdown()
+        try:
+            workspace.destroy()
+        except tk.TclError:
+            pass
+
+    def on_activated(self):
+        if self.workspace is not None:
+            self.workspace.on_host_activated()
+
+    def approve_application_close(self):
+        workspace = self.workspace
+        if workspace is None or not workspace.has_unsaved_changes():
+            return True
+        decision = messagebox.askyesnocancel(
+            "Unsaved Review & Name changes",
+            "The current review has unsaved changes.\n\n"
+            "Yes: Apply the changes, then close.\n"
+            "No: Discard the changes and close.\n"
+            "Cancel: Keep Transcript Studio open.",
+            parent=self.winfo_toplevel(),
+        )
+        if decision is None:
+            return False
+        if decision:
+            return bool(workspace.apply_changes())
+        return True
+
+    def shutdown(self):
+        self._unload_workspace()
+
 
 class App(ttk.Frame):
     def __init__(self, master):
-        super().__init__(master, padding=8)
+        register_midnightstudio_theme(master)
+        super().__init__(master, padding=8, style=MIDNIGHTSTUDIO_STYLES["shell"])
         self.master = master
         self.grid(sticky="nsew")
         self.master.rowconfigure(0, weight=1)
@@ -3364,6 +5514,10 @@ class App(ttk.Frame):
         self.cancel_requested = False
         self.queue = queue.Queue()
         self.input_files = []
+        self.pending_review_result = None
+        self._application_closing = False
+        self._main_window_normal_geometry = None
+        self._main_window_tracking_enabled = False
         self.var_model = tk.StringVar(value=_DEFAULTS["model"])
         self.var_lang = tk.StringVar(value=_DEFAULTS["language"])
         self.var_output = tk.StringVar(value=_DEFAULTS["output_format"])
@@ -3384,82 +5538,145 @@ class App(ttk.Frame):
         self.var_speaker_mode = tk.StringVar(value=_SPEAKER_MODE_LABELS[_DEFAULTS["diarization_speaker_mode"]])
         self.var_min_speakers = tk.StringVar(value=str(_DEFAULTS["min_speakers"]))
         self.var_max_speakers = tk.StringVar(value=str(_DEFAULTS["max_speakers"]))
+        self.var_ner_engine = tk.StringVar(value=_DEFAULTS["ner_engine"])
         self._build_ui()
         self._load_conf_to_ui()
         self._update_title_with_conf_path()
+        self._restore_main_window_preferences()
+        self.master.protocol("WM_DELETE_WINDOW", self.close_application)
         self.after(120, self._poll_queue)
 
     def _build_ui(self):
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(6, weight=1)
+        self.rowconfigure(0, weight=1)
 
-        header = ttk.Frame(self, padding=(8, 4, 8, 8))
+        self.notebook = ttk.Notebook(self, style=MIDNIGHTSTUDIO_STYLES["notebook"])
+        self.notebook.grid(row=0, column=0, sticky="nsew")
+        self.review_page = ReviewNamePage(
+            self.notebook,
+            open_latest_callback=self.on_name_speakers,
+            back_to_transcribe_callback=lambda: self.show_page("transcribe"),
+            apply_complete_callback=lambda: self.show_page("review"),
+            report_callback=self.log,
+        )
+        self.pages = {
+            "transcribe": ttk.Frame(
+                self.notebook,
+                padding=8,
+                style=MIDNIGHTSTUDIO_STYLES["page"],
+            ),
+            "review": self.review_page,
+            "activity": ttk.Frame(
+                self.notebook,
+                padding=8,
+                style=MIDNIGHTSTUDIO_STYLES["page"],
+            ),
+            "settings": ttk.Frame(
+                self.notebook,
+                padding=8,
+                style=MIDNIGHTSTUDIO_STYLES["page"],
+            ),
+        }
+        self.notebook.add(self.pages["transcribe"], text="Transcribe")
+        self.notebook.add(self.pages["review"], text="Review & Name")
+        self.notebook.add(self.pages["activity"], text="Activity")
+        self.notebook.add(self.pages["settings"], text="Settings")
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed, add="+")
+
+        transcribe = self.pages["transcribe"]
+        transcribe.columnconfigure(0, weight=1)
+        transcribe.rowconfigure(4, weight=1)
+
+        header = ttk.Frame(
+            transcribe,
+            padding=(8, 4, 8, 8),
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(0, weight=1)
-        ttk.Label(header, text="AudioTranscript Studio", font=("Segoe UI", 18, "bold")).grid(row=0, column=0, sticky="w")
-        ttk.Label(header, text="Local transcription and speaker tools").grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ttk.Label(
+            header,
+            text="Transcript Studio",
+            style=MIDNIGHTSTUDIO_STYLES["title"],
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            header,
+            text="Local transcription, speaker review, and subtitle tools",
+            style=MIDNIGHTSTUDIO_STYLES["subtitle"],
+        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
         self.lbl_status = tb.Label(header, text="Ready", bootstyle="secondary")
         self.lbl_status.grid(row=0, column=1, rowspan=2, sticky="e", padx=(12, 0))
 
-        files = ttk.LabelFrame(self, text="Files", padding=12)
+        files = ttk.LabelFrame(transcribe, text="Files", padding=12)
         files.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         tb.Button(files, text="Select Files", command=self.select_input_files, bootstyle="primary-outline").grid(row=0, column=0, sticky="w")
         tb.Button(files, text="Open Output", command=self.open_output_folder, bootstyle="secondary-outline").grid(row=0, column=1, sticky="w", padx=(8, 0))
         tb.Button(files, text="Clear Output", command=self.on_clear_output, bootstyle="danger-outline").grid(row=0, column=2, sticky="w", padx=(8, 0))
 
-        settings = ttk.LabelFrame(self, text="Transcription Settings", padding=12)
-        settings.grid(row=2, column=0, sticky="ew", pady=(0, 8))
-        settings.columnconfigure(7, weight=1)
-        ttk.Label(settings, text="Model").grid(row=0, column=0, sticky="w", padx=(0, 6))
-        self.cmb_model = ttk.Combobox(settings, textvariable=self.var_model, values=_MODEL_CHOICES, width=18, state="readonly")
+        transcription_settings = ttk.LabelFrame(transcribe, text="Transcription Settings", padding=12)
+        transcription_settings.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        transcription_settings.columnconfigure(7, weight=1)
+        ttk.Label(transcription_settings, text="Model").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.cmb_model = ttk.Combobox(transcription_settings, textvariable=self.var_model, values=_MODEL_CHOICES, width=18, state="readonly")
         self.cmb_model.grid(row=0, column=1, sticky="w", padx=(0, 16))
         self.cmb_model.bind("<<ComboboxSelected>>", self._on_model_changed)
-        ttk.Label(settings, text="Language").grid(row=0, column=2, sticky="w", padx=(0, 6))
-        ttk.Entry(settings, textvariable=self.var_lang, width=10).grid(row=0, column=3, sticky="w", padx=(0, 16))
-        ttk.Checkbutton(settings, text="Identify speakers", variable=self.var_diar).grid(row=0, column=4, sticky="w", padx=(0, 16))
-        ttk.Label(settings, text="Output").grid(row=0, column=5, sticky="w", padx=(0, 6))
-        output_options = ttk.Frame(settings)
+        ttk.Label(transcription_settings, text="Language").grid(row=0, column=2, sticky="w", padx=(0, 6))
+        ttk.Entry(transcription_settings, textvariable=self.var_lang, width=10).grid(row=0, column=3, sticky="w", padx=(0, 16))
+        ttk.Checkbutton(transcription_settings, text="Identify speakers", variable=self.var_diar).grid(row=0, column=4, sticky="w", padx=(0, 16))
+        ttk.Label(transcription_settings, text="Output").grid(row=0, column=5, sticky="w", padx=(0, 6))
+        output_options = ttk.Frame(transcription_settings)
         output_options.grid(row=0, column=6, sticky="w")
         ttk.Radiobutton(output_options, text="Both", variable=self.var_output, value="both").pack(side="left")
         ttk.Radiobutton(output_options, text="SRT", variable=self.var_output, value="srt").pack(side="left", padx=(8, 0))
         ttk.Radiobutton(output_options, text="TXT", variable=self.var_output, value="txt").pack(side="left", padx=(8, 0))
-        ttk.Frame(settings).grid(row=0, column=7, sticky="ew")
+        ttk.Frame(transcription_settings).grid(row=0, column=7, sticky="ew")
 
-        actions = ttk.Frame(self, padding=(0, 2, 0, 10))
+        actions = ttk.Frame(
+            transcribe,
+            padding=(0, 2, 0, 10),
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
         actions.grid(row=3, column=0, sticky="ew")
-        self.btn_start = tb.Button(actions, text="Start Transcription", command=self.on_run, bootstyle="success", padding=(20, 8))
+        self.btn_start = tb.Button(actions, text="Start Transcription", command=self.on_run, bootstyle="primary", padding=(20, 8))
         self.btn_start.pack(side="left")
         self.btn_cancel = tb.Button(actions, text="Cancel", command=self.on_stop, bootstyle="danger-outline", padding=(16, 8))
         self.btn_cancel.pack(side="left", padx=(8, 0))
-        progress_area = ttk.Frame(actions)
+        progress_area = ttk.Frame(actions, style=MIDNIGHTSTUDIO_STYLES["page"])
         progress_area.pack(side="left", padx=(14, 0))
-        self.lbl_progress = ttk.Label(progress_area, text="Ready — 0%")
+        self.lbl_progress = ttk.Label(
+            progress_area,
+            text="Ready — 0%",
+            style=MIDNIGHTSTUDIO_STYLES["secondary"],
+        )
         self.lbl_progress.pack(anchor="w")
         self.progress = tb.Progressbar(
             progress_area,
             mode="determinate",
             maximum=100,
             length=220,
-            bootstyle="info-striped",
+            bootstyle="primary-striped",
         )
         self.progress.pack(fill="x", pady=(2, 0))
         self._last_progress = 0
         self._set_runtime_state("Ready")
 
-        advanced = ttk.Frame(self)
-        advanced.grid(row=4, column=0, sticky="ew", pady=(0, 8))
-        advanced.columnconfigure(0, weight=1)
-        self._advanced_expanded = False
-        self.btn_advanced = tb.Button(
-            advanced,
-            text="Advanced Settings  ▸",
-            command=self._toggle_advanced_settings,
-            bootstyle="secondary-outline",
+        settings_page = self.pages["settings"]
+        settings_page.columnconfigure(0, weight=1)
+        settings_page.rowconfigure(4, weight=1)
+        ttk.Label(
+            settings_page,
+            text="Settings",
+            style=MIDNIGHTSTUDIO_STYLES["title"],
+        ).grid(
+            row=0, column=0, sticky="w", padx=8, pady=(4, 10)
         )
-        self.btn_advanced.grid(row=0, column=0, sticky="ew")
 
-        self.advanced_content = ttk.Frame(advanced, padding=(12, 10, 12, 4))
-        self.advanced_content.grid(row=1, column=0, sticky="ew")
+        self.advanced_content = ttk.LabelFrame(
+            settings_page,
+            text="Advanced Settings",
+            padding=12,
+        )
+        self.advanced_content.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
         self.advanced_content.columnconfigure(7, weight=1)
         ttk.Checkbutton(self.advanced_content, text="Slice audio", variable=self.var_slice).grid(row=0, column=0, sticky="w")
         ttk.Checkbutton(self.advanced_content, text="Slice video", variable=self.var_slice_video).grid(row=0, column=1, sticky="w", padx=(16, 0))
@@ -3502,36 +5719,292 @@ class App(ttk.Frame):
         ttk.Entry(self.advanced_content, textvariable=self.var_player, width=48).grid(row=3, column=1, columnspan=5, sticky="w", padx=(6, 8), pady=(10, 0))
         tb.Button(self.advanced_content, text="Browse", command=self.browse_player, bootstyle="secondary-outline").grid(row=3, column=6, sticky="w", pady=(10, 0))
         ttk.Frame(self.advanced_content).grid(row=0, column=7, rowspan=4, sticky="ew")
-        self.advanced_content.grid_remove()
 
-        utilities = ttk.LabelFrame(self, text="Utilities", padding=10)
-        utilities.grid(row=5, column=0, sticky="ew", pady=(0, 8))
-        ttk.Button(utilities, text="Save config", command=self.on_save).grid(row=0, column=0, sticky="w")
-        ttk.Button(utilities, text="Copy log", command=self.copy_log).grid(row=0, column=1, sticky="w", padx=(8, 0))
-        ttk.Button(utilities, text="Clear log", command=self.clear_log).grid(row=0, column=2, sticky="w", padx=(8, 0))
-        ttk.Button(utilities, text="About", command=self.on_about).grid(row=0, column=3, sticky="w", padx=(8, 0))
-        ttk.Button(utilities, text="Name speakers…", command=self.on_name_speakers).grid(row=0, column=4, sticky="w", padx=(8, 0))
-        self.lbl_conf = ttk.Label(utilities, text="Configuration: conf.yaml", foreground="#666")
-        self.lbl_conf.grid(row=1, column=0, columnspan=5, sticky="w", pady=(8, 0))
+        ner_settings = ttk.LabelFrame(settings_page, text="Name Detection", padding=12)
+        ner_settings.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
+        ner_settings.columnconfigure(3, weight=1)
+        ttk.Label(ner_settings, text="NER engine").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.cmb_ner_engine = ttk.Combobox(
+            ner_settings,
+            textvariable=self.var_ner_engine,
+            values=_NER_CHOICES,
+            state="readonly",
+            width=16,
+        )
+        self.cmb_ner_engine.grid(row=0, column=1, sticky="w", padx=(0, 12))
+        self.cmb_ner_engine.bind("<<ComboboxSelected>>", self._on_ner_engine_changed)
+        self.lbl_ner_info = ttk.Label(
+            ner_settings,
+            text="",
+            style=MIDNIGHTSTUDIO_STYLES["card_secondary"],
+        )
+        self.lbl_ner_info.grid(row=0, column=2, sticky="w")
 
-        activity = ttk.LabelFrame(self, text="Activity", padding=8)
-        activity.grid(row=6, column=0, sticky="nsew")
+        utilities = ttk.LabelFrame(settings_page, text="Utilities", padding=10)
+        utilities.grid(row=3, column=0, sticky="ew", padx=8)
+        tb.Button(
+            utilities,
+            text="Save config",
+            command=self.on_save,
+            bootstyle="primary",
+        ).grid(row=0, column=0, sticky="w")
+        tb.Button(
+            utilities,
+            text="About",
+            command=self.on_about,
+            bootstyle="secondary-outline",
+        ).grid(row=0, column=1, sticky="w", padx=(8, 0))
+        self.lbl_conf = ttk.Label(
+            utilities,
+            text="Configuration: conf.yaml",
+            style=MIDNIGHTSTUDIO_STYLES["card_secondary"],
+        )
+        self.lbl_conf.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        activity_page = self.pages["activity"]
+        activity_page.columnconfigure(0, weight=1)
+        activity_page.rowconfigure(1, weight=1)
+        activity_toolbar = ttk.Frame(
+            activity_page,
+            padding=(0, 0, 0, 8),
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
+        activity_toolbar.grid(row=0, column=0, sticky="ew")
+        ttk.Label(
+            activity_toolbar,
+            text="Activity",
+            style=MIDNIGHTSTUDIO_STYLES["title"],
+        ).pack(side="left")
+        tb.Button(
+            activity_toolbar,
+            text="Clear Log",
+            command=self.clear_log,
+            bootstyle="danger-outline",
+        ).pack(side="right")
+        tb.Button(
+            activity_toolbar,
+            text="Copy Log",
+            command=self.copy_log,
+            bootstyle="primary-outline",
+        ).pack(side="right", padx=(0, 8))
+        activity = ttk.LabelFrame(activity_page, text="Processing Log", padding=8)
+        activity.grid(row=1, column=0, sticky="nsew")
         activity.rowconfigure(0, weight=1)
         activity.columnconfigure(0, weight=1)
         self.txt = tk.Text(activity, height=16, wrap="word")
+        style_midnightstudio_text(self.txt)
         self.txt.grid(row=0, column=0, sticky="nsew")
         log_scrollbar = ttk.Scrollbar(activity, orient="vertical", command=self.txt.yview)
         log_scrollbar.grid(row=0, column=1, sticky="ns")
         self.txt.configure(yscrollcommand=log_scrollbar.set)
 
-    def _toggle_advanced_settings(self):
-        self._advanced_expanded = not self._advanced_expanded
-        if self._advanced_expanded:
-            self.advanced_content.grid()
-            self.btn_advanced.configure(text="Advanced Settings  ▾")
-        else:
-            self.advanced_content.grid_remove()
-            self.btn_advanced.configure(text="Advanced Settings  ▸")
+        for card in (
+            files,
+            transcription_settings,
+            self.advanced_content,
+            ner_settings,
+            utilities,
+            activity,
+        ):
+            apply_midnightstudio_card_style(card)
+        self.lbl_ner_info.configure(style=MIDNIGHTSTUDIO_STYLES["card_secondary"])
+        self.lbl_conf.configure(style=MIDNIGHTSTUDIO_STYLES["card_secondary"])
+        reinforce_midnightstudio_control_states(self.master.style)
+
+        self.show_page("transcribe")
+
+    def show_page(self, page_name: str):
+        page = self.pages.get(page_name)
+        if page is None:
+            raise KeyError(f"Unknown workspace page: {page_name}")
+        self.notebook.select(page)
+        if page_name == "review":
+            self.review_page.on_activated()
+
+    def _on_notebook_tab_changed(self, _event=None):
+        if self.notebook.select() == str(self.review_page):
+            self.review_page.on_activated()
+
+    def _desktop_bounds(self):
+        if os.name == "nt":
+            try:
+                import ctypes
+
+                user32 = ctypes.windll.user32
+                return (
+                    int(user32.GetSystemMetrics(76)),
+                    int(user32.GetSystemMetrics(77)),
+                    int(user32.GetSystemMetrics(78)),
+                    int(user32.GetSystemMetrics(79)),
+                )
+            except Exception:
+                pass
+        try:
+            return (
+                int(self.master.winfo_vrootx()),
+                int(self.master.winfo_vrooty()),
+                int(self.master.winfo_vrootwidth()),
+                int(self.master.winfo_vrootheight()),
+            )
+        except tk.TclError:
+            return (0, 0, 0, 0)
+
+    def _validated_main_window_geometry(self, value):
+        if not isinstance(value, str):
+            return None
+        match = re.fullmatch(r"\s*(\d+)x(\d+)([+-]\d+)([+-]\d+)\s*", value)
+        if not match:
+            return None
+        width, height, x_pos, y_pos = (int(part) for part in match.groups())
+        desktop_x, desktop_y, desktop_width, desktop_height = self._desktop_bounds()
+        if (
+            width < 800
+            or height < 500
+            or desktop_width <= 0
+            or desktop_height <= 0
+            or width > desktop_width
+            or height > desktop_height
+        ):
+            return None
+        visible_width = min(x_pos + width, desktop_x + desktop_width) - max(x_pos, desktop_x)
+        title_bar_visible = desktop_y <= y_pos <= desktop_y + desktop_height - 80
+        if visible_width < min(160, width) or not title_bar_visible:
+            return None
+        return f"{width}x{height}{x_pos:+d}{y_pos:+d}"
+
+    def _default_main_window_geometry(self):
+        try:
+            screen_width = max(1, int(self.master.winfo_screenwidth()))
+            screen_height = max(1, int(self.master.winfo_screenheight()))
+        except tk.TclError:
+            screen_width, screen_height = 1400, 900
+        width = min(1400, max(960, screen_width - 80))
+        height = min(900, max(650, screen_height - 80))
+        x_pos = max(0, (screen_width - width) // 2)
+        y_pos = max(0, (screen_height - height) // 2)
+        return f"{width}x{height}+{x_pos}+{y_pos}"
+
+    def _set_main_window_maximized(self, maximized):
+        try:
+            self.master.state("zoomed" if maximized else "normal")
+            return
+        except tk.TclError:
+            pass
+        try:
+            self.master.attributes("-zoomed", bool(maximized))
+        except tk.TclError:
+            pass
+
+    def _main_window_is_maximized(self):
+        try:
+            if self.master.state() == "zoomed":
+                return True
+        except tk.TclError:
+            return False
+        try:
+            return bool(self.master.attributes("-zoomed"))
+        except tk.TclError:
+            return False
+
+    def _track_main_window_geometry(self, event=None):
+        if not self._main_window_tracking_enabled or self._application_closing:
+            return
+        if event is not None and event.widget is not self.master:
+            return
+        if self._main_window_is_maximized():
+            return
+        try:
+            geometry = self._validated_main_window_geometry(self.master.geometry())
+        except tk.TclError:
+            return
+        if geometry is not None:
+            self._main_window_normal_geometry = geometry
+
+    def _restore_main_window_preferences(self):
+        try:
+            self.master.update_idletasks()
+        except tk.TclError:
+            return
+        try:
+            cfg = read_yaml(conf_path())
+            if not isinstance(cfg, dict):
+                cfg = {}
+        except Exception:
+            cfg = {}
+        saved_geometry = self._validated_main_window_geometry(
+            cfg.get("main_window_geometry")
+        )
+        saved_maximized = cfg.get("main_window_maximized")
+        preference_valid = saved_geometry is not None and isinstance(saved_maximized, bool)
+        normal_geometry = saved_geometry if preference_valid else self._default_main_window_geometry()
+        self._set_main_window_maximized(False)
+        try:
+            self.master.geometry(normal_geometry)
+            self.master.update_idletasks()
+        except tk.TclError:
+            return
+        self._main_window_normal_geometry = normal_geometry
+        self._set_main_window_maximized(saved_maximized if preference_valid else True)
+        self._main_window_tracking_enabled = True
+        self.master.bind("<Configure>", self._track_main_window_geometry, add="+")
+
+    def _save_main_window_preferences(self):
+        maximized = self._main_window_is_maximized()
+        if not maximized:
+            try:
+                current_geometry = self._validated_main_window_geometry(
+                    self.master.geometry()
+                )
+            except tk.TclError:
+                current_geometry = None
+            if current_geometry is not None:
+                self._main_window_normal_geometry = current_geometry
+        geometry = self._validated_main_window_geometry(
+            self._main_window_normal_geometry
+        )
+        if geometry is None:
+            geometry = self._default_main_window_geometry()
+        try:
+            cfg = merge_gui_conf(
+                read_yaml(conf_path()),
+                {
+                    "main_window_geometry": geometry,
+                    "main_window_maximized": bool(maximized),
+                },
+            )
+            atomic_write_yaml(conf_path(), cfg)
+        except Exception as exc:
+            self.log(f"[window] Could not save main-window preferences: {exc}")
+
+    def close_application(self):
+        if self._application_closing:
+            return
+        if not self.review_page.approve_application_close():
+            return
+        self._application_closing = True
+        self._save_main_window_preferences()
+        try:
+            self.review_page.shutdown()
+        finally:
+            try:
+                self.master.destroy()
+            except tk.TclError:
+                pass
+
+    def _current_ner_engine(self) -> str:
+        engine = self.var_ner_engine.get().strip().lower()
+        if engine not in _NER_CHOICES:
+            engine = _DEFAULTS["ner_engine"]
+            self.var_ner_engine.set(engine)
+        _set_ner_settings(engine=engine)
+        return engine
+
+    def _update_ner_engine_info(self):
+        engine = self._current_ner_engine()
+        self.lbl_ner_info.configure(text=f"{engine} — {_ner_device_info(engine)}")
+
+    def _on_ner_engine_changed(self, *_):
+        self._update_ner_engine_info()
 
     def _update_speaker_count_controls(self, *_):
         self.speaker_exact_fields.pack_forget()
@@ -3624,7 +6097,7 @@ class App(ttk.Frame):
         self.txt.see("end")
 
     def _update_title_with_conf_path(self):
-        self.master.title("AudioTranscript Studio")
+        self.master.title("Transcript Studio")
         self.lbl_conf.configure(text="Configuration: conf.yaml")
 
     @staticmethod
@@ -3668,7 +6141,9 @@ class App(ttk.Frame):
 
     def _load_conf_to_ui(self):
         cfg = read_yaml(conf_path())
-        if not cfg: return
+        if not cfg:
+            self._update_ner_engine_info()
+            return
         self.var_lang.set(cfg.get("language", self.var_lang.get()))
         self.var_model.set(cfg.get("model", self.var_model.get()))
         self.var_diar.set(bool(cfg.get("diarize", self.var_diar.get())))
@@ -3692,6 +6167,9 @@ class App(ttk.Frame):
         self.var_speaker_mode.set(_SPEAKER_MODE_LABELS[mode])
         self.var_min_speakers.set(str(cfg.get("min_speakers", _DEFAULTS["min_speakers"])))
         self.var_max_speakers.set(str(cfg.get("max_speakers", _DEFAULTS["max_speakers"])))
+        engine = str(cfg.get("ner_engine", _DEFAULTS["ner_engine"])).strip().lower()
+        self.var_ner_engine.set(engine if engine in _NER_CHOICES else _DEFAULTS["ner_engine"])
+        self._update_ner_engine_info()
         self._update_speaker_count_controls()
 
     def _collect_ui_to_conf(self) -> dict:
@@ -3722,6 +6200,7 @@ class App(ttk.Frame):
             "diarization_speaker_mode": speaker_mode,
             "min_speakers": min_speakers,
             "max_speakers": max_speakers,
+            "ner_engine": self._current_ner_engine(),
         }
 
     def on_save(self):
@@ -3865,6 +6344,7 @@ class App(ttk.Frame):
             self._set_runtime_state("Failed")
             messagebox.showerror("Run failed", str(e))
             return
+        self.pending_review_result = None
         self._set_runtime_state("Running")
         threading.Thread(target=self._reader, daemon=True).start()
 
@@ -3927,13 +6407,20 @@ class App(ttk.Frame):
                         if not self._handle_progress_line(event[1]):
                             self.log(event[1])
                     elif kind == "speakers":
-                        NamingDialog(self.master, event[1], event[2])
+                        try:
+                            self.pending_review_result = ReviewNamePage._validated_result_identity(
+                                event[1],
+                                event[2],
+                            )
+                        except Exception as exc:
+                            self.log(f"[review] Ignored an invalid speaker result: {exc}")
                     elif kind == "process_finished":
                         self.proc = None
                         if self.cancel_requested:
                             self._set_runtime_state("Cancelled")
                         elif event[1] == 0:
                             self._set_runtime_state("Complete")
+                            self._open_completed_review_result()
                         else:
                             self._set_runtime_state("Failed")
                 else:
@@ -4023,53 +6510,151 @@ class App(ttk.Frame):
             self.log(line)
         self.log("-------------")
         win = tk.Toplevel(self.master)
-        win.title("About - AudioTranscript Studio")
+        style_midnightstudio_toplevel(win)
+        win.title("About - Transcript Studio")
         win.geometry("820x460")
-        frm = ttk.Frame(win, padding=8)
+        frm = ttk.Frame(
+            win,
+            padding=8,
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
         frm.pack(fill="both", expand=True)
         text = tk.Text(frm, wrap="word")
-        yscroll = ttk.Scrollbar(frm, orient="vertical", command=text.yview)
+        style_midnightstudio_text(text, readonly=True)
+        yscroll = ttk.Scrollbar(
+            frm,
+            orient="vertical",
+            command=text.yview,
+            style=MIDNIGHTSTUDIO_STYLES["review_scrollbar"],
+        )
         text.configure(yscrollcommand=yscroll.set)
         text.pack(side="left", fill="both", expand=True)
         yscroll.pack(side="right", fill="y")
         text.insert("1.0", info)
         text.configure(state="disabled")
-        btns = ttk.Frame(win, padding=(8,0,8,8))
+        btns = ttk.Frame(
+            win,
+            padding=(8, 0, 8, 8),
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
         btns.pack(fill="x")
         def copy_all():
             win.clipboard_clear()
             win.clipboard_append(info)
-        ttk.Button(btns, text="Copy", command=copy_all).pack(side="right")
-        ttk.Button(btns, text="Close", command=win.destroy).pack(side="right", padx=6)
+        tb.Button(
+            btns,
+            text="Copy",
+            command=copy_all,
+            bootstyle="primary-outline",
+        ).pack(side="right")
+        tb.Button(
+            btns,
+            text="Close",
+            command=win.destroy,
+            bootstyle="secondary-outline",
+        ).pack(side="right", padx=6)
+        reinforce_midnightstudio_control_states(tb.Style.get_instance() or tb.Style())
 
-    def on_name_speakers(self):
+    def _validated_pending_review_result(self):
+        if self.pending_review_result is None:
+            return None
+        pending = self.pending_review_result
+        try:
+            current = ReviewNamePage._validated_result_identity(*pending.paths)
+        except Exception as exc:
+            self.pending_review_result = None
+            self.log(f"[review] Rejected the pending result because it is no longer valid: {exc}")
+            return None
+        if current != pending:
+            self.pending_review_result = current
+            self.log(
+                "[review] The pending result changed before loading; using its latest validated revision."
+            )
+        return self.pending_review_result
+
+    def _open_completed_review_result(self):
+        pending = self._validated_pending_review_result()
+        if pending is None:
+            self.log("[review] Processing completed, but no valid speaker-review result was reported.")
+            return False
+
+        engine = self._current_ner_engine()
+        self.log(f"[ner] Engine set to: {engine}  |  {_ner_device_info(engine)}")
+        if not self.review_page.load_result(pending):
+            self.log(
+                "[review] The completed result is ready and can be opened later from Review & Name."
+            )
+            return False
+
+        self.pending_review_result = None
+        self.show_page("review")
+        self.log("[review] Loaded the final completed result.")
+        return True
+
+    def _latest_review_result(self):
+        pending = self._validated_pending_review_result()
+        if pending is not None:
+            return pending
+
         out = output_root()
         if not out.exists():
             messagebox.showinfo("No output", f"No output folder {out}")
-            return
+            return None
         candidates = []
         for child in out.iterdir():
             if child.is_dir() and (child / "speakers.json").exists() and (child / "segments.json").exists():
-                candidates.append((child.stat().st_mtime, child))
+                candidates.append(
+                    (
+                        child.stat().st_mtime,
+                        (child / "speakers.json").resolve(),
+                        (child / "segments.json").resolve(),
+                    )
+                )
         if not candidates:
             messagebox.showinfo("Nothing to name", "No speakers.json found in output folders.")
+            return None
+        validation_errors = []
+        for _modified, speakers_path, segments_path in sorted(
+            candidates,
+            key=lambda item: item[0],
+            reverse=True,
+        ):
+            try:
+                return ReviewNamePage._validated_result_identity(
+                    speakers_path,
+                    segments_path,
+                )
+            except Exception as exc:
+                validation_errors.append(f"{speakers_path.parent.name}: {exc}")
+                self.log(f"[review] Skipped invalid result in {speakers_path.parent.name}: {exc}")
+        messagebox.showerror(
+            "No valid result",
+            "Completed-result folders were found, but none contained compatible review data.\n\n"
+            + "\n".join(validation_errors[:5]),
+        )
+        return None
+
+    def on_name_speakers(self):
+        latest = self._latest_review_result()
+        if latest is None:
             return
-        latest = sorted(candidates, key=lambda x: x[0], reverse=True)[0][1]
-        default_engine = _NER_SETTINGS.get("engine","auto")
-        dlg = NERSelectDialog(self.master, initial=default_engine)
-        self.wait_window(dlg)
-        engine = dlg.result or default_engine
-        if engine not in _NER_CHOICES:
-            engine = default_engine
-        _set_ner_settings(engine=engine)
+        engine = self._current_ner_engine()
         self.log(f"[ner] Engine set to: {engine}  |  {_ner_device_info(engine)}")
-        NamingDialog(self.master, latest / "speakers.json", latest / "segments.json")
+        if not self.review_page.load_result(latest):
+            return
+        if (
+            self.pending_review_result is not None
+            and self.review_page.current_result_identity
+            == self.pending_review_result
+        ):
+            self.pending_review_result = None
+        self.show_page("review")
 
 def main():
     root = tb.Window(themename="litera")
+    register_midnightstudio_theme(root)
+    root.title("Transcript Studio")
     app = App(root)
-    root.geometry("1140x620")
-    root.title("AudioTranscript Studio")
     root.mainloop()
 
 if __name__ == "__main__":
