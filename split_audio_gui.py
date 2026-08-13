@@ -2514,6 +2514,9 @@ class NamingWorkspace(ttk.Frame):
         if self._started or self._player_closing:
             return
         self._started = True
+        # A replacement is constructed while dormant. Render once from the fully
+        # populated assignment controls before any host/player callbacks begin.
+        self._refresh_transcript_preview()
         self._initialize_embedded_player()
         self._schedule_initial_pane_ratios(100)
 
@@ -3440,10 +3443,11 @@ class NamingWorkspace(ttk.Frame):
         self._schedule_selected_subtitle_after_play()
         self._schedule_word_synchronization()
 
-    def _release_embedded_player(self):
+    def _release_embedded_player(self, *, save_view_preferences=True):
         if self._player_closing:
             return
-        self._save_name_speakers_view_preferences()
+        if save_view_preferences:
+            self._save_name_speakers_view_preferences()
         self._player_closing = True
         self._cancel_pending_preview_ratio()
         self._cancel_word_synchronization()
@@ -3483,9 +3487,110 @@ class NamingWorkspace(ttk.Frame):
             except Exception:
                 pass
 
-    def shutdown(self):
+    def _suspend_embedded_player_for_replacement(self):
+        """Release the old player for a one-player-at-a-time workspace handoff."""
+        player = self._vlc_player
+        media = self._vlc_media
+        playback_snapshot = self._subtitle_playback_snapshot()
+        try:
+            volume = int(player.audio_get_volume()) if player is not None else int(
+                round(self.video_volume_var.get())
+            )
+            if volume < 0:
+                raise ValueError
+        except Exception:
+            volume = int(round(self.video_volume_var.get()))
+        snapshot = {
+            "had_player": player is not None,
+            "video_path": Path(self._loaded_video_path) if self._loaded_video_path else None,
+            "current_ms": playback_snapshot[0] if playback_snapshot else 0,
+            "was_playing": playback_snapshot[1] if playback_snapshot else False,
+            "was_paused": playback_snapshot[2] if playback_snapshot else False,
+            "volume": max(0, min(100, volume)),
+            "subtitle_choice": self.subtitle_var.get() or "Off",
+            "pane_ratio_pending": self._preview_ratio_after is not None,
+        }
+
+        self._cancel_pending_preview_ratio()
+        self._cancel_word_synchronization()
+        self._cancel_pending_video_seek()
+        self._cancel_pending_subtitle_apply()
+        self._cancel_pending_apply_player_restore()
+        if self._video_reattach_after is not None:
+            try:
+                self.after_cancel(self._video_reattach_after)
+            except (AttributeError, tk.TclError):
+                pass
+            self._video_reattach_after = None
+        if self._video_update_after is not None:
+            try:
+                self.after_cancel(self._video_update_after)
+            except (AttributeError, tk.TclError):
+                pass
+            self._video_update_after = None
+
+        self._vlc_player = None
+        self._vlc_media = None
+        if player is not None:
+            try:
+                player.stop()
+            except Exception:
+                pass
+            try:
+                player.release()
+            except Exception:
+                pass
+        if media is not None:
+            try:
+                media.release()
+            except Exception:
+                pass
+        return snapshot
+
+    def _resume_after_failed_replacement(self, snapshot):
+        """Best-effort restoration after a replacement could not be activated."""
+        if self._player_closing:
+            return False, "The previous Review workspace is already closing."
+        if snapshot.get("pane_ratio_pending") and not self._preview_ratio_applied:
+            self._schedule_initial_pane_ratios()
+        if not snapshot.get("had_player"):
+            return True, None
+
+        try:
+            self._initialize_embedded_player()
+            if self._vlc_player is None:
+                reason = self._vlc_status.get("reason") or "Embedded VLC could not be restarted."
+                return False, reason
+
+            volume = snapshot["volume"]
+            self.video_volume_var.set(volume)
+            self._vlc_player.audio_set_volume(volume)
+            selected_subtitle = snapshot["subtitle_choice"]
+            self.subtitle_var.set(
+                selected_subtitle
+                if selected_subtitle in self._subtitle_choices
+                else "Off"
+            )
+            video_path = snapshot.get("video_path")
+            if video_path is not None:
+                if not video_path.is_file():
+                    return False, f"The previously loaded video is no longer available: {video_path}"
+                self._load_embedded_video(
+                    video_path,
+                    max(0.0, snapshot["current_ms"] / 1000.0),
+                )
+                restored_snapshot = dict(snapshot)
+                restored_snapshot["player"] = self._vlc_player
+                self._schedule_apply_player_state_restore(restored_snapshot)
+            return True, None
+        except Exception as exc:
+            return False, str(exc)
+
+    def shutdown(self, *, save_view_preferences=True):
         self._remove_dirty_tracking()
-        self._release_embedded_player()
+        self._release_embedded_player(
+            save_view_preferences=save_view_preferences,
+        )
 
     def _on_workspace_destroyed(self, event):
         if event.widget is self:
@@ -4222,7 +4327,20 @@ class NamingWorkspace(ttk.Frame):
                 lines.append(transcript)
         return "\n".join(lines)
 
-    def _refresh_transcript_preview(self):
+    def _refresh_transcript_preview(self, *, preserve_view=False):
+        transcript_scroll = None
+        active_word_key = None
+        if preserve_view:
+            try:
+                transcript_scroll = self.text.yview()[0]
+            except (AttributeError, IndexError, tk.TclError):
+                pass
+            active_word = self._word_tag_to_record.get(self._current_word_tag)
+            if active_word is not None:
+                active_word_key = (
+                    active_word["segment_index"],
+                    active_word["word_index"],
+                )
         restart_synchronization = (
             not self._player_closing
             and self._vlc_player is not None
@@ -4233,6 +4351,25 @@ class NamingWorkspace(ttk.Frame):
         self._render_transcript_preview()
         query = self.find_var.get().strip() if hasattr(self, "find_var") else ""
         self._highlight_query(query)
+        if active_word_key is not None:
+            replacement_word = next(
+                (
+                    record
+                    for record in self._word_records
+                    if (
+                        record["segment_index"],
+                        record["word_index"],
+                    )
+                    == active_word_key
+                ),
+                None,
+            )
+            self._set_current_word(replacement_word)
+        if transcript_scroll is not None:
+            try:
+                self.text.yview_moveto(transcript_scroll)
+            except (AttributeError, tk.TclError):
+                pass
         if restart_synchronization:
             self._schedule_word_synchronization()
 
@@ -4992,6 +5129,7 @@ class NamingWorkspace(ttk.Frame):
         ).identity
         self.saved_names = dict(mapping)
         self.manual_corrections_pending = False
+        self._refresh_transcript_preview(preserve_view=True)
         self._capture_clean_baseline()
         messagebox.showinfo(
             "Done",
@@ -5124,6 +5262,21 @@ class ReviewNamePage(ttk.Frame):
         if self._report_callback is not None:
             self._report_callback(message)
 
+    @staticmethod
+    def _dispose_workspace(workspace, *, save_view_preferences=True):
+        if workspace is None:
+            return
+        try:
+            workspace.shutdown(
+                save_view_preferences=save_view_preferences,
+            )
+        except Exception:
+            pass
+        try:
+            workspace.destroy()
+        except (AttributeError, tk.TclError):
+            pass
+
     def load_result(self, speakers_json, segments_json=None, *, confirm_replacement=True):
         requested_identity = (
             speakers_json
@@ -5211,9 +5364,10 @@ class ReviewNamePage(ttk.Frame):
             )
             return False
 
-        if self.workspace is not None:
-            self._unload_workspace()
-
+        old_workspace = self.workspace
+        old_result_paths = self.current_result_paths
+        old_result_identity = self.current_result_identity
+        existing_children = set(self.winfo_children())
         new_workspace = None
         try:
             new_workspace = NamingWorkspace(
@@ -5225,30 +5379,81 @@ class ReviewNamePage(ttk.Frame):
                 discard_label="Back to Transcribe",
                 result_preflight=verified_preflight,
             )
-            new_workspace.grid(row=0, column=0, sticky="nsew")
-            self.empty_state.grid_remove()
-            self.workspace = new_workspace
-            self.current_result_paths = result_paths
-            self.current_result_identity = verified_preflight.identity
-            new_workspace.start()
-            return True
         except Exception as exc:
             if new_workspace is not None:
-                new_workspace.shutdown()
-                try:
-                    new_workspace.destroy()
-                except tk.TclError:
-                    pass
-            self.workspace = None
-            self.current_result_paths = None
-            self.current_result_identity = None
-            self.empty_state.grid()
+                self._dispose_workspace(
+                    new_workspace,
+                    save_view_preferences=False,
+                )
+            else:
+                for child in self.winfo_children():
+                    if child not in existing_children:
+                        try:
+                            child.destroy()
+                        except tk.TclError:
+                            pass
+            self._report(
+                f"[review] Replacement workspace construction failed; the current review was preserved: {exc}"
+            )
             messagebox.showerror(
                 "Could not open result",
-                f"The transcription result could not be loaded:\n{exc}",
+                "The replacement Review workspace could not be prepared:\n"
+                f"{exc}\n\nThe current review was left unchanged and the result can be opened again later.",
                 parent=self.winfo_toplevel(),
             )
             return False
+
+        old_player_snapshot = None
+        try:
+            if old_workspace is not None:
+                old_player_snapshot = old_workspace._suspend_embedded_player_for_replacement()
+            new_workspace.grid(row=0, column=0, sticky="nsew")
+            new_workspace.start()
+        except Exception as exc:
+            self._dispose_workspace(
+                new_workspace,
+                save_view_preferences=False,
+            )
+
+            restored = True
+            restore_reason = None
+            if old_workspace is not None and old_player_snapshot is not None:
+                restored, restore_reason = old_workspace._resume_after_failed_replacement(
+                    old_player_snapshot
+                )
+            self.workspace = old_workspace
+            self.current_result_paths = old_result_paths
+            self.current_result_identity = old_result_identity
+            if old_workspace is None:
+                self.empty_state.grid()
+
+            report = (
+                f"[review] Replacement workspace activation failed; the current review was "
+                f"{'restored' if restored else 'retained without full video restoration'}: {exc}"
+            )
+            if restore_reason:
+                report += f" ({restore_reason})"
+            self._report(report)
+            restore_note = (
+                "The current review was restored unchanged."
+                if restored
+                else "The current review data was retained, but its video preview could not be fully restored."
+            )
+            messagebox.showerror(
+                "Could not open result",
+                "The replacement Review workspace could not be activated:\n"
+                f"{exc}\n\n{restore_note} The result can be opened again later.",
+                parent=self.winfo_toplevel(),
+            )
+            return False
+
+        if old_workspace is not None:
+            self._dispose_workspace(old_workspace)
+        self.empty_state.grid_remove()
+        self.workspace = new_workspace
+        self.current_result_paths = result_paths
+        self.current_result_identity = verified_preflight.identity
+        return True
 
     def _on_workspace_applied(self):
         if self.workspace is not None:
