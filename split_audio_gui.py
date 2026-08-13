@@ -1,6 +1,7 @@
 # split_audio_gui.py — v1.11.0 (Stop Button + Worker Control)
 import os, sys, stat, json, yaml, queue, shutil, threading, subprocess, tkinter as tk, hashlib, datetime, re, signal, copy, math, time, tempfile
 import ttkbootstrap as tb
+from ttkbootstrap.style import ThemeDefinition
 from tkinter import ttk, messagebox, filedialog, font as tkfont
 from pathlib import Path
 from dataclasses import dataclass
@@ -14,6 +15,528 @@ from split_audio import (
     discover_sources,
     speaker_name_record_path,
 )
+
+
+MIDNIGHTSTUDIO_THEME_NAME = "midnightstudio"
+MIDNIGHTSTUDIO_THEME_COLORS = {
+    "primary": "#2EC4B6",
+    "secondary": "#52667A",
+    "success": "#49B982",
+    "info": "#4FA3C7",
+    "warning": "#DFA84A",
+    "danger": "#C96A73",
+    "light": "#D8E3EC",
+    "dark": "#071513",
+    "bg": "#0B1220",
+    "fg": "#E6EDF3",
+    "selectbg": "#2EC4B6",
+    "selectfg": "#071513",
+    "border": "#304258",
+    "inputfg": "#E6EDF3",
+    "inputbg": "#0F1927",
+    "active": "#1B293A",
+}
+MIDNIGHTSTUDIO_TOKENS = {
+    "surface": "#151F2E",
+    "surface_active": "#1B293A",
+    "text_secondary": "#9AAEC1",
+    "border": "#304258",
+    "focus": "#2EC4B6",
+    "disabled_bg": "#182331",
+    "disabled_fg": "#7E91A6",
+    "video_bg": "#000000",
+    "video_message_fg": "#AAB7C4",
+    "find_match_bg": "#5E4824",
+    "find_match_fg": "#FFE0A3",
+    "playback_word_bg": "#F2B84B",
+    "playback_word_fg": "#071513",
+}
+MIDNIGHTSTUDIO_STYLES = {
+    "shell": "MidnightStudio.TFrame",
+    "page": "MidnightStudio.Page.TFrame",
+    "card": "MidnightStudio.Card.TLabelframe",
+    "card_frame": "MidnightStudio.Card.TFrame",
+    "card_label": "MidnightStudio.Card.TLabel",
+    "card_secondary": "MidnightStudio.Card.Secondary.TLabel",
+    "card_checkbutton": "MidnightStudio.Card.TCheckbutton",
+    "card_radiobutton": "MidnightStudio.Card.TRadiobutton",
+    "card_entry": "MidnightStudio.Card.TEntry",
+    "card_combobox": "MidnightStudio.Card.TCombobox",
+    "card_spinbox": "MidnightStudio.Card.TSpinbox",
+    "title": "MidnightStudio.Title.TLabel",
+    "subtitle": "MidnightStudio.Subtitle.TLabel",
+    "secondary": "MidnightStudio.Secondary.TLabel",
+    "notebook": "MidnightStudio.TNotebook",
+    "notebook_tab": "MidnightStudio.TNotebook.Tab",
+    "review_title": "MidnightStudio.Review.Title.TLabel",
+    "review_paned": "MidnightStudio.Horizontal.TPanedwindow",
+    "review_scrollbar": "MidnightStudio.Vertical.TScrollbar",
+    "dialog_hscrollbar": "MidnightStudio.Horizontal.TScrollbar",
+    "review_scale": "MidnightStudio.Horizontal.TScale",
+    "dialog_warning": "MidnightStudio.Dialog.Warning.TLabel",
+    "srt_tree": "MidnightStudio.SrtMatches.Treeview",
+    "segment_tree": "MidnightStudio.SegmentCorrection.Treeview",
+}
+
+
+def register_midnightstudio_theme(root):
+    """Register and activate the application's dark ttkbootstrap theme."""
+    style = root.style
+    if MIDNIGHTSTUDIO_THEME_NAME not in style.theme_names():
+        style.register_theme(
+            ThemeDefinition(
+                MIDNIGHTSTUDIO_THEME_NAME,
+                MIDNIGHTSTUDIO_THEME_COLORS,
+                mode="dark",
+            )
+        )
+    style.theme_use(MIDNIGHTSTUDIO_THEME_NAME)
+    _configure_midnightstudio_styles(style)
+    root.configure(background=MIDNIGHTSTUDIO_THEME_COLORS["bg"])
+    root.option_add(
+        "*TCombobox*Listbox.background",
+        MIDNIGHTSTUDIO_THEME_COLORS["inputbg"],
+    )
+    root.option_add(
+        "*TCombobox*Listbox.foreground",
+        MIDNIGHTSTUDIO_THEME_COLORS["inputfg"],
+    )
+    root.option_add(
+        "*TCombobox*Listbox.selectBackground",
+        MIDNIGHTSTUDIO_THEME_COLORS["selectbg"],
+    )
+    root.option_add(
+        "*TCombobox*Listbox.selectForeground",
+        MIDNIGHTSTUDIO_THEME_COLORS["selectfg"],
+    )
+    return style
+
+
+def _configure_midnightstudio_styles(style):
+    colors = MIDNIGHTSTUDIO_THEME_COLORS
+    tokens = MIDNIGHTSTUDIO_TOKENS
+    styles = MIDNIGHTSTUDIO_STYLES
+
+    style.configure(styles["shell"], background=colors["bg"])
+    style.configure(styles["page"], background=colors["bg"])
+    style.configure(
+        styles["title"],
+        background=colors["bg"],
+        foreground=colors["fg"],
+        font=("Segoe UI", 18, "bold"),
+    )
+    style.configure(
+        styles["subtitle"],
+        background=colors["bg"],
+        foreground=tokens["text_secondary"],
+    )
+    style.configure(
+        styles["review_title"],
+        background=colors["bg"],
+        foreground=colors["fg"],
+        font=("Segoe UI", 16, "bold"),
+    )
+    style.configure(
+        styles["secondary"],
+        foreground=tokens["text_secondary"],
+    )
+
+    style.configure(
+        styles["notebook"],
+        background=colors["bg"],
+        borderwidth=0,
+        tabmargins=(4, 4, 4, 0),
+    )
+    style.configure(
+        styles["notebook_tab"],
+        background=tokens["surface"],
+        foreground=tokens["text_secondary"],
+        bordercolor=tokens["border"],
+        focuscolor=tokens["focus"],
+        padding=(18, 10),
+        font=("Segoe UI", 10, "bold"),
+    )
+    style.map(
+        styles["notebook_tab"],
+        background=[
+            ("selected", colors["primary"]),
+            ("active", tokens["surface_active"]),
+            ("focus", tokens["surface_active"]),
+        ],
+        foreground=[
+            ("selected", colors["selectfg"]),
+            ("disabled", tokens["disabled_fg"]),
+            ("active", colors["fg"]),
+            ("focus", colors["fg"]),
+        ],
+        bordercolor=[
+            ("selected", colors["primary"]),
+            ("focus", tokens["focus"]),
+            ("active", tokens["focus"]),
+        ],
+        lightcolor=[("selected", colors["primary"]), ("focus", tokens["focus"])],
+        darkcolor=[("selected", colors["primary"]), ("focus", tokens["focus"])],
+    )
+    style.configure(
+        styles["review_paned"],
+        background=tokens["border"],
+        bordercolor=tokens["border"],
+        sashrelief="flat",
+        sashwidth=8,
+    )
+    style.map(
+        styles["review_paned"],
+        background=[("focus", tokens["focus"]), ("active", tokens["surface_active"])],
+        bordercolor=[("focus", tokens["focus"]), ("active", tokens["focus"])],
+    )
+    style.configure(
+        styles["review_scrollbar"],
+        background=colors["secondary"],
+        troughcolor=tokens["surface"],
+        bordercolor=tokens["border"],
+        arrowcolor=colors["fg"],
+        lightcolor=colors["secondary"],
+        darkcolor=colors["secondary"],
+    )
+    style.map(
+        styles["review_scrollbar"],
+        background=[
+            ("disabled", tokens["disabled_bg"]),
+            ("pressed", colors["primary"]),
+            ("active", colors["primary"]),
+        ],
+        arrowcolor=[
+            ("disabled", tokens["disabled_fg"]),
+            ("pressed", colors["selectfg"]),
+            ("active", colors["selectfg"]),
+        ],
+    )
+    style.configure(
+        styles["dialog_hscrollbar"],
+        background=colors["secondary"],
+        troughcolor=tokens["surface"],
+        bordercolor=tokens["border"],
+        arrowcolor=colors["fg"],
+        lightcolor=colors["secondary"],
+        darkcolor=colors["secondary"],
+    )
+    style.map(
+        styles["dialog_hscrollbar"],
+        background=[
+            ("disabled", tokens["disabled_bg"]),
+            ("pressed", colors["primary"]),
+            ("active", colors["primary"]),
+        ],
+        arrowcolor=[
+            ("disabled", tokens["disabled_fg"]),
+            ("pressed", colors["selectfg"]),
+            ("active", colors["selectfg"]),
+        ],
+    )
+    style.configure(
+        styles["review_scale"],
+        background=colors["primary"],
+        troughcolor=colors["inputbg"],
+        bordercolor=tokens["border"],
+        lightcolor=colors["primary"],
+        darkcolor=colors["primary"],
+    )
+    style.map(
+        styles["review_scale"],
+        background=[
+            ("disabled", tokens["disabled_fg"]),
+            ("pressed", colors["warning"]),
+            ("active", colors["warning"]),
+        ],
+        bordercolor=[("focus", tokens["focus"])],
+    )
+    style.configure(
+        styles["dialog_warning"],
+        background=tokens["surface_active"],
+        foreground=colors["warning"],
+        bordercolor=tokens["border"],
+        relief="solid",
+        borderwidth=1,
+        padding=(8, 6),
+        font=("Segoe UI", 9, "bold"),
+    )
+
+    for tree_style in (styles["srt_tree"], styles["segment_tree"]):
+        style.configure(
+            tree_style,
+            background=colors["inputbg"],
+            foreground=colors["inputfg"],
+            fieldbackground=colors["inputbg"],
+            bordercolor=tokens["border"],
+            lightcolor=tokens["border"],
+            darkcolor=tokens["border"],
+            rowheight=25,
+            relief="flat",
+        )
+        style.map(
+            tree_style,
+            background=[
+                ("selected", colors["selectbg"]),
+                ("disabled", tokens["disabled_bg"]),
+            ],
+            foreground=[
+                ("selected", colors["selectfg"]),
+                ("disabled", tokens["disabled_fg"]),
+            ],
+            bordercolor=[("focus", tokens["focus"])],
+            lightcolor=[("focus", tokens["focus"])],
+            darkcolor=[("focus", tokens["focus"])],
+        )
+        heading_style = f"{tree_style}.Heading"
+        style.configure(
+            heading_style,
+            background=tokens["surface_active"],
+            foreground=colors["fg"],
+            bordercolor=tokens["border"],
+            lightcolor=tokens["border"],
+            darkcolor=tokens["border"],
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            padding=(8, 6),
+        )
+        style.map(
+            heading_style,
+            background=[
+                ("pressed", colors["primary"]),
+                ("active", colors["secondary"]),
+            ],
+            foreground=[("pressed", colors["selectfg"]), ("active", colors["fg"])],
+            bordercolor=[("focus", tokens["focus"]), ("active", tokens["focus"])],
+        )
+
+    style.configure(
+        styles["card"],
+        background=tokens["surface"],
+        bordercolor=tokens["border"],
+        lightcolor=tokens["border"],
+        darkcolor=tokens["border"],
+        relief="solid",
+        borderwidth=1,
+    )
+    style.configure(
+        f"{styles['card']}.Label",
+        background=tokens["surface"],
+        foreground=colors["fg"],
+        font=("Segoe UI", 10, "bold"),
+    )
+    style.configure(styles["card_frame"], background=tokens["surface"])
+    style.configure(
+        styles["card_label"],
+        background=tokens["surface"],
+        foreground=colors["fg"],
+    )
+    style.configure(
+        styles["card_secondary"],
+        background=tokens["surface"],
+        foreground=tokens["text_secondary"],
+    )
+    for widget_style in (styles["card_checkbutton"], styles["card_radiobutton"]):
+        style.configure(
+            widget_style,
+            background=tokens["surface"],
+            foreground=colors["fg"],
+            focuscolor=tokens["focus"],
+        )
+        style.map(
+            widget_style,
+            background=[
+                ("disabled", tokens["surface"]),
+                ("active", tokens["surface_active"]),
+            ],
+            foreground=[
+                ("disabled", tokens["disabled_fg"]),
+                ("active", colors["fg"]),
+            ],
+        )
+
+    for widget_style in (
+        styles["card_entry"],
+        styles["card_combobox"],
+        styles["card_spinbox"],
+    ):
+        style.configure(
+            widget_style,
+            fieldbackground=colors["inputbg"],
+            background=colors["inputbg"],
+            foreground=colors["inputfg"],
+            bordercolor=tokens["border"],
+            lightcolor=tokens["border"],
+            darkcolor=tokens["border"],
+            insertcolor=colors["fg"],
+            arrowcolor=tokens["text_secondary"],
+        )
+        style.map(
+            widget_style,
+            fieldbackground=[
+                ("disabled", tokens["disabled_bg"]),
+                ("readonly", colors["inputbg"]),
+            ],
+            background=[("disabled", tokens["disabled_bg"])],
+            foreground=[
+                ("disabled", tokens["disabled_fg"]),
+                ("readonly", colors["inputfg"]),
+            ],
+            bordercolor=[
+                ("focus", tokens["focus"]),
+                ("invalid", colors["danger"]),
+            ],
+            lightcolor=[("focus", tokens["focus"])],
+            darkcolor=[("focus", tokens["focus"])],
+            arrowcolor=[
+                ("disabled", tokens["disabled_fg"]),
+                ("active", colors["primary"]),
+            ],
+        )
+
+    for widget_style in ("TEntry", "TCombobox", "TSpinbox"):
+        style.map(
+            widget_style,
+            fieldbackground=[("disabled", tokens["disabled_bg"])],
+            foreground=[("disabled", tokens["disabled_fg"])],
+            bordercolor=[("focus", tokens["focus"]), ("invalid", colors["danger"])],
+            lightcolor=[("focus", tokens["focus"])],
+            darkcolor=[("focus", tokens["focus"])],
+        )
+    for widget_style in ("TButton", "TCheckbutton", "TRadiobutton"):
+        style.map(widget_style, foreground=[("disabled", tokens["disabled_fg"])])
+
+
+def apply_midnightstudio_card_style(container):
+    """Apply surface-aware styles to a card and its non-button ttk children."""
+    styles = MIDNIGHTSTUDIO_STYLES
+    container.configure(style=styles["card"])
+    widget_styles = (
+        (ttk.LabelFrame, styles["card"]),
+        (ttk.Frame, styles["card_frame"]),
+        (ttk.Label, styles["card_label"]),
+        (ttk.Checkbutton, styles["card_checkbutton"]),
+        (ttk.Radiobutton, styles["card_radiobutton"]),
+        (ttk.Combobox, styles["card_combobox"]),
+        (ttk.Spinbox, styles["card_spinbox"]),
+        (ttk.Entry, styles["card_entry"]),
+    )
+    for child in container.winfo_children():
+        for widget_type, widget_style in widget_styles:
+            if isinstance(child, widget_type):
+                child.configure(style=widget_style)
+                break
+        if not isinstance(child, (ttk.Button, ttk.Scrollbar)):
+            apply_midnightstudio_descendant_styles(child, widget_styles)
+
+
+def apply_midnightstudio_descendant_styles(container, widget_styles):
+    for child in container.winfo_children():
+        for widget_type, widget_style in widget_styles:
+            if isinstance(child, widget_type):
+                child.configure(style=widget_style)
+                break
+        if not isinstance(child, (ttk.Button, ttk.Scrollbar)):
+            apply_midnightstudio_descendant_styles(child, widget_styles)
+
+
+def reinforce_midnightstudio_control_states(style):
+    """Add accessible disabled/focus states without replacing hover/press maps."""
+    tokens = MIDNIGHTSTUDIO_TOKENS
+    button_styles = (
+        "TButton",
+        "primary.TButton",
+        "primary.Outline.TButton",
+        "secondary.Outline.TButton",
+        "success.TButton",
+        "warning.Outline.TButton",
+        "danger.Outline.TButton",
+    )
+
+    def prepend_state(widget_style, option, state, value):
+        existing = style.map(widget_style, query_opt=option)
+        retained = [item for item in existing if state not in item[:-1]]
+        style.map(widget_style, **{option: [(state, value), *retained]})
+
+    for widget_style in button_styles:
+        prepend_state(widget_style, "foreground", "disabled", tokens["disabled_fg"])
+        prepend_state(widget_style, "background", "disabled", tokens["disabled_bg"])
+        prepend_state(widget_style, "bordercolor", "focus", tokens["focus"])
+        prepend_state(widget_style, "lightcolor", "focus", tokens["focus"])
+        prepend_state(widget_style, "darkcolor", "focus", tokens["focus"])
+
+
+def style_midnightstudio_text(text_widget, *, readonly=False):
+    colors = MIDNIGHTSTUDIO_THEME_COLORS
+    tokens = MIDNIGHTSTUDIO_TOKENS
+    text_widget.configure(
+        background=tokens["disabled_bg"] if readonly else colors["inputbg"],
+        foreground=tokens["disabled_fg"] if readonly else colors["fg"],
+        insertbackground=tokens["focus"],
+        selectbackground=colors["selectbg"],
+        selectforeground=colors["selectfg"],
+        relief="flat",
+        borderwidth=0,
+        highlightthickness=1,
+        highlightbackground=tokens["border"],
+        highlightcolor=tokens["focus"],
+    )
+
+
+def style_midnightstudio_canvas(canvas):
+    tokens = MIDNIGHTSTUDIO_TOKENS
+    canvas.configure(
+        background=tokens["surface"],
+        highlightthickness=1,
+        highlightbackground=tokens["border"],
+        highlightcolor=tokens["focus"],
+        borderwidth=0,
+        takefocus=True,
+    )
+
+
+def style_midnightstudio_listbox(listbox):
+    colors = MIDNIGHTSTUDIO_THEME_COLORS
+    tokens = MIDNIGHTSTUDIO_TOKENS
+    listbox.configure(
+        background=colors["inputbg"],
+        foreground=colors["fg"],
+        selectbackground=colors["selectbg"],
+        selectforeground=colors["selectfg"],
+        disabledforeground=tokens["disabled_fg"],
+        activestyle="dotbox",
+        relief="flat",
+        borderwidth=0,
+        highlightthickness=1,
+        highlightbackground=tokens["border"],
+        highlightcolor=tokens["focus"],
+        takefocus=True,
+    )
+
+
+def style_midnightstudio_native_panedwindow(panedwindow):
+    tokens = MIDNIGHTSTUDIO_TOKENS
+    panedwindow.configure(
+        background=tokens["border"],
+        proxybackground=tokens["focus"],
+        proxyborderwidth=0,
+        sashrelief="flat",
+        sashcursor="sb_v_double_arrow",
+    )
+
+
+def style_midnightstudio_toplevel(window):
+    """Apply the centralized dark shell to an application-created Toplevel."""
+    window.configure(background=MIDNIGHTSTUDIO_THEME_COLORS["bg"])
+
+
+def style_midnightstudio_review_buttons(container):
+    """Give otherwise unstyled Review buttons a quiet secondary treatment."""
+    for child in container.winfo_children():
+        if isinstance(child, ttk.Button):
+            current_style = str(child.cget("style") or "")
+            if current_style in ("", "TButton"):
+                child.configure(style="secondary.Outline.TButton")
+        style_midnightstudio_review_buttons(child)
 
 # === word-level exporters (VTT, ASS, and HTML player) ========================
 def _has_word_level(segments):
@@ -920,22 +1443,44 @@ def _ner_device_info(engine: str) -> str:
 class NERSelectDialog(tk.Toplevel):
     def __init__(self, master, initial: str = "auto"):
         super().__init__(master)
+        style_midnightstudio_toplevel(self)
         self.title("NER Engine")
         self.geometry("340x180")
         self.resizable(False, False)
         self.result = None
-        frm = ttk.Frame(self, padding=10)
+        frm = ttk.Frame(
+            self,
+            padding=10,
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
         frm.pack(fill="both", expand=True)
         ttk.Label(frm, text="Choose NER engine:").pack(anchor="w")
         self.var_engine = tk.StringVar(value=initial)
-        self.cb = ttk.Combobox(frm, textvariable=self.var_engine, values=_NER_CHOICES, state="readonly", width=16)
+        self.cb = ttk.Combobox(
+            frm,
+            textvariable=self.var_engine,
+            values=_NER_CHOICES,
+            state="readonly",
+            width=16,
+            style=MIDNIGHTSTUDIO_STYLES["card_combobox"],
+        )
         self.cb.pack(anchor="w", pady=(6, 8))
-        self.lbl = ttk.Label(frm, text="", foreground="#555")
+        self.lbl = ttk.Label(
+            frm,
+            text="",
+            style=MIDNIGHTSTUDIO_STYLES["secondary"],
+        )
         self.lbl.pack(anchor="w")
-        btns = ttk.Frame(frm)
+        btns = ttk.Frame(frm, style=MIDNIGHTSTUDIO_STYLES["page"])
         btns.pack(fill="x", pady=(10, 0))
-        ttk.Button(btns, text="OK", command=self._accept).pack(side="right")
-        ttk.Button(btns, text="Cancel", command=self._cancel).pack(side="right", padx=6)
+        tb.Button(btns, text="OK", command=self._accept, bootstyle="primary").pack(side="right")
+        tb.Button(
+            btns,
+            text="Cancel",
+            command=self._cancel,
+            bootstyle="secondary-outline",
+        ).pack(side="right", padx=6)
+        reinforce_midnightstudio_control_states(tb.Style.get_instance() or tb.Style())
         self.transient(master)
         self.grab_set()
         self.protocol("WM_DELETE_WINDOW", self._cancel)
@@ -957,6 +1502,7 @@ class NERSelectDialog(tk.Toplevel):
 class _SrtHitsDialog(tk.Toplevel):
     def __init__(self, parent, hits):
         super().__init__(parent)
+        style_midnightstudio_toplevel(self)
         self.title("SRT Matches")
         self.resizable(True, True)
         self.transient(parent)
@@ -964,24 +1510,15 @@ class _SrtHitsDialog(tk.Toplevel):
         self.result = None
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
-        frame = ttk.Frame(self, padding=8)
+        frame = ttk.Frame(
+            self,
+            padding=8,
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
         frame.grid(row=0, column=0, sticky="nsew")
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
-        tree_style_name = "SrtMatches.Treeview"
-        tree_style = tb.Style.get_instance() or tb.Style()
-        colors = tree_style.colors
-        tree_style.configure(
-            tree_style_name,
-            background=colors.inputbg,
-            foreground=colors.inputfg,
-            fieldbackground=colors.inputbg,
-        )
-        tree_style.map(
-            tree_style_name,
-            background=[("selected", colors.primary)],
-            foreground=[("selected", colors.get_foreground("primary"))],
-        )
+        tree_style_name = MIDNIGHTSTUDIO_STYLES["srt_tree"]
         self.tree = ttk.Treeview(
             frame,
             columns=("time","text"),
@@ -995,7 +1532,12 @@ class _SrtHitsDialog(tk.Toplevel):
         self.tree.column("time", width=110, anchor="w")
         self.tree.column("text", width=680, anchor="w")
         self.tree.grid(row=0, column=0, sticky="nsew")
-        ybar = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        ybar = ttk.Scrollbar(
+            frame,
+            orient="vertical",
+            command=self.tree.yview,
+            style=MIDNIGHTSTUDIO_STYLES["review_scrollbar"],
+        )
         self.tree.configure(yscrollcommand=ybar.set)
         ybar.grid(row=0, column=1, sticky="ns")
         for i, h in enumerate(self.hits):
@@ -1008,11 +1550,22 @@ class _SrtHitsDialog(tk.Toplevel):
             self.tree.selection_set(first_item[0])
             self.tree.focus(first_item[0])
             self.tree.see(first_item[0])
-        btns = ttk.Frame(frame)
+        btns = ttk.Frame(frame, style=MIDNIGHTSTUDIO_STYLES["page"])
         btns.grid(row=1, column=0, columnspan=2, sticky="e", pady=(8,0))
-        self.btn_open = ttk.Button(btns, text="Open at time", command=self._on_open)
+        self.btn_open = tb.Button(
+            btns,
+            text="Open at time",
+            command=self._on_open,
+            bootstyle="primary",
+        )
         self.btn_open.pack(side="right", padx=(0,8))
-        ttk.Button(btns, text="Cancel", command=self._on_cancel).pack(side="right")
+        tb.Button(
+            btns,
+            text="Cancel",
+            command=self._on_cancel,
+            bootstyle="secondary-outline",
+        ).pack(side="right")
+        reinforce_midnightstudio_control_states(tb.Style.get_instance() or tb.Style())
         self.tree.bind("<ButtonRelease-1>", self._select_clicked_row, add="+")
         self.tree.bind("<Double-1>", lambda e: self._on_open())
         self.bind("<Return>", lambda e: self._on_open())
@@ -1092,6 +1645,7 @@ def _write_corrected_segments_json(
 class SegmentCorrectionDialog(tk.Toplevel):
     def __init__(self, parent, segments, speakers, name_mapping):
         super().__init__(parent)
+        style_midnightstudio_toplevel(self)
         self.title("Review Speaker Segments")
         self.geometry("1100x650")
         self.minsize(820, 480)
@@ -1127,39 +1681,34 @@ class SegmentCorrectionDialog(tk.Toplevel):
         search_entry = ttk.Entry(filters, textvariable=self.var_search, width=34)
         search_entry.grid(row=0, column=3, sticky="w")
         search_entry.bind("<KeyRelease>", self._populate_tree)
-        tb.Label(
+        self.lbl_segment_warning = ttk.Label(
             filters,
             text=(
                 "Whole-segment correction only: each row is one indivisible segments.json entry. "
                 "If a row contains dialogue from more than one real speaker, this version cannot split "
                 "the text inside it. Assigning changes the entire row."
             ),
-            bootstyle="warning",
-            font=("Segoe UI", 9, "bold"),
+            style=MIDNIGHTSTUDIO_STYLES["dialog_warning"],
             justify="left",
             wraplength=1000,
-            padding=(8, 6),
-        ).grid(row=1, column=0, columnspan=5, sticky="ew", pady=(8, 0))
+        )
+        self.lbl_segment_warning.grid(
+            row=1,
+            column=0,
+            columnspan=5,
+            sticky="ew",
+            pady=(8, 0),
+        )
 
-        tree_frame = ttk.Frame(self, padding=(12, 0))
+        tree_frame = ttk.Frame(
+            self,
+            padding=(12, 0),
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
         tree_frame.grid(row=1, column=0, sticky="nsew")
         tree_frame.columnconfigure(0, weight=1)
         tree_frame.rowconfigure(0, weight=1)
-        tree_style_name = "SegmentCorrection.Treeview"
-        tree_style = tb.Style.get_instance() or tb.Style()
-        colors = tree_style.colors
-        tree_style.configure(
-            tree_style_name,
-            background=colors.inputbg,
-            foreground=colors.inputfg,
-            fieldbackground=colors.inputbg,
-            rowheight=25,
-        )
-        tree_style.map(
-            tree_style_name,
-            background=[("selected", colors.primary)],
-            foreground=[("selected", colors.get_foreground("primary"))],
-        )
+        tree_style_name = MIDNIGHTSTUDIO_STYLES["segment_tree"]
         self.tree = ttk.Treeview(
             tree_frame,
             columns=("start", "speaker", "transcript"),
@@ -1174,8 +1723,18 @@ class SegmentCorrectionDialog(tk.Toplevel):
         self.tree.column("speaker", width=210, minwidth=150, stretch=False, anchor="w")
         self.tree.column("transcript", width=700, minwidth=300, stretch=True, anchor="w")
         self.tree.grid(row=0, column=0, sticky="nsew")
-        yscroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
-        xscroll = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
+        yscroll = ttk.Scrollbar(
+            tree_frame,
+            orient="vertical",
+            command=self.tree.yview,
+            style=MIDNIGHTSTUDIO_STYLES["review_scrollbar"],
+        )
+        xscroll = ttk.Scrollbar(
+            tree_frame,
+            orient="horizontal",
+            command=self.tree.xview,
+            style=MIDNIGHTSTUDIO_STYLES["dialog_hscrollbar"],
+        )
         self.tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
         yscroll.grid(row=0, column=1, sticky="ns")
         xscroll.grid(row=1, column=0, sticky="ew")
@@ -1200,10 +1759,20 @@ class SegmentCorrectionDialog(tk.Toplevel):
             bootstyle="primary",
         ).grid(row=0, column=2, sticky="w")
 
-        buttons = ttk.Frame(self, padding=12)
+        buttons = ttk.Frame(
+            self,
+            padding=12,
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
         buttons.grid(row=3, column=0, sticky="e")
         tb.Button(buttons, text="Save Corrections", command=self._save, bootstyle="success", padding=(16, 6)).pack(side="right")
         tb.Button(buttons, text="Cancel", command=self._cancel, bootstyle="secondary-outline", padding=(14, 6)).pack(side="right", padx=(0, 8))
+        for card in (filters, assignment):
+            apply_midnightstudio_card_style(card)
+        self.lbl_segment_warning.configure(
+            style=MIDNIGHTSTUDIO_STYLES["dialog_warning"]
+        )
+        reinforce_midnightstudio_control_states(tb.Style.get_instance() or tb.Style())
 
         self.tree.bind("<Control-a>", self._select_all_visible)
         self.tree.bind("<Control-A>", self._select_all_visible)
@@ -1396,7 +1965,7 @@ class NamingWorkspace(ttk.Frame):
         discard_label="Cancel",
         result_preflight=None,
     ):
-        super().__init__(master)
+        super().__init__(master, style=MIDNIGHTSTUDIO_STYLES["page"])
         self._on_apply_complete = on_apply_complete
         self._on_discard = on_discard
         self._discard_label = discard_label
@@ -1478,16 +2047,41 @@ class NamingWorkspace(ttk.Frame):
             c = Counter(_extract_candidates_from_text(" ".join(str(s.get("text","")) for s in self.segments if (s.get("speaker") == spk))))
             c.update(addressed_counts.get(spk, Counter()))
             per_spk_counts[spk] = c
-        main = ttk.Frame(self, padding=14)
+        main = ttk.Frame(
+            self,
+            padding=14,
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
         main.pack(fill="both", expand=True)
         main.columnconfigure(0, weight=1)
         main.rowconfigure(2, weight=1)
-        ttk.Label(main, text="Name Speakers", font=("Segoe UI", 16, "bold")).grid(row=0, column=0, sticky="w")
-        ttk.Label(main, text=f"{self.title_name} — assign names and review the transcript").grid(row=1, column=0, sticky="w", pady=(2, 10))
-        self._workspace_paned = ttk.PanedWindow(main, orient="horizontal")
+        ttk.Label(
+            main,
+            text="Name Speakers",
+            style=MIDNIGHTSTUDIO_STYLES["review_title"],
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            main,
+            text=f"{self.title_name} — assign names and review the transcript",
+            style=MIDNIGHTSTUDIO_STYLES["subtitle"],
+        ).grid(row=1, column=0, sticky="w", pady=(2, 10))
+        self._workspace_paned = ttk.PanedWindow(
+            main,
+            orient="horizontal",
+            style=MIDNIGHTSTUDIO_STYLES["review_paned"],
+            takefocus=True,
+        )
         self._workspace_paned.grid(row=2, column=0, sticky="nsew")
-        left = ttk.Frame(self._workspace_paned, padding=(0, 0, 6, 0))
-        right = ttk.Frame(self._workspace_paned, padding=(6, 0, 0, 0))
+        left = ttk.Frame(
+            self._workspace_paned,
+            padding=(0, 0, 6, 0),
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
+        right = ttk.Frame(
+            self._workspace_paned,
+            padding=(6, 0, 0, 0),
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
         self._workspace_paned.add(left, weight=2)
         self._workspace_paned.add(right, weight=3)
         left.columnconfigure(0, weight=1)
@@ -1511,7 +2105,14 @@ class NamingWorkspace(ttk.Frame):
         ttk.Label(assignment_headings, text="Assigned name", font=("Segoe UI", 9, "bold")).grid(row=0, column=2, sticky="w")
 
         speaker_canvas = tk.Canvas(assignments, height=155, highlightthickness=0, borderwidth=0)
-        speaker_scroll = ttk.Scrollbar(assignments, orient="vertical", command=speaker_canvas.yview)
+        self.speaker_canvas = speaker_canvas
+        style_midnightstudio_canvas(speaker_canvas)
+        speaker_scroll = ttk.Scrollbar(
+            assignments,
+            orient="vertical",
+            command=speaker_canvas.yview,
+            style=MIDNIGHTSTUDIO_STYLES["review_scrollbar"],
+        )
         speaker_canvas.configure(yscrollcommand=speaker_scroll.set)
         speaker_canvas.grid(row=1, column=0, sticky="nsew")
         speaker_scroll.grid(row=1, column=1, sticky="ns")
@@ -1598,7 +2199,13 @@ class NamingWorkspace(ttk.Frame):
         pool_inner.rowconfigure(0, weight=1)
 
         self.name_pool = tk.Listbox(pool_inner, height=6, exportselection=False)
-        pool_scroll = ttk.Scrollbar(pool_inner, orient="vertical", command=self.name_pool.yview)
+        style_midnightstudio_listbox(self.name_pool)
+        pool_scroll = ttk.Scrollbar(
+            pool_inner,
+            orient="vertical",
+            command=self.name_pool.yview,
+            style=MIDNIGHTSTUDIO_STYLES["review_scrollbar"],
+        )
         self.name_pool.configure(yscrollcommand=pool_scroll.set)
 
         self.name_pool.grid(row=0, column=0, sticky="nsew")
@@ -1665,9 +2272,9 @@ class NamingWorkspace(ttk.Frame):
         ttk.Checkbutton(opts, text="Word-level LRC (CapCut)", variable=self.var_export_lrc).grid(row=7, column=0, sticky="w", pady=(2, 0))
         ttk.Checkbutton(opts, text="ASS (plain, no karaoke)", variable=self.var_export_ass_plain).grid(row=8, column=0, sticky="w", pady=(2, 0))
 
-        btns = ttk.Frame(left)
+        btns = ttk.Frame(left, style=MIDNIGHTSTUDIO_STYLES["page"])
         btns.grid(row=3, column=0, sticky="ew")
-        tb.Button(btns, text="Apply", command=self.apply_changes, bootstyle="success", padding=(16, 6)).pack(side="right")
+        tb.Button(btns, text="Apply", command=self.apply_changes, bootstyle="primary", padding=(16, 6)).pack(side="right")
         tb.Button(
             btns,
             text=self._discard_label,
@@ -1715,6 +2322,7 @@ class NamingWorkspace(ttk.Frame):
             opaqueresize=True,
             borderwidth=0,
         )
+        style_midnightstudio_native_panedwindow(self._preview_paned)
         self._preview_paned.grid(row=1, column=0, sticky="nsew")
 
         video = ttk.LabelFrame(self._preview_paned, text="Video Preview", padding=8)
@@ -1731,7 +2339,7 @@ class NamingWorkspace(ttk.Frame):
             video_host,
             width=480,
             height=270,
-            background="black",
+            background=MIDNIGHTSTUDIO_TOKENS["video_bg"],
             highlightthickness=0,
             borderwidth=0,
         )
@@ -1739,8 +2347,8 @@ class NamingWorkspace(ttk.Frame):
         self.video_message = tk.Label(
             self.video_surface,
             text="No video loaded",
-            background="black",
-            foreground="#c8c8c8",
+            background=MIDNIGHTSTUDIO_TOKENS["video_bg"],
+            foreground=MIDNIGHTSTUDIO_TOKENS["video_message_fg"],
             justify="center",
             wraplength=430,
         )
@@ -1761,7 +2369,13 @@ class NamingWorkspace(ttk.Frame):
         self.lbl_video_time.grid(row=0, column=5, sticky="e")
 
         self.video_seek_var = tk.DoubleVar(value=0.0)
-        self.video_seek = ttk.Scale(player_controls, from_=0.0, to=1.0, variable=self.video_seek_var)
+        self.video_seek = ttk.Scale(
+            player_controls,
+            from_=0.0,
+            to=1.0,
+            variable=self.video_seek_var,
+            style=MIDNIGHTSTUDIO_STYLES["review_scale"],
+        )
         self.video_seek.grid(row=1, column=0, columnspan=6, sticky="ew", pady=(8, 0))
         self.video_seek.bind("<ButtonPress-1>", self._video_seek_started)
         self.video_seek.bind("<ButtonRelease-1>", self._video_seek_released)
@@ -1791,6 +2405,7 @@ class NamingWorkspace(ttk.Frame):
             length=120,
             variable=self.video_volume_var,
             command=self._video_volume_changed,
+            style=MIDNIGHTSTUDIO_STYLES["review_scale"],
         )
         self.video_volume.grid(row=0, column=4, sticky="e")
         self._video_controls = [
@@ -1846,6 +2461,7 @@ class NamingWorkspace(ttk.Frame):
         ).pack(side="left", padx=(6, 0))
 
         self.text = tk.Text(viewer, wrap="word", height=8)
+        style_midnightstudio_text(self.text)
         self.transcript_font = tkfont.Font(root=self, font=self.text.cget("font"))
         try:
             captured_font_size = abs(int(self.transcript_font.cget("size")))
@@ -1859,10 +2475,20 @@ class NamingWorkspace(ttk.Frame):
         initial_font_size = self._validated_transcript_font_size(
             self._naming_cfg.get("name_speakers_transcript_font_size")
         )
-        yscroll = ttk.Scrollbar(viewer, orient="vertical", command=self._on_transcript_scrollbar)
+        yscroll = ttk.Scrollbar(
+            viewer,
+            orient="vertical",
+            command=self._on_transcript_scrollbar,
+            style=MIDNIGHTSTUDIO_STYLES["review_scrollbar"],
+        )
         self.text.configure(yscrollcommand=yscroll.set)
         self.text.grid(row=1, column=0, sticky="nsew")
         yscroll.grid(row=1, column=1, sticky="ns")
+        for card in (assignments, pool_frame, opts, toolbar, video, viewer):
+            apply_midnightstudio_card_style(card)
+        style_midnightstudio_review_buttons(main)
+        self.btn_video_stop.configure(style="danger.Outline.TButton")
+        reinforce_midnightstudio_control_states(tb.Style.get_instance() or tb.Style())
         self._set_transcript_font_size(initial_font_size)
         self.text.bind("<Control-MouseWheel>", self._on_transcript_ctrl_mousewheel)
         self.text.bind("<Control-Button-4>", self._on_transcript_ctrl_mousewheel)
@@ -3062,15 +3688,9 @@ class NamingWorkspace(ttk.Frame):
         self._update_dirty_state()
 
     def _configure_transcript_word_tags(self):
-        try:
-            style = tb.Style.get_instance() or tb.Style()
-            hover_color = style.colors.primary
-            current_background = style.colors.primary
-            current_foreground = style.colors.get_foreground("primary")
-        except Exception:
-            hover_color = "#0d6efd"
-            current_background = "#0d6efd"
-            current_foreground = "#ffffff"
+        hover_color = MIDNIGHTSTUDIO_THEME_COLORS["primary"]
+        current_background = MIDNIGHTSTUDIO_TOKENS["playback_word_bg"]
+        current_foreground = MIDNIGHTSTUDIO_TOKENS["playback_word_fg"]
         self._transcript_default_cursor = self.text.cget("cursor") or "xterm"
         self.text.tag_configure("clickable_word")
         self.text.tag_configure("hover_word", foreground=hover_color, underline=True)
@@ -3652,7 +4272,11 @@ class NamingWorkspace(ttk.Frame):
 
     def _reset_highlight(self):
         self.text.tag_delete("find")
-        self.text.tag_configure("find", background="#fff59d")
+        self.text.tag_configure(
+            "find",
+            background=MIDNIGHTSTUDIO_TOKENS["find_match_bg"],
+            foreground=MIDNIGHTSTUDIO_TOKENS["find_match_fg"],
+        )
         self.text.tag_raise("current_word")
 
     def _highlight_query(self, query: str):
@@ -4382,6 +5006,7 @@ class NamingDialog(tk.Toplevel):
 
     def __init__(self, master, speakers_json: Path, segments_json: Path):
         super().__init__(master)
+        style_midnightstudio_toplevel(self)
         self.title("Name Speakers")
         self.geometry("1180x700")
         self.minsize(960, 600)
@@ -4426,7 +5051,7 @@ class ReviewNamePage(ttk.Frame):
         apply_complete_callback=None,
         report_callback=None,
     ):
-        super().__init__(master)
+        super().__init__(master, style=MIDNIGHTSTUDIO_STYLES["page"])
         self._open_latest_callback = open_latest_callback
         self._back_to_transcribe_callback = back_to_transcribe_callback
         self._apply_complete_callback = apply_complete_callback
@@ -4437,14 +5062,18 @@ class ReviewNamePage(ttk.Frame):
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
 
-        self.empty_state = ttk.Frame(self, padding=16)
+        self.empty_state = ttk.Frame(
+            self,
+            padding=16,
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
         self.empty_state.grid(row=0, column=0, sticky="nsew")
         self.empty_state.columnconfigure(0, weight=1)
         self.empty_state.rowconfigure(2, weight=1)
         ttk.Label(
             self.empty_state,
             text="Review & Name",
-            font=("Segoe UI", 18, "bold"),
+            style=MIDNIGHTSTUDIO_STYLES["title"],
         ).grid(row=0, column=0, sticky="w", pady=(0, 10))
         empty_card = ttk.LabelFrame(self.empty_state, text="Completed Results", padding=16)
         empty_card.grid(row=1, column=0, sticky="ew")
@@ -4465,6 +5094,7 @@ class ReviewNamePage(ttk.Frame):
             bootstyle="primary-outline",
             padding=(16, 6),
         ).grid(row=1, column=0, sticky="w", pady=(12, 0))
+        apply_midnightstudio_card_style(empty_card)
 
     @staticmethod
     def _validated_result_paths(speakers_json, segments_json):
@@ -4669,7 +5299,8 @@ class ReviewNamePage(ttk.Frame):
 
 class App(ttk.Frame):
     def __init__(self, master):
-        super().__init__(master, padding=8)
+        register_midnightstudio_theme(master)
+        super().__init__(master, padding=8, style=MIDNIGHTSTUDIO_STYLES["shell"])
         self.master = master
         self.grid(sticky="nsew")
         self.master.rowconfigure(0, weight=1)
@@ -4714,7 +5345,7 @@ class App(ttk.Frame):
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
 
-        self.notebook = ttk.Notebook(self)
+        self.notebook = ttk.Notebook(self, style=MIDNIGHTSTUDIO_STYLES["notebook"])
         self.notebook.grid(row=0, column=0, sticky="nsew")
         self.review_page = ReviewNamePage(
             self.notebook,
@@ -4724,10 +5355,22 @@ class App(ttk.Frame):
             report_callback=self.log,
         )
         self.pages = {
-            "transcribe": ttk.Frame(self.notebook, padding=8),
+            "transcribe": ttk.Frame(
+                self.notebook,
+                padding=8,
+                style=MIDNIGHTSTUDIO_STYLES["page"],
+            ),
             "review": self.review_page,
-            "activity": ttk.Frame(self.notebook, padding=8),
-            "settings": ttk.Frame(self.notebook, padding=8),
+            "activity": ttk.Frame(
+                self.notebook,
+                padding=8,
+                style=MIDNIGHTSTUDIO_STYLES["page"],
+            ),
+            "settings": ttk.Frame(
+                self.notebook,
+                padding=8,
+                style=MIDNIGHTSTUDIO_STYLES["page"],
+            ),
         }
         self.notebook.add(self.pages["transcribe"], text="Transcribe")
         self.notebook.add(self.pages["review"], text="Review & Name")
@@ -4739,11 +5382,23 @@ class App(ttk.Frame):
         transcribe.columnconfigure(0, weight=1)
         transcribe.rowconfigure(4, weight=1)
 
-        header = ttk.Frame(transcribe, padding=(8, 4, 8, 8))
+        header = ttk.Frame(
+            transcribe,
+            padding=(8, 4, 8, 8),
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(0, weight=1)
-        ttk.Label(header, text="Transcript Studio", font=("Segoe UI", 18, "bold")).grid(row=0, column=0, sticky="w")
-        ttk.Label(header, text="Local transcription, speaker review, and subtitle tools").grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ttk.Label(
+            header,
+            text="Transcript Studio",
+            style=MIDNIGHTSTUDIO_STYLES["title"],
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            header,
+            text="Local transcription, speaker review, and subtitle tools",
+            style=MIDNIGHTSTUDIO_STYLES["subtitle"],
+        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
         self.lbl_status = tb.Label(header, text="Ready", bootstyle="secondary")
         self.lbl_status.grid(row=0, column=1, rowspan=2, sticky="e", padx=(12, 0))
 
@@ -4771,22 +5426,30 @@ class App(ttk.Frame):
         ttk.Radiobutton(output_options, text="TXT", variable=self.var_output, value="txt").pack(side="left", padx=(8, 0))
         ttk.Frame(transcription_settings).grid(row=0, column=7, sticky="ew")
 
-        actions = ttk.Frame(transcribe, padding=(0, 2, 0, 10))
+        actions = ttk.Frame(
+            transcribe,
+            padding=(0, 2, 0, 10),
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
         actions.grid(row=3, column=0, sticky="ew")
-        self.btn_start = tb.Button(actions, text="Start Transcription", command=self.on_run, bootstyle="success", padding=(20, 8))
+        self.btn_start = tb.Button(actions, text="Start Transcription", command=self.on_run, bootstyle="primary", padding=(20, 8))
         self.btn_start.pack(side="left")
         self.btn_cancel = tb.Button(actions, text="Cancel", command=self.on_stop, bootstyle="danger-outline", padding=(16, 8))
         self.btn_cancel.pack(side="left", padx=(8, 0))
-        progress_area = ttk.Frame(actions)
+        progress_area = ttk.Frame(actions, style=MIDNIGHTSTUDIO_STYLES["page"])
         progress_area.pack(side="left", padx=(14, 0))
-        self.lbl_progress = ttk.Label(progress_area, text="Ready — 0%")
+        self.lbl_progress = ttk.Label(
+            progress_area,
+            text="Ready — 0%",
+            style=MIDNIGHTSTUDIO_STYLES["secondary"],
+        )
         self.lbl_progress.pack(anchor="w")
         self.progress = tb.Progressbar(
             progress_area,
             mode="determinate",
             maximum=100,
             length=220,
-            bootstyle="info-striped",
+            bootstyle="primary-striped",
         )
         self.progress.pack(fill="x", pady=(2, 0))
         self._last_progress = 0
@@ -4795,7 +5458,11 @@ class App(ttk.Frame):
         settings_page = self.pages["settings"]
         settings_page.columnconfigure(0, weight=1)
         settings_page.rowconfigure(4, weight=1)
-        ttk.Label(settings_page, text="Settings", font=("Segoe UI", 18, "bold")).grid(
+        ttk.Label(
+            settings_page,
+            text="Settings",
+            style=MIDNIGHTSTUDIO_STYLES["title"],
+        ).grid(
             row=0, column=0, sticky="w", padx=8, pady=(4, 10)
         )
 
@@ -4861,33 +5528,83 @@ class App(ttk.Frame):
         )
         self.cmb_ner_engine.grid(row=0, column=1, sticky="w", padx=(0, 12))
         self.cmb_ner_engine.bind("<<ComboboxSelected>>", self._on_ner_engine_changed)
-        self.lbl_ner_info = ttk.Label(ner_settings, text="")
+        self.lbl_ner_info = ttk.Label(
+            ner_settings,
+            text="",
+            style=MIDNIGHTSTUDIO_STYLES["card_secondary"],
+        )
         self.lbl_ner_info.grid(row=0, column=2, sticky="w")
 
         utilities = ttk.LabelFrame(settings_page, text="Utilities", padding=10)
         utilities.grid(row=3, column=0, sticky="ew", padx=8)
-        ttk.Button(utilities, text="Save config", command=self.on_save).grid(row=0, column=0, sticky="w")
-        ttk.Button(utilities, text="About", command=self.on_about).grid(row=0, column=1, sticky="w", padx=(8, 0))
-        self.lbl_conf = ttk.Label(utilities, text="Configuration: conf.yaml", foreground="#666")
+        tb.Button(
+            utilities,
+            text="Save config",
+            command=self.on_save,
+            bootstyle="primary",
+        ).grid(row=0, column=0, sticky="w")
+        tb.Button(
+            utilities,
+            text="About",
+            command=self.on_about,
+            bootstyle="secondary-outline",
+        ).grid(row=0, column=1, sticky="w", padx=(8, 0))
+        self.lbl_conf = ttk.Label(
+            utilities,
+            text="Configuration: conf.yaml",
+            style=MIDNIGHTSTUDIO_STYLES["card_secondary"],
+        )
         self.lbl_conf.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         activity_page = self.pages["activity"]
         activity_page.columnconfigure(0, weight=1)
         activity_page.rowconfigure(1, weight=1)
-        activity_toolbar = ttk.Frame(activity_page, padding=(0, 0, 0, 8))
+        activity_toolbar = ttk.Frame(
+            activity_page,
+            padding=(0, 0, 0, 8),
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
         activity_toolbar.grid(row=0, column=0, sticky="ew")
-        ttk.Label(activity_toolbar, text="Activity", font=("Segoe UI", 18, "bold")).pack(side="left")
-        ttk.Button(activity_toolbar, text="Clear Log", command=self.clear_log).pack(side="right")
-        ttk.Button(activity_toolbar, text="Copy Log", command=self.copy_log).pack(side="right", padx=(0, 8))
+        ttk.Label(
+            activity_toolbar,
+            text="Activity",
+            style=MIDNIGHTSTUDIO_STYLES["title"],
+        ).pack(side="left")
+        tb.Button(
+            activity_toolbar,
+            text="Clear Log",
+            command=self.clear_log,
+            bootstyle="danger-outline",
+        ).pack(side="right")
+        tb.Button(
+            activity_toolbar,
+            text="Copy Log",
+            command=self.copy_log,
+            bootstyle="primary-outline",
+        ).pack(side="right", padx=(0, 8))
         activity = ttk.LabelFrame(activity_page, text="Processing Log", padding=8)
         activity.grid(row=1, column=0, sticky="nsew")
         activity.rowconfigure(0, weight=1)
         activity.columnconfigure(0, weight=1)
         self.txt = tk.Text(activity, height=16, wrap="word")
+        style_midnightstudio_text(self.txt)
         self.txt.grid(row=0, column=0, sticky="nsew")
         log_scrollbar = ttk.Scrollbar(activity, orient="vertical", command=self.txt.yview)
         log_scrollbar.grid(row=0, column=1, sticky="ns")
         self.txt.configure(yscrollcommand=log_scrollbar.set)
+
+        for card in (
+            files,
+            transcription_settings,
+            self.advanced_content,
+            ner_settings,
+            utilities,
+            activity,
+        ):
+            apply_midnightstudio_card_style(card)
+        self.lbl_ner_info.configure(style=MIDNIGHTSTUDIO_STYLES["card_secondary"])
+        self.lbl_conf.configure(style=MIDNIGHTSTUDIO_STYLES["card_secondary"])
+        reinforce_midnightstudio_control_states(self.master.style)
 
         self.show_page("transcribe")
 
@@ -5588,24 +6305,50 @@ class App(ttk.Frame):
             self.log(line)
         self.log("-------------")
         win = tk.Toplevel(self.master)
+        style_midnightstudio_toplevel(win)
         win.title("About - Transcript Studio")
         win.geometry("820x460")
-        frm = ttk.Frame(win, padding=8)
+        frm = ttk.Frame(
+            win,
+            padding=8,
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
         frm.pack(fill="both", expand=True)
         text = tk.Text(frm, wrap="word")
-        yscroll = ttk.Scrollbar(frm, orient="vertical", command=text.yview)
+        style_midnightstudio_text(text, readonly=True)
+        yscroll = ttk.Scrollbar(
+            frm,
+            orient="vertical",
+            command=text.yview,
+            style=MIDNIGHTSTUDIO_STYLES["review_scrollbar"],
+        )
         text.configure(yscrollcommand=yscroll.set)
         text.pack(side="left", fill="both", expand=True)
         yscroll.pack(side="right", fill="y")
         text.insert("1.0", info)
         text.configure(state="disabled")
-        btns = ttk.Frame(win, padding=(8,0,8,8))
+        btns = ttk.Frame(
+            win,
+            padding=(8, 0, 8, 8),
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
         btns.pack(fill="x")
         def copy_all():
             win.clipboard_clear()
             win.clipboard_append(info)
-        ttk.Button(btns, text="Copy", command=copy_all).pack(side="right")
-        ttk.Button(btns, text="Close", command=win.destroy).pack(side="right", padx=6)
+        tb.Button(
+            btns,
+            text="Copy",
+            command=copy_all,
+            bootstyle="primary-outline",
+        ).pack(side="right")
+        tb.Button(
+            btns,
+            text="Close",
+            command=win.destroy,
+            bootstyle="secondary-outline",
+        ).pack(side="right", padx=6)
+        reinforce_midnightstudio_control_states(tb.Style.get_instance() or tb.Style())
 
     def _validated_pending_review_result(self):
         if self.pending_review_result is None:
@@ -5704,6 +6447,7 @@ class App(ttk.Frame):
 
 def main():
     root = tb.Window(themename="litera")
+    register_midnightstudio_theme(root)
     root.title("Transcript Studio")
     app = App(root)
     root.mainloop()
