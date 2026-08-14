@@ -15,6 +15,17 @@ from split_audio import (
     discover_sources,
     speaker_name_record_path,
 )
+from crisperwhisper_backend import (
+    CrisperWhisperBackend,
+    CrisperWhisperBackendError,
+    CrisperWhisperProtocolError,
+    CrisperWhisperRuntimeError,
+    OFFICIAL_MODEL_IDS as _CRISPER_OFFICIAL_MODEL_IDS,
+    PREFLIGHT_ENV_VAR as _CRISPER_PREFLIGHT_ENV_VAR,
+    PROTOCOL_VERSION as _CRISPER_PROTOCOL_VERSION,
+    SUPPORTED_CRISPERWHISPER_VERSION as _SUPPORTED_CRISPERWHISPER_VERSION,
+    validate_probe_response as _validate_crisper_probe_response,
+)
 
 
 MIDNIGHTSTUDIO_THEME_NAME = "midnightstudio"
@@ -1048,7 +1059,7 @@ def get_pkg_version(dist_name: str) -> str:
     except Exception:
         return "(not installed)"
 
-def gather_about_info() -> str:
+def gather_about_info(crisper_diagnostics=None) -> str:
     lines = []
     lines.append("Transcript Studio")
     lines.append("Local transcription, speaker review, and subtitle tools")
@@ -1084,6 +1095,8 @@ def gather_about_info() -> str:
     lines.append(f"  pyannote.audio: {get_pkg_version('pyannote.audio')}")
     lines.append(f"  ctranslate2: {get_pkg_version('ctranslate2')}")
     lines.append("")
+    lines.extend(format_crisper_diagnostics(crisper_diagnostics))
+    lines.append("")
     ff = which_ff("ffmpeg"); fp = which_ff("ffprobe")
     lines.append(f"ffmpeg: {first_line(try_cmd([ff, '-version'])) or '(not found)'}")
     lines.append(f"ffprobe: {first_line(try_cmd([fp, '-version'])) or '(not found)'}")
@@ -1098,20 +1111,181 @@ _DEFAULTS = {
     "padding_seconds": 0.25,"hf_token": "",
     "diarization_speaker_mode": "auto", "min_speakers": 2, "max_speakers": 2,
     "ner_engine": "auto",
+    "transcription_backend": "whisperx",
+    "crisperwhisper_model": "medium",
+    "crisperwhisper_mode": "verbatim",
 }
 _MODEL_CHOICES = ["tiny","base","small","medium","large-v2","large-v3","large-v3-turbo","distil-large-v3"]
+_TRANSCRIPTION_BACKENDS = ("whisperx", "crisperwhisper")
+_CRISPER_MODEL_CHOICES = tuple(_CRISPER_OFFICIAL_MODEL_IDS)
+_CRISPER_MODE_CHOICES = ("verbatim", "intended")
+_CRISPER_LICENSE_URL = "https://huggingface.co/nyralabs/CrisperWhisper2.0_medium/blob/main/LICENSE.md"
 _COMPUTE_CHOICES = ["float16","float32"]
 _TF32_CHOICES = ["on","off"]
 _SPEAKER_MODE_LABELS = {"auto": "Automatic", "exact": "Exact number", "range": "Range"}
 _SPEAKER_MODE_KEYS = {label: key for key, label in _SPEAKER_MODE_LABELS.items()}
 
+def _deep_merge_dict(existing: dict, updates: dict) -> dict:
+    merged = copy.deepcopy(existing) if isinstance(existing, dict) else {}
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_dict(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
 def merge_gui_conf(existing: dict, gui_values: dict) -> dict:
     """Merge GUI-owned settings without discarding other configuration keys."""
-    merged = dict(existing) if isinstance(existing, dict) else {}
-    merged.update(gui_values)
+    merged = _deep_merge_dict(existing, gui_values)
     merged["compute_type"] = "float16"
     merged["tf32"] = "off"
     return merged
+
+
+def crisper_gui_selection_from_conf(config) -> tuple[dict, list[str]]:
+    """Return safe Stage 3 GUI values without mutating expert configuration."""
+
+    cfg = config if isinstance(config, dict) else {}
+    warnings = []
+    backend = str(cfg.get("transcription_backend", "whisperx")).strip().lower()
+    if backend not in _TRANSCRIPTION_BACKENDS:
+        warnings.append(
+            f"Unknown transcription_backend {backend!r}; WhisperX will be used."
+        )
+        backend = "whisperx"
+
+    supplied = cfg.get("crisperwhisper", {})
+    if supplied is None:
+        supplied = {}
+    if not isinstance(supplied, dict):
+        warnings.append("crisperwhisper must be a YAML mapping; safe GUI defaults will be used.")
+        supplied = {}
+
+    model_config = supplied.get("model", {})
+    if model_config is None:
+        model_config = {}
+    if not isinstance(model_config, dict):
+        warnings.append("crisperwhisper.model must be a YAML mapping; medium will be used.")
+        model_config = {}
+    family = str(model_config.get("family", _DEFAULTS["crisperwhisper_model"])).strip().lower()
+    if family not in _CRISPER_MODEL_CHOICES:
+        warnings.append(f"Unsupported CrisperWhisper model {family!r}; medium will be used.")
+        family = _DEFAULTS["crisperwhisper_model"]
+    model_id = model_config.get("model_id")
+    if model_id is not None and model_id != _CRISPER_OFFICIAL_MODEL_IDS[family]:
+        warnings.append(
+            "Custom or mismatched CrisperWhisper model IDs are not supported in this stage; "
+            f"the official {family} model will be used."
+        )
+    execution_backend = model_config.get("execution_backend", "transformers")
+    if execution_backend != "transformers":
+        warnings.append(
+            "Only the Transformers CrisperWhisper execution backend is supported in this stage; "
+            "Transformers will be used."
+        )
+
+    transcription = supplied.get("transcription", {})
+    if transcription is None:
+        transcription = {}
+    if not isinstance(transcription, dict):
+        warnings.append(
+            "crisperwhisper.transcription must be a YAML mapping; verbatim will be used."
+        )
+        transcription = {}
+    mode = str(transcription.get("mode", _DEFAULTS["crisperwhisper_mode"])).strip().lower()
+    if mode not in _CRISPER_MODE_CHOICES:
+        warnings.append(f"Unsupported CrisperWhisper mode {mode!r}; verbatim will be used.")
+        mode = _DEFAULTS["crisperwhisper_mode"]
+    if transcription.get("word_timestamps", True) is not True:
+        warnings.append("CrisperWhisper word timestamps are mandatory and will remain enabled.")
+
+    return {
+        "backend": backend,
+        "model": family,
+        "mode": mode,
+        "license_acknowledged": cfg.get("crisperwhisper_license_acknowledged") is True,
+    }, warnings
+
+
+def crisper_gui_config_update(family: str, mode: str) -> dict:
+    family = str(family).strip().lower()
+    mode = str(mode).strip().lower()
+    if family not in _CRISPER_MODEL_CHOICES:
+        raise ValueError("Select a supported CrisperWhisper model: small, medium, large, or turbo.")
+    if mode not in _CRISPER_MODE_CHOICES:
+        raise ValueError("Select either Verbatim or Intended transcription style.")
+    return {
+        "model": {
+            "family": family,
+            "model_id": _CRISPER_OFFICIAL_MODEL_IDS[family],
+            "execution_backend": "transformers",
+        },
+        "transcription": {
+            "mode": mode,
+            "word_timestamps": True,
+        },
+    }
+
+
+def validate_crisper_probe_for_gui(response) -> dict:
+    """Apply the Stage 3 GUI's stricter RTX and model-family checks."""
+
+    validated = _validate_crisper_probe_response(response)
+    families = validated.get("supported_model_families")
+    if not isinstance(families, list) or any(
+        family not in families for family in _CRISPER_MODEL_CHOICES
+    ):
+        raise CrisperWhisperProtocolError(
+            "The CrisperWhisper worker does not support all Stage 3 standard model families."
+        )
+    gpu_name = validated["runtime"].get("gpu_name")
+    if not isinstance(gpu_name, str) or not gpu_name.strip() or "RTX" not in gpu_name.upper():
+        raise CrisperWhisperRuntimeError(
+            "An NVIDIA RTX GPU was not detected by the isolated CrisperWhisper environment."
+        )
+    return validated
+
+
+def format_crisper_diagnostics(diagnostics=None) -> list[str]:
+    root = program_root()
+    interpreter_exists = (root / "venv-crisper" / "Scripts" / "python.exe").is_file()
+    worker_exists = (root / "crisperwhisper_worker.py").is_file()
+    lines = ["CrisperWhisper isolated runtime:"]
+    lines.append(f"  venv-crisper: {'found' if interpreter_exists else 'not found'}")
+    lines.append(f"  Worker: {'found' if worker_exists else 'not found'}")
+    lines.append(f"  Protocol: {_CRISPER_PROTOCOL_VERSION}")
+    lines.append(f"  Required CrisperWhisper: {_SUPPORTED_CRISPERWHISPER_VERSION}")
+    lines.append(f"  Stage 3 models: {', '.join(_CRISPER_MODEL_CHOICES)}")
+    response = diagnostics.get("response") if isinstance(diagnostics, dict) else None
+    error = diagnostics.get("error") if isinstance(diagnostics, dict) else None
+    if isinstance(response, dict):
+        runtime = response.get("runtime", {})
+        versions = runtime.get("versions", {}) if isinstance(runtime, dict) else {}
+        lines.append(f"  CrisperWhisper: {versions.get('crisperwhisper', '(unknown)')}")
+        lines.append(f"  CUDA available: {runtime.get('cuda_available') is True}")
+        lines.append(f"  GPU: {runtime.get('gpu_name') or '(not reported)'}")
+        lines.append("  Transformers backend: available")
+    elif error:
+        lines.append(f"  Status: unavailable — {error}")
+    else:
+        lines.append("  Status: not checked yet")
+    return lines
+
+
+def refresh_crisper_diagnostics_text(info: str, diagnostics=None) -> str:
+    """Replace only About's isolated-runtime block without rerunning diagnostics."""
+
+    lines = info.splitlines()
+    try:
+        start = lines.index("CrisperWhisper isolated runtime:")
+    except ValueError:
+        return info
+    end = start + 1
+    while end < len(lines) and lines[end].strip():
+        end += 1
+    replacement = format_crisper_diagnostics(diagnostics)
+    return "\n".join(lines[:start] + replacement + lines[end:])
 
 def srt_timestamp(t: float) -> str:
     if t < 0: t = 0.0
@@ -5518,6 +5692,24 @@ class App(ttk.Frame):
         self._application_closing = False
         self._main_window_normal_geometry = None
         self._main_window_tracking_enabled = False
+        self._crisper_probe_adapter = None
+        self._crisper_probe_in_progress = False
+        self._crisper_probe_callbacks = []
+        self._crisper_probe_response = None
+        self._crisper_probe_error = None
+        self._crisper_probe_time = 0.0
+        self._crisper_probe_thread = None
+        self._crisper_launch_waiting = False
+        self._crisper_license_acknowledged = False
+        self.var_transcription_backend = tk.StringVar(
+            value=_DEFAULTS["transcription_backend"]
+        )
+        self.var_crisper_model = tk.StringVar(
+            value=_DEFAULTS["crisperwhisper_model"]
+        )
+        self.var_crisper_mode = tk.StringVar(
+            value=_DEFAULTS["crisperwhisper_mode"]
+        )
         self.var_model = tk.StringVar(value=_DEFAULTS["model"])
         self.var_lang = tk.StringVar(value=_DEFAULTS["language"])
         self.var_output = tk.StringVar(value=_DEFAULTS["output_format"])
@@ -5616,20 +5808,77 @@ class App(ttk.Frame):
         transcription_settings = ttk.LabelFrame(transcribe, text="Transcription Settings", padding=12)
         transcription_settings.grid(row=2, column=0, sticky="ew", pady=(0, 8))
         transcription_settings.columnconfigure(7, weight=1)
-        ttk.Label(transcription_settings, text="Model").grid(row=0, column=0, sticky="w", padx=(0, 6))
-        self.cmb_model = ttk.Combobox(transcription_settings, textvariable=self.var_model, values=_MODEL_CHOICES, width=18, state="readonly")
-        self.cmb_model.grid(row=0, column=1, sticky="w", padx=(0, 16))
+        ttk.Label(transcription_settings, text="Transcription engine").grid(
+            row=0, column=0, sticky="w", padx=(0, 6)
+        )
+        engine_options = ttk.Frame(transcription_settings)
+        engine_options.grid(row=0, column=1, columnspan=6, sticky="w")
+        ttk.Radiobutton(
+            engine_options,
+            text="WhisperX",
+            variable=self.var_transcription_backend,
+            value="whisperx",
+            command=self._on_transcription_engine_changed,
+        ).pack(side="left")
+        ttk.Radiobutton(
+            engine_options,
+            text="CrisperWhisper",
+            variable=self.var_transcription_backend,
+            value="crisperwhisper",
+            command=self._on_transcription_engine_changed,
+        ).pack(side="left", padx=(12, 0))
+
+        self.whisperx_model_controls = ttk.Frame(transcription_settings)
+        self.whisperx_model_controls.grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Label(self.whisperx_model_controls, text="Model").pack(side="left", padx=(0, 6))
+        self.cmb_model = ttk.Combobox(
+            self.whisperx_model_controls,
+            textvariable=self.var_model,
+            values=_MODEL_CHOICES,
+            width=18,
+            state="readonly",
+        )
+        self.cmb_model.pack(side="left", padx=(0, 16))
         self.cmb_model.bind("<<ComboboxSelected>>", self._on_model_changed)
-        ttk.Label(transcription_settings, text="Language").grid(row=0, column=2, sticky="w", padx=(0, 6))
-        ttk.Entry(transcription_settings, textvariable=self.var_lang, width=10).grid(row=0, column=3, sticky="w", padx=(0, 16))
-        ttk.Checkbutton(transcription_settings, text="Identify speakers", variable=self.var_diar).grid(row=0, column=4, sticky="w", padx=(0, 16))
-        ttk.Label(transcription_settings, text="Output").grid(row=0, column=5, sticky="w", padx=(0, 6))
+
+        self.crisper_model_controls = ttk.Frame(transcription_settings)
+        self.crisper_model_controls.grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Label(self.crisper_model_controls, text="Model").pack(side="left", padx=(0, 6))
+        self.cmb_crisper_model = ttk.Combobox(
+            self.crisper_model_controls,
+            textvariable=self.var_crisper_model,
+            values=_CRISPER_MODEL_CHOICES,
+            width=10,
+            state="readonly",
+        )
+        self.cmb_crisper_model.pack(side="left", padx=(0, 16))
+        ttk.Label(self.crisper_model_controls, text="Transcription style").pack(
+            side="left", padx=(0, 6)
+        )
+        ttk.Radiobutton(
+            self.crisper_model_controls,
+            text="Verbatim",
+            variable=self.var_crisper_mode,
+            value="verbatim",
+        ).pack(side="left")
+        ttk.Radiobutton(
+            self.crisper_model_controls,
+            text="Intended",
+            variable=self.var_crisper_mode,
+            value="intended",
+        ).pack(side="left", padx=(8, 0))
+
+        ttk.Label(transcription_settings, text="Language").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=(10, 0))
+        ttk.Entry(transcription_settings, textvariable=self.var_lang, width=10).grid(row=2, column=1, sticky="w", padx=(0, 16), pady=(10, 0))
+        ttk.Checkbutton(transcription_settings, text="Identify speakers", variable=self.var_diar).grid(row=2, column=2, columnspan=2, sticky="w", padx=(0, 16), pady=(10, 0))
+        ttk.Label(transcription_settings, text="Output").grid(row=2, column=4, sticky="w", padx=(0, 6), pady=(10, 0))
         output_options = ttk.Frame(transcription_settings)
-        output_options.grid(row=0, column=6, sticky="w")
+        output_options.grid(row=2, column=5, columnspan=2, sticky="w", pady=(10, 0))
         ttk.Radiobutton(output_options, text="Both", variable=self.var_output, value="both").pack(side="left")
         ttk.Radiobutton(output_options, text="SRT", variable=self.var_output, value="srt").pack(side="left", padx=(8, 0))
         ttk.Radiobutton(output_options, text="TXT", variable=self.var_output, value="txt").pack(side="left", padx=(8, 0))
-        ttk.Frame(transcription_settings).grid(row=0, column=7, sticky="ew")
+        ttk.Frame(transcription_settings).grid(row=0, column=7, rowspan=3, sticky="ew")
+        self._update_transcription_engine_controls(show_notice=False)
 
         actions = ttk.Frame(
             transcribe,
@@ -5983,6 +6232,9 @@ class App(ttk.Frame):
             return
         self._application_closing = True
         self._save_main_window_preferences()
+        if self._crisper_probe_adapter is not None:
+            self._crisper_probe_adapter.cancel()
+        self._crisper_probe_callbacks = []
         try:
             self.review_page.shutdown()
         finally:
@@ -6005,6 +6257,125 @@ class App(ttk.Frame):
 
     def _on_ner_engine_changed(self, *_):
         self._update_ner_engine_info()
+
+    def _current_transcription_backend(self) -> str:
+        backend = self.var_transcription_backend.get().strip().lower()
+        if backend not in _TRANSCRIPTION_BACKENDS:
+            backend = _DEFAULTS["transcription_backend"]
+            self.var_transcription_backend.set(backend)
+        return backend
+
+    def _update_transcription_engine_controls(self, *, show_notice=True):
+        backend = self._current_transcription_backend()
+        if backend == "crisperwhisper":
+            self.whisperx_model_controls.grid_remove()
+            self.crisper_model_controls.grid()
+            if show_notice:
+                self._show_crisper_license_notice_once()
+        else:
+            self.crisper_model_controls.grid_remove()
+            self.whisperx_model_controls.grid()
+
+    def _on_transcription_engine_changed(self, *_):
+        self._update_transcription_engine_controls(show_notice=True)
+
+    def _show_crisper_license_notice_once(self):
+        if self._crisper_license_acknowledged:
+            return
+        messagebox.showinfo(
+            "CrisperWhisper model license",
+            "Standard CrisperWhisper model weights are licensed for non-commercial "
+            "research use. Commercial use requires a license from Nyra Health.\n\n"
+            "Models are downloaded from Hugging Face when first used. Transcript Studio "
+            "does not bundle the model weights.\n\n"
+            f"Official license: {_CRISPER_LICENSE_URL}",
+            parent=self.winfo_toplevel(),
+        )
+        self._crisper_license_acknowledged = True
+        try:
+            cfg = merge_gui_conf(
+                read_yaml(conf_path()),
+                {"crisperwhisper_license_acknowledged": True},
+            )
+            atomic_write_yaml(conf_path(), cfg)
+        except Exception as exc:
+            self.log(f"[crisper] Could not save the model-license acknowledgement: {exc}")
+
+    def _create_crisper_probe_adapter(self):
+        return CrisperWhisperBackend(
+            program_root(),
+            log_callback=lambda message: self.queue.put(("log", message)),
+        )
+
+    def _start_crisper_probe(self, callback, *, allow_cached=True):
+        if (
+            allow_cached
+            and self._crisper_probe_response is not None
+            and time.monotonic() - self._crisper_probe_time <= 60.0
+        ):
+            self.after_idle(lambda: callback(self._crisper_probe_response, None))
+            return
+        self._crisper_probe_callbacks.append(callback)
+        if self._crisper_probe_in_progress:
+            return
+        self._crisper_probe_in_progress = True
+        adapter = self._create_crisper_probe_adapter()
+        self._crisper_probe_adapter = adapter
+
+        def probe_worker():
+            response = None
+            error = None
+            try:
+                response = validate_crisper_probe_for_gui(adapter.probe(force=True))
+            except KeyboardInterrupt:
+                error = "CrisperWhisper runtime check was cancelled."
+            except CrisperWhisperBackendError as exc:
+                error = str(exc)
+            except Exception as exc:
+                error = f"CrisperWhisper runtime check failed ({type(exc).__name__})."
+            self.queue.put(("crisper_probe_finished", response, error))
+
+        self._crisper_probe_thread = threading.Thread(target=probe_worker, daemon=True)
+        self._crisper_probe_thread.start()
+
+    def _finish_crisper_probe(self, response, error):
+        self._crisper_probe_in_progress = False
+        self._crisper_probe_adapter = None
+        self._crisper_probe_thread = None
+        if response is not None:
+            self._crisper_probe_response = response
+            self._crisper_probe_error = None
+            self._crisper_probe_time = time.monotonic()
+        else:
+            self._crisper_probe_response = None
+            self._crisper_probe_time = 0.0
+            self._crisper_probe_error = error or "The isolated runtime check failed."
+        callbacks = self._crisper_probe_callbacks
+        self._crisper_probe_callbacks = []
+        for callback in callbacks:
+            try:
+                callback(response, error)
+            except Exception as exc:
+                self.log(f"[crisper] Runtime-check callback failed: {exc}")
+
+    def _crisper_diagnostics_snapshot(self):
+        return {
+            "response": self._crisper_probe_response,
+            "error": self._crisper_probe_error,
+        }
+
+    @staticmethod
+    def _crisper_unavailable_message(reason):
+        return (
+            "CrisperWhisper could not start.\n\n"
+            f"{reason or 'The isolated runtime check did not complete.'}\n\n"
+            "CrisperWhisper uses the separate venv-crisper environment. Verify that "
+            "venv-crisper\\Scripts\\python.exe and crisperwhisper_worker.py are present "
+            "and that the environment contains CrisperWhisper 2.0.2, CUDA-enabled "
+            "PyTorch, Transformers, and CTranslate2.\n\n"
+            "WhisperX remains available from the Transcription engine control; Transcript "
+            "Studio will not switch engines automatically."
+        )
 
     def _update_speaker_count_controls(self, *_):
         self.speaker_exact_fields.pack_forget()
@@ -6144,6 +6515,11 @@ class App(ttk.Frame):
         if not cfg:
             self._update_ner_engine_info()
             return
+        crisper_selection, crisper_warnings = crisper_gui_selection_from_conf(cfg)
+        self.var_transcription_backend.set(crisper_selection["backend"])
+        self.var_crisper_model.set(crisper_selection["model"])
+        self.var_crisper_mode.set(crisper_selection["mode"])
+        self._crisper_license_acknowledged = crisper_selection["license_acknowledged"]
         self.var_lang.set(cfg.get("language", self.var_lang.get()))
         self.var_model.set(cfg.get("model", self.var_model.get()))
         self.var_diar.set(bool(cfg.get("diarize", self.var_diar.get())))
@@ -6171,6 +6547,20 @@ class App(ttk.Frame):
         self.var_ner_engine.set(engine if engine in _NER_CHOICES else _DEFAULTS["ner_engine"])
         self._update_ner_engine_info()
         self._update_speaker_count_controls()
+        self._update_transcription_engine_controls(show_notice=False)
+        if crisper_warnings:
+            warning_text = "\n".join(f"• {warning}" for warning in crisper_warnings)
+            self.log(f"[crisper] Configuration warning:\n{warning_text}")
+            messagebox.showwarning(
+                "CrisperWhisper configuration warning",
+                warning_text,
+                parent=self.winfo_toplevel(),
+            )
+        if (
+            self._current_transcription_backend() == "crisperwhisper"
+            and not self._crisper_license_acknowledged
+        ):
+            self.after_idle(self._show_crisper_license_notice_once)
 
     def _collect_ui_to_conf(self) -> dict:
         self.var_compute.set("float16")
@@ -6180,9 +6570,14 @@ class App(ttk.Frame):
         srt = self.var_srt.get() if ofmt in ("both","srt") else False
         txt = self.var_txt.get() if ofmt in ("both","txt") else False
         if ofmt == "both": srt, txt = True, True
-        return {
+        gui_values = {
             "language": self.var_lang.get().strip() or "en",
             "model": self.var_model.get().strip(),
+            "transcription_backend": self._current_transcription_backend(),
+            "crisperwhisper": crisper_gui_config_update(
+                self.var_crisper_model.get(),
+                self.var_crisper_mode.get(),
+            ),
             "diarize": bool(self.var_diar.get()),
             "slice_audio": bool(self.var_slice.get()),
             "slice_video": bool(self.var_slice_video.get()),
@@ -6202,19 +6597,26 @@ class App(ttk.Frame):
             "max_speakers": max_speakers,
             "ner_engine": self._current_ner_engine(),
         }
+        if self._crisper_license_acknowledged:
+            gui_values["crisperwhisper_license_acknowledged"] = True
+        return gui_values
 
     def on_save(self):
         try:
             cfg = merge_gui_conf(read_yaml(conf_path()), self._collect_ui_to_conf())
             atomic_write_yaml(conf_path(), cfg)
             self.log(f"Saved {conf_path()}")
+            saved = True
         except ValueError as e:
-            messagebox.showwarning("Invalid speaker count", str(e))
-            self.log(f"[validation] Invalid diarization speaker count: {e}")
+            messagebox.showwarning("Invalid settings", str(e))
+            self.log(f"[validation] Invalid settings: {e}")
+            saved = False
         except Exception as e:
             messagebox.showerror("Save failed", f"{e}")
             self.log(f"ERROR saving conf: {e}")
+            saved = False
         self._update_title_with_conf_path()
+        return saved
 
     def _on_model_changed(self, *_):
         model = self.var_model.get().strip()
@@ -6242,6 +6644,14 @@ class App(ttk.Frame):
             self.log("[selection] Cleared selection (will use data/input folder).")
 
     def on_stop(self):
+        if self._crisper_launch_waiting:
+            self.cancel_requested = True
+            self._set_runtime_state("Cancelling")
+            self.log("[stop] Cancelling the CrisperWhisper runtime check...")
+            adapter = self._crisper_probe_adapter
+            if adapter is not None:
+                adapter.cancel()
+            return
         if self.proc and self.proc.poll() is None:
             self.cancel_requested = True
             self._set_runtime_state("Cancelling")
@@ -6306,34 +6716,101 @@ class App(ttk.Frame):
         self.cancel_requested = False
         if not self._validate_diarization_speaker_count():
             return
-        self.on_save()
+        try:
+            crisper_gui_config_update(
+                self.var_crisper_model.get(),
+                self.var_crisper_mode.get(),
+            )
+        except ValueError as exc:
+            self._set_runtime_state("Ready")
+            self.log(f"[validation] Invalid CrisperWhisper setting: {exc}")
+            messagebox.showwarning("Invalid CrisperWhisper settings", str(exc))
+            return
+        if not self.on_save():
+            self._set_runtime_state("Ready")
+            return
         if not self._validate_slice_video_inputs():
             return
         self._reset_progress("Starting")
-        model = self.var_model.get().strip()
-        workers = self.var_workers.get()
-        try:
-            import torch
-            dev = "cuda:0" if torch.cuda.is_available() else "cpu"
-            gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else ""
-            self.log(f"[run] Launching with model '{model}', compute={self.var_compute.get()}, tf32={self.var_tf32.get()} — device {dev} {('('+gpu+')') if gpu else ''}".strip())
-        except Exception:
-            self.log(f"[run] Launching with model '{model}'")
+        context = {
+            "backend": self._current_transcription_backend(),
+            "whisperx_model": self.var_model.get().strip(),
+            "crisper_model": self.var_crisper_model.get().strip(),
+            "crisper_mode": self.var_crisper_mode.get().strip(),
+            "workers": self.var_workers.get(),
+            "input_files": list(self.input_files),
+        }
+        if context["backend"] == "crisperwhisper":
+            self._begin_crisper_launch(context)
+        else:
+            self._launch_pipeline_process(context)
+
+    def _begin_crisper_launch(self, context):
+        self._crisper_launch_waiting = True
+        self._set_runtime_state("Running")
+        self._set_progress_display("Checking CrisperWhisper runtime", 0)
+        self.log(
+            "[crisper] Checking the separate venv-crisper environment before launch "
+            f"({context['crisper_model']}, {context['crisper_mode']})."
+        )
+
+        def probe_complete(response, error):
+            if not self._crisper_launch_waiting:
+                return
+            self._crisper_launch_waiting = False
+            if self.cancel_requested:
+                self._set_runtime_state("Cancelled")
+                return
+            if response is None:
+                self._set_runtime_state("Failed")
+                self.log(f"[crisper] Runtime check failed: {error}")
+                messagebox.showerror(
+                    "CrisperWhisper unavailable",
+                    self._crisper_unavailable_message(error),
+                    parent=self.winfo_toplevel(),
+                )
+                return
+            self.log("[crisper] Isolated CrisperWhisper runtime is ready.")
+            self._launch_pipeline_process(context, crisper_probe=response)
+
+        self._start_crisper_probe(probe_complete, allow_cached=False)
+
+    def _launch_pipeline_process(self, context, *, crisper_probe=None):
+        backend = context["backend"]
+        if backend == "crisperwhisper":
+            runtime = crisper_probe.get("runtime", {}) if isinstance(crisper_probe, dict) else {}
+            gpu = runtime.get("gpu_name") or "RTX GPU"
+            self.log(
+                f"[run] Launching CrisperWhisper model '{context['crisper_model']}' "
+                f"in {context['crisper_mode']} mode — device {gpu}"
+            )
+        else:
+            model = context["whisperx_model"]
+            try:
+                import torch
+                dev = "cuda:0" if torch.cuda.is_available() else "cpu"
+                gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else ""
+                self.log(f"[run] Launching with model '{model}', compute={self.var_compute.get()}, tf32={self.var_tf32.get()} — device {dev} {('('+gpu+')') if gpu else ''}".strip())
+            except Exception:
+                self.log(f"[run] Launching with model '{model}'")
         py = sys.executable or "python"
-        
         cmd = [py, str(program_root() / "split_audio.py")]
-        
-        # Pass worker count explicitly
-        cmd.append("--workers")
-        cmd.append(str(workers))
-        
-        if self.input_files:
+        cmd.extend(["--workers", str(context["workers"])])
+        if context["input_files"]:
             cmd.append("--inputs")
-            cmd.extend(self.input_files)
-            
+            cmd.extend(context["input_files"])
+        env = None
+        if backend == "crisperwhisper" and crisper_probe is not None:
+            env = os.environ.copy()
+            env[_CRISPER_PREFLIGHT_ENV_VAR] = json.dumps(
+                crisper_probe,
+                ensure_ascii=True,
+                separators=(",", ":"),
+            )
         try:
             self.proc = subprocess.Popen(cmd, cwd=str(program_root()),
-                                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+                                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                          text=True, bufsize=1, env=env)
         except FileNotFoundError:
             self.proc = None
             self._set_runtime_state("Failed")
@@ -6423,6 +6900,8 @@ class App(ttk.Frame):
                             self._open_completed_review_result()
                         else:
                             self._set_runtime_state("Failed")
+                    elif kind == "crisper_probe_finished":
+                        self._finish_crisper_probe(event[1], event[2])
                 else:
                     self.log(str(event).rstrip())
         except queue.Empty:
@@ -6504,7 +6983,8 @@ class App(ttk.Frame):
         self.txt.delete("1.0", "end")
 
     def on_about(self):
-        info = gather_about_info()
+        info_holder = [gather_about_info(self._crisper_diagnostics_snapshot())]
+        info = info_holder[0]
         self.log("--- About ---")
         for line in info.splitlines():
             self.log(line)
@@ -6540,7 +7020,7 @@ class App(ttk.Frame):
         btns.pack(fill="x")
         def copy_all():
             win.clipboard_clear()
-            win.clipboard_append(info)
+            win.clipboard_append(info_holder[0])
         tb.Button(
             btns,
             text="Copy",
@@ -6554,6 +7034,24 @@ class App(ttk.Frame):
             bootstyle="secondary-outline",
         ).pack(side="right", padx=6)
         reinforce_midnightstudio_control_states(tb.Style.get_instance() or tb.Style())
+
+        def refresh_crisper_diagnostics(_response, _error):
+            try:
+                if not win.winfo_exists():
+                    return
+                updated = refresh_crisper_diagnostics_text(
+                    info_holder[0],
+                    self._crisper_diagnostics_snapshot(),
+                )
+                info_holder[0] = updated
+                text.configure(state="normal")
+                text.delete("1.0", "end")
+                text.insert("1.0", updated)
+                text.configure(state="disabled")
+            except tk.TclError:
+                pass
+
+        self._start_crisper_probe(refresh_crisper_diagnostics, allow_cached=True)
 
     def _validated_pending_review_result(self):
         if self.pending_review_result is None:

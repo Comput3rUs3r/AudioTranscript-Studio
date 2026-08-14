@@ -20,6 +20,7 @@ from typing import Any, Callable, Optional
 PROTOCOL_VERSION = 1
 SUPPORTED_CRISPERWHISPER_VERSION = "2.0.2"
 EVENT_PREFIX = "@@ATS_CRISPER@@"
+PREFLIGHT_ENV_VAR = "ATS_CRISPER_PREFLIGHT_JSON"
 
 OFFICIAL_MODEL_IDS = {
     "small": "nyralabs/CrisperWhisper2.0_small",
@@ -613,6 +614,13 @@ class CrisperWhisperBackend:
         if return_code != 0:
             self._worker_failure("probe", return_code, error)
         response = success.get("response") if isinstance(success, dict) else None
+        validated = validate_probe_response(response)
+        self._probe_response = validated
+        return copy.deepcopy(validated)
+
+    def seed_probe_response(self, response: Any) -> dict[str, Any]:
+        """Reuse a freshly validated probe supplied by the parent GUI process."""
+
         validated = validate_probe_response(response)
         self._probe_response = validated
         return copy.deepcopy(validated)

@@ -727,6 +727,7 @@ def run_pipeline(explicit_files: List[str] = None, explicit_workers: int = None)
     cfg, hf_token = load_conf(ROOT / "conf.yaml")
     from crisperwhisper_backend import (
         CrisperWhisperBackend,
+        PREFLIGHT_ENV_VAR,
         normalize_backend_name,
         resolve_crisperwhisper_settings,
     )
@@ -765,7 +766,18 @@ def run_pipeline(explicit_files: List[str] = None, explicit_workers: int = None)
     if backend_name == "crisperwhisper":
         crisper_settings = resolve_crisperwhisper_settings(cfg.crisperwhisper, cfg.language)
         crisper_backend = CrisperWhisperBackend(ROOT)
-        crisper_backend.probe()
+        handed_off_probe = os.environ.pop(PREFLIGHT_ENV_VAR, None)
+        if handed_off_probe:
+            try:
+                crisper_backend.seed_probe_response(json.loads(handed_off_probe))
+            except Exception:
+                print(
+                    "[crisper] GUI runtime check could not be reused; "
+                    "checking the isolated runtime again."
+                )
+                crisper_backend.probe()
+        else:
+            crisper_backend.probe()
         print("[crisper] Isolated CrisperWhisper runtime is ready.")
     
     file_total = len(sources)
