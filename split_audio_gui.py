@@ -30,6 +30,7 @@ from result_catalog import (
     ResultDescriptor,
     ResultFileIdentity as ReviewResultIdentity,
     descriptor_from_json_pair,
+    determine_source_state,
     discover_results,
     preflight_result_pair,
     revalidate_descriptor,
@@ -95,6 +96,7 @@ MIDNIGHTSTUDIO_STYLES = {
     "dialog_warning": "MidnightStudio.Dialog.Warning.TLabel",
     "srt_tree": "MidnightStudio.SrtMatches.Treeview",
     "segment_tree": "MidnightStudio.SegmentCorrection.Treeview",
+    "result_tree": "MidnightStudio.ResultBrowser.Treeview",
 }
 
 
@@ -280,7 +282,11 @@ def _configure_midnightstudio_styles(style):
         font=("Segoe UI", 9, "bold"),
     )
 
-    for tree_style in (styles["srt_tree"], styles["segment_tree"]):
+    for tree_style in (
+        styles["srt_tree"],
+        styles["segment_tree"],
+        styles["result_tree"],
+    ):
         style.configure(
             tree_style,
             background=colors["inputbg"],
@@ -569,6 +575,34 @@ def _speaker_display(spk, mapping):
         return ""
     return mapping.get(spk, spk)
 
+
+def _result_local_speaker_names(speakers_data):
+    """Return this result's stored names, limited to its current speaker IDs."""
+
+    if not isinstance(speakers_data, dict):
+        return {}
+    speakers = speakers_data.get("speakers")
+    if not isinstance(speakers, list):
+        return {}
+    if "names" in speakers_data:
+        stored_names = speakers_data.get("names")
+    else:
+        stored_names = speakers_data.get("name_map")
+    if not isinstance(stored_names, dict):
+        return {}
+
+    result = {}
+    for speaker in speakers:
+        if not isinstance(speaker, str) or speaker not in stored_names:
+            continue
+        name = stored_names.get(speaker)
+        if not isinstance(name, str):
+            continue
+        name = name.strip()
+        if name:
+            result[speaker] = name
+    return result
+
 def _vtt_timestamp(t):
     if t is None: t = 0.0
     if t < 0: t = 0.0
@@ -607,21 +641,48 @@ def _fmt_ass_time(t):
     s = cs // 100; cs %= 100
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
+_ASS_PLAY_RES_Y = 1080
+_ASS_FONT_NAME = "Segoe UI"
+_ASS_FONT_SIZE = 48
+_ASS_MARGIN_V = 60
+_ASS_SECONDARY_RGB = (255, 0, 0)
+_ASS_SECONDARY_COLOR = "&H000000FF"
+_ASS_OUTLINE_COLOR = "&H7F000000"
+_ASS_BACK_COLOR = "&H00000000"
+_ASS_SPEAKER_COLORS = (
+    (255, 209, 102),
+    (6, 214, 160),
+    (84, 190, 255),
+    (255, 99, 132),
+    (255, 140, 66),
+    (171, 143, 255),
+    (255, 183, 197),
+    (120, 220, 130),
+)
+
+
+def _rgb_hex(rgb):
+    r, g, b = rgb
+    return f"#{r:02X}{g:02X}{b:02X}"
+
+
+def _ass_display_speakers(segments, mapping):
+    speakers = []
+    for segment in segments:
+        display = _speaker_display(segment.get("speaker"), mapping)
+        if display and display not in speakers:
+            speakers.append(display)
+    return speakers or ["Default"]
+
+
 def _speaker_palette(speakers):
-    base = [(255,209,102),(6,214,160),(84,190,255),(255,99,132),(255,140,66),(171,143,255),(255,183,197),(120,220,130)]
     pal = {}
     for i, sp in enumerate(speakers):
-        pal[sp] = base[i % len(base)]
+        pal[sp] = _ASS_SPEAKER_COLORS[i % len(_ASS_SPEAKER_COLORS)]
     return pal
 
 def write_word_ass(out_path, segments, mapping):
-    speakers = []
-    for s in segments:
-        disp = _speaker_display(s.get("speaker"), mapping)
-        if disp and disp not in speakers:
-            speakers.append(disp)
-    if not speakers:
-        speakers = ["Default"]
+    speakers = _ass_display_speakers(segments, mapping)
     palette = _speaker_palette(speakers)
 
     with open(out_path, "w", encoding="utf-8", newline="\n") as f:
@@ -632,8 +693,11 @@ def write_word_ass(out_path, segments, mapping):
         for sp in speakers:
             r,g,b = palette.get(sp,(255,255,255))
             primary = "&H00%02X%02X%02X" % (b,g,r)
-            outline = "&H7F000000"; back="&H00000000"
-            f.write(f"Style: {sp},Segoe UI,48,{primary},&H000000FF,{outline},{back},0,0,0,0,100,100,0,0,1,4,0,2,40,40,60,1\n")
+            f.write(
+                f"Style: {sp},{_ASS_FONT_NAME},{_ASS_FONT_SIZE},{primary},"
+                f"{_ASS_SECONDARY_COLOR},{_ASS_OUTLINE_COLOR},{_ASS_BACK_COLOR},"
+                f"0,0,0,0,100,100,0,0,1,4,0,2,40,40,{_ASS_MARGIN_V},1\n"
+            )
 
         f.write("\n[Events]\n")
         f.write("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
@@ -761,13 +825,7 @@ def write_lrc(out_path, segments, mapping):
     Path(out_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 def write_ass_plain(out_path, segments, mapping):
-    speakers = []
-    for s in segments:
-        disp = _speaker_display(s.get("speaker"), mapping)
-        if disp and disp not in speakers:
-            speakers.append(disp)
-    if not speakers:
-        speakers = ["Default"]
+    speakers = _ass_display_speakers(segments, mapping)
     palette = _speaker_palette(speakers)
 
     with open(out_path, "w", encoding="utf-8", newline="\n") as f:
@@ -778,8 +836,11 @@ def write_ass_plain(out_path, segments, mapping):
         for sp in speakers:
             r,g,b = palette.get(sp,(255,255,255))
             primary = "&H00%02X%02X%02X" % (b,g,r)
-            outline = "&H7F000000"; back="&H00000000"
-            f.write(f"Style: {sp},Segoe UI,48,{primary},&H000000FF,{outline},{back},0,0,0,0,100,100,0,0,1,4,0,2,40,40,60,1\n")
+            f.write(
+                f"Style: {sp},{_ASS_FONT_NAME},{_ASS_FONT_SIZE},{primary},"
+                f"{_ASS_SECONDARY_COLOR},{_ASS_OUTLINE_COLOR},{_ASS_BACK_COLOR},"
+                f"0,0,0,0,100,100,0,0,1,4,0,2,40,40,{_ASS_MARGIN_V},1\n"
+            )
 
         f.write("\n[Events]\n")
         f.write("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
@@ -827,7 +888,8 @@ def find_segments_matching_query(segments, query: str):
     q = (query or "").strip().lower()
     return [seg for seg in segments if q and q in (seg.get("text","").lower())]
 
-_VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".avi", ".m4v")
+_VIDEO_EXTS = tuple(sorted(_PIPELINE_VIDEO_EXTS))
+_MEDIA_EXTS = tuple(sorted(_PIPELINE_AUDIO_EXTS | _PIPELINE_VIDEO_EXTS))
 
 _EMBEDDED_VLC_CHECKED = False
 _EMBEDDED_VLC_INSTANCE = None
@@ -946,7 +1008,19 @@ def get_embedded_vlc_status(force_retry=False):
     _EMBEDDED_VLC_FAILURE_REASON = ""
     return _embedded_vlc_status_result()
 
-def guess_video_for_srt(srt_path: _PathMod, project_root: _PathMod):
+def _supported_media_kind(path):
+    try:
+        suffix = _PathMod(path).suffix.lower()
+    except (TypeError, ValueError):
+        return None
+    if suffix in _PIPELINE_AUDIO_EXTS:
+        return "audio"
+    if suffix in _PIPELINE_VIDEO_EXTS:
+        return "video"
+    return None
+
+
+def guess_media_for_srt(srt_path: _PathMod, project_root: _PathMod):
     try:
         seg_json = srt_path.parent / "segments.json"
         if seg_json.exists():
@@ -954,27 +1028,32 @@ def guess_video_for_srt(srt_path: _PathMod, project_root: _PathMod):
             src_str = data.get("source_path")
             if src_str:
                 p = _PathMod(src_str)
-                if p.exists():
+                if p.exists() and _supported_media_kind(p) is not None:
                     return p
     except Exception:
         pass
 
     base = srt_path.stem
     candidates = []
-    candidates += [srt_path.with_suffix(ext) for ext in _VIDEO_EXTS]
-    candidates += [(srt_path.parent / (base + ext)) for ext in _VIDEO_EXTS]
+    candidates += [srt_path.with_suffix(ext) for ext in _MEDIA_EXTS]
+    candidates += [(srt_path.parent / (base + ext)) for ext in _MEDIA_EXTS]
     data_input = project_root / "data" / "input"
     if data_input.exists():
-        candidates += [data_input / (base + ext) for ext in _VIDEO_EXTS]
-        for ext in _VIDEO_EXTS:
+        candidates += [data_input / (base + ext) for ext in _MEDIA_EXTS]
+        for ext in _MEDIA_EXTS:
             candidates += list(data_input.glob(f"{base}*{ext}"))
     for c in candidates:
         if c.exists():
             return c
-    for ext in _VIDEO_EXTS:
+    for ext in _MEDIA_EXTS:
         for p in project_root.rglob(f"{base}*{ext}"):
             return p
     return None
+
+
+def guess_video_for_srt(srt_path: _PathMod, project_root: _PathMod):
+    """Compatibility alias for integrations that used the former video-only helper."""
+    return guess_media_for_srt(srt_path, project_root)
 
 def _open_in_vlc(video_path: _PathMod, start_seconds: float, vlc_path: _PathMod | None = None):
     if vlc_path:
@@ -1001,17 +1080,22 @@ def _open_in_ffplay(video_path: _PathMod, start_seconds: float):
     ffplay = str(ffplay_local if ffplay_local.exists() else "ffplay")
     _subproc_mod.Popen([ffplay, "-autoexit", "-ss", str(start_seconds), "-i", str(video_path)])
 
-def jump_video_to_srt_time(srt_path: _PathMod, target_seconds: float, vlc_path: _PathMod | None = None):
+def jump_media_to_srt_time(srt_path: _PathMod, target_seconds: float, vlc_path: _PathMod | None = None):
     try:
         proj = program_root()
     except Exception:
         proj = _PathMod(".")
-    vid = guess_video_for_srt(srt_path, proj)
-    if not vid:
-        raise FileNotFoundError(f"Could not locate a video file automatically for source: {srt_path.name}")
+    media_path = guess_media_for_srt(srt_path, proj)
+    if not media_path:
+        raise FileNotFoundError(f"Could not locate a supported media file for source: {srt_path.name}")
     
-    if not _open_in_vlc(vid, target_seconds, vlc_path=vlc_path):
-        _open_in_ffplay(vid, target_seconds)
+    if not _open_in_vlc(media_path, target_seconds, vlc_path=vlc_path):
+        _open_in_ffplay(media_path, target_seconds)
+
+
+def jump_video_to_srt_time(srt_path: _PathMod, target_seconds: float, vlc_path: _PathMod | None = None):
+    """Compatibility alias for the former video-only launcher."""
+    return jump_media_to_srt_time(srt_path, target_seconds, vlc_path=vlc_path)
 
 # === end helpers =============================================================
 
@@ -2063,6 +2147,7 @@ class NamingWorkspace(ttk.Frame):
         on_discard=None,
         discard_label="Cancel",
         result_preflight=None,
+        result_descriptor=None,
     ):
         super().__init__(master, style=MIDNIGHTSTUDIO_STYLES["page"])
         self._on_apply_complete = on_apply_complete
@@ -2077,6 +2162,10 @@ class NamingWorkspace(ttk.Frame):
         self._vlc_player = None
         self._vlc_media = None
         self._loaded_video_path = None
+        self._loaded_media_kind = None
+        self._audio_caption_render_key = None
+        self._audio_ass_palette_cache = None
+        self._audio_caption_font_size = None
         self._video_update_after = None
         self._pending_seek_after = None
         self._pending_subtitle_after = None
@@ -2091,6 +2180,8 @@ class NamingWorkspace(ttk.Frame):
         self._word_tag_names = []
         self._timed_word_index = []
         self._timed_word_starts = []
+        self._timed_caption_index = []
+        self._timed_caption_starts = []
         self._current_word_tag = None
         self._word_sync_after = None
         self._word_sync_interval_ms = 40
@@ -2132,9 +2223,26 @@ class NamingWorkspace(ttk.Frame):
         seg_data = copy.deepcopy(result_preflight.segments_data)
         self.title_name = spk_data.get("title") or self.speakers_json.parent.name
         self.speakers = list(spk_data.get("speakers") or [])
-        self.saved_names = dict(spk_data.get("names") or spk_data.get("name_map") or {})
+        # The mapping embedded in this exact speakers.json is authoritative for
+        # reopening the result. Source availability/identity controls media
+        # playback only and must not suppress these saved assignments.
+        self.saved_names = _result_local_speaker_names(spk_data)
         self.segments_data = copy.deepcopy(seg_data)
         self.segments = copy.deepcopy(seg_data.get("segments") or [])
+        descriptor_matches = (
+            isinstance(result_descriptor, ResultDescriptor)
+            and result_descriptor.file_identity == self.result_identity
+        )
+        self._source_path = (
+            result_descriptor.source_path
+            if descriptor_matches and result_descriptor.source_path is not None
+            else self.segments_data.get("source_path")
+        )
+        self._source_identity = (
+            result_descriptor.source_identity
+            if descriptor_matches and result_descriptor.source_identity is not None
+            else self.segments_data.get("source_identity")
+        )
         self._subtitle_paths, self._subtitle_choices = self._discover_subtitle_files()
         self.manual_corrections_pending = False
         global_counts = Counter(_extract_candidates_from_text(" ".join(str(s.get("text","")) for s in self.segments)))
@@ -2246,11 +2354,13 @@ class NamingWorkspace(ttk.Frame):
             cb.bind("<FocusIn>", lambda e, spk=spk: self.selected_speaker.set(spk))
             cb.bind("<Button-1>", lambda e, spk=spk: self.selected_speaker.set(spk))
 
-            if saved:
-                cb.set(saved)
-
             self.inputs[spk] = cb
             self.name_vars[spk] = name_var
+
+        # Hydrate the completed assignment UI in one source-independent step.
+        # This is intentionally done before the first transcript render and
+        # before dirty tracking/baseline capture.
+        self._set_result_local_speaker_names(self.saved_names)
 
         grid.columnconfigure(2, weight=1)
         grid.bind("<Configure>", lambda event: speaker_canvas.configure(scrollregion=speaker_canvas.bbox("all")))
@@ -2408,8 +2518,8 @@ class NamingWorkspace(ttk.Frame):
         search_actions.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(8, 0))
         tb.Button(search_actions, text="Find next", command=self.find_next, bootstyle="primary-outline").pack(side="left")
         ttk.Button(search_actions, text="Find speaker tag", command=self.find_speaker_tag).pack(side="left", padx=(6, 0))
-        ttk.Button(search_actions, text="Preview video at hit", command=self.preview_video_at_query).pack(side="left", padx=(6, 0))
-        ttk.Button(search_actions, text="Open video externally", command=self.open_video_at_query).pack(side="left", padx=(6, 0))
+        ttk.Button(search_actions, text="Preview media at hit", command=self.preview_video_at_query).pack(side="left", padx=(6, 0))
+        ttk.Button(search_actions, text="Open media externally", command=self.open_video_at_query).pack(side="left", padx=(6, 0))
         ttk.Button(search_actions, text="Open transcript file", command=self.open_txt_external).pack(side="left", padx=(6, 0))
 
         self._preview_paned = tk.PanedWindow(
@@ -2424,7 +2534,7 @@ class NamingWorkspace(ttk.Frame):
         style_midnightstudio_native_panedwindow(self._preview_paned)
         self._preview_paned.grid(row=1, column=0, sticky="nsew")
 
-        video = ttk.LabelFrame(self._preview_paned, text="Video Preview", padding=8)
+        video = ttk.LabelFrame(self._preview_paned, text="Media Preview", padding=8)
         self._video_preview_frame = video
         video.columnconfigure(0, weight=1, minsize=480)
         video.rowconfigure(0, weight=1, minsize=160)
@@ -2445,13 +2555,73 @@ class NamingWorkspace(ttk.Frame):
         self.video_surface.grid(row=0, column=0, sticky="nsew")
         self.video_message = tk.Label(
             self.video_surface,
-            text="No video loaded",
+            text="No media loaded",
             background=MIDNIGHTSTUDIO_TOKENS["video_bg"],
             foreground=MIDNIGHTSTUDIO_TOKENS["video_message_fg"],
             justify="center",
             wraplength=430,
         )
         self.video_message.place(relx=0.5, rely=0.5, anchor="center")
+        self.audio_ass_font = tkfont.Font(
+            root=self,
+            family=_ASS_FONT_NAME,
+            size=12,
+            weight="normal",
+        )
+        self.audio_srt_font = tkfont.Font(
+            root=self,
+            family=_ASS_FONT_NAME,
+            size=12,
+            weight="normal",
+        )
+        self.audio_caption = tk.Text(
+            self.video_surface,
+            height=1,
+            wrap="word",
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=0,
+            background=MIDNIGHTSTUDIO_TOKENS["video_bg"],
+            foreground=MIDNIGHTSTUDIO_THEME_COLORS["fg"],
+            insertbackground=MIDNIGHTSTUDIO_TOKENS["video_bg"],
+            selectbackground=MIDNIGHTSTUDIO_TOKENS["video_bg"],
+            selectforeground=MIDNIGHTSTUDIO_THEME_COLORS["fg"],
+            cursor="arrow",
+            takefocus=False,
+            font=self.audio_ass_font,
+        )
+        self.audio_caption.tag_configure(
+            "audio_caption_srt",
+            justify="center",
+            foreground=MIDNIGHTSTUDIO_THEME_COLORS["fg"],
+            font=self.audio_srt_font,
+        )
+        self.audio_caption.tag_configure(
+            "audio_caption_message",
+            justify="center",
+            foreground=MIDNIGHTSTUDIO_TOKENS["video_message_fg"],
+            font=self.audio_srt_font,
+        )
+        self.audio_caption.tag_configure(
+            "audio_caption_ass_base",
+            justify="center",
+            font=self.audio_ass_font,
+        )
+        for karaoke_tag in (
+            "audio_caption_ass_completed",
+            "audio_caption_ass_current",
+            "audio_caption_ass_upcoming",
+        ):
+            self.audio_caption.tag_configure(
+                karaoke_tag,
+                font=self.audio_ass_font,
+            )
+        self.audio_caption.configure(state="disabled")
+        self.video_surface.bind(
+            "<Configure>",
+            self._on_media_surface_configure,
+            add="+",
+        )
 
         player_controls = ttk.Frame(video)
         player_controls.grid(row=1, column=0, sticky="ew", pady=(8, 0))
@@ -2626,6 +2796,7 @@ class NamingWorkspace(ttk.Frame):
             os.name != "nt"
             or self._player_closing
             or self._vlc_player is None
+            or self._loaded_media_kind != "video"
             or self._video_reattach_after is not None
         ):
             return
@@ -2848,14 +3019,302 @@ class NamingWorkspace(ttk.Frame):
             pass
 
     def _set_video_message(self, message):
+        self._audio_caption_render_key = None
+        self.audio_caption.place_forget()
         self.video_message.configure(text=message)
         self.video_message.place(relx=0.5, rely=0.5, anchor="center")
+
+    def _current_source_state(self):
+        return determine_source_state(self._source_path, self._source_identity)
+
+    def _source_media_for_playback(self):
+        source_state = self._current_source_state()
+        if source_state == "missing":
+            return None, None, "The original media source is missing. This result remains available for transcript review."
+        if source_state == "changed":
+            return None, None, "The original media source has changed since this result was created. Playback is disabled for safety."
+        if not self._source_path:
+            return None, None, "The original media path is not available for this transcript."
+        try:
+            source = Path(self._source_path).expanduser().resolve()
+        except (OSError, TypeError, ValueError):
+            return None, None, "The original media path is invalid."
+        if not source.is_file():
+            return None, None, "The original media source is missing. This result remains available for transcript review."
+        media_kind = _supported_media_kind(source)
+        if media_kind is None:
+            return None, None, "The original source is not a supported audio or video file."
+        return source, media_kind, None
+
+    def _on_media_surface_configure(self, event=None):
+        try:
+            surface_height = int(
+                getattr(event, "height", 0) or self.video_surface.winfo_height()
+            )
+        except (AttributeError, TypeError, ValueError, tk.TclError):
+            surface_height = 270
+        scaled_size = int(
+            round(
+                max(1, surface_height)
+                * _ASS_FONT_SIZE
+                / _ASS_PLAY_RES_Y
+                * 72
+                / 96
+            )
+        )
+        ass_size = max(10, min(28, scaled_size))
+        if ass_size == self._audio_caption_font_size:
+            return
+        self._audio_caption_font_size = ass_size
+        self.audio_ass_font.configure(size=ass_size, weight="normal")
+        self.audio_srt_font.configure(size=max(11, min(20, ass_size)))
+        self._audio_caption_render_key = None
+        self._update_audio_caption()
+
+    def _audio_caption_margin_pixels(self):
+        try:
+            surface_height = max(1, int(self.video_surface.winfo_height()))
+        except (AttributeError, TypeError, ValueError, tk.TclError):
+            surface_height = 270
+        return max(8, int(round(surface_height * _ASS_MARGIN_V / _ASS_PLAY_RES_Y)))
+
+    def _fit_audio_caption_height(self):
+        try:
+            self.audio_caption.update_idletasks()
+            counted = self.audio_caption.count("1.0", "end-1c", "displaylines")
+            display_lines = int(counted[0]) if counted else 1
+        except (AttributeError, IndexError, TypeError, ValueError, tk.TclError):
+            display_lines = 1
+        self.audio_caption.configure(height=max(1, display_lines))
+
+    def _set_audio_caption_content(
+        self,
+        text,
+        *,
+        base_tag,
+        word_states=(),
+        primary_color=None,
+        style_name=None,
+        message=False,
+    ):
+        if self._loaded_media_kind != "audio":
+            self._audio_caption_render_key = None
+            self.audio_caption.place_forget()
+            return
+        word_states = tuple(word_states)
+        render_key = (
+            text,
+            base_tag,
+            word_states,
+            primary_color,
+            style_name,
+            bool(message),
+            self._audio_caption_font_size,
+        )
+        if render_key == self._audio_caption_render_key:
+            return
+        self._audio_caption_render_key = render_key
+        self.video_message.place_forget()
+        self.audio_caption.configure(state="normal")
+        self.audio_caption.delete("1.0", "end")
+        if primary_color is not None:
+            for tag_name in (
+                "audio_caption_ass_base",
+                "audio_caption_ass_completed",
+                "audio_caption_ass_current",
+            ):
+                self.audio_caption.tag_configure(
+                    tag_name,
+                    foreground=primary_color,
+                    background=MIDNIGHTSTUDIO_TOKENS["video_bg"],
+                )
+            self.audio_caption.tag_configure(
+                "audio_caption_ass_upcoming",
+                foreground=_rgb_hex(_ASS_SECONDARY_RGB),
+                background=MIDNIGHTSTUDIO_TOKENS["video_bg"],
+            )
+        self.audio_caption.insert("1.0", text, base_tag)
+        if not message:
+            tag_names = {
+                "completed": "audio_caption_ass_completed",
+                "current": "audio_caption_ass_current",
+                "upcoming": "audio_caption_ass_upcoming",
+            }
+            for state, start, end in word_states:
+                tag_name = tag_names.get(state)
+                if tag_name is None:
+                    continue
+                try:
+                    self.audio_caption.tag_add(
+                        tag_name,
+                        f"1.0+{start}c",
+                        f"1.0+{end}c",
+                    )
+                except (TypeError, ValueError, tk.TclError):
+                    continue
+        self.audio_caption.configure(state="disabled")
+        if message:
+            self.audio_caption.configure(height=1)
+            self.audio_caption.place(
+                relx=0.5,
+                rely=0.5,
+                relwidth=0.92,
+                anchor="center",
+            )
+            return
+        self.audio_caption.configure(height=1)
+        self.audio_caption.place(
+            relx=0.5,
+            rely=1.0,
+            y=-self._audio_caption_margin_pixels(),
+            relwidth=0.92,
+            anchor="s",
+        )
+        self._fit_audio_caption_height()
+
+    def _caption_segment_at_playback_time(self, current_seconds):
+        if not self._timed_caption_index:
+            return None
+        try:
+            current_seconds = float(current_seconds)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(current_seconds):
+            return None
+        index = bisect_right(self._timed_caption_starts, current_seconds) - 1
+        if index < 0:
+            return None
+        record = self._timed_caption_index[index]
+        if record["media_start"] <= current_seconds < record["media_end"]:
+            return record
+        return None
+
+    def _audio_ass_palette(self):
+        if self._audio_ass_palette_cache is None:
+            mapping = self._current_name_mapping()
+            speakers = _ass_display_speakers(self.segments, mapping)
+            self._audio_ass_palette_cache = _speaker_palette(speakers)
+        return self._audio_ass_palette_cache
+
+    def _audio_ass_style_for_segment(self, segment):
+        style_name = _speaker_display(
+            segment.get("speaker"),
+            self._current_name_mapping(),
+        ) or "Default"
+        rgb = self._audio_ass_palette().get(style_name, (255, 255, 255))
+        return style_name, rgb
+
+    @staticmethod
+    def _audio_caption_segment_text(segment):
+        text = str(segment.get("text", "") or "").replace("\n", " ").strip()
+        if text:
+            return text
+        words = segment.get("words")
+        if not isinstance(words, list):
+            return ""
+        return " ".join(
+            str(word.get("word", word.get("text", "")) or "").strip()
+            for word in words
+            if isinstance(word, dict)
+            and str(word.get("word", word.get("text", "")) or "").strip()
+        )
+
+    def _audio_ass_word_states(self, segment, segment_text, current_seconds):
+        words = segment.get("words")
+        if not isinstance(words, list):
+            return ()
+        states = []
+        search_from = 0
+        for word in words:
+            if not isinstance(word, dict):
+                continue
+            raw_word = word.get("word")
+            if raw_word is None:
+                raw_word = word.get("text")
+            word_text = str(raw_word or "")
+            if not word_text.strip():
+                continue
+            match_start = segment_text.find(word_text, search_from)
+            if match_start < 0:
+                continue
+            match_end = match_start + len(word_text)
+            timing = self._valid_word_time_range(word)
+            if timing is not None:
+                if current_seconds < timing[0]:
+                    state = "upcoming"
+                elif current_seconds < timing[1]:
+                    state = "current"
+                else:
+                    state = "completed"
+                states.append((state, match_start, match_end))
+            search_from = match_end
+        return tuple(states)
+
+    def _audio_srt_caption_text(self, segment):
+        segment_text = self._audio_caption_segment_text(segment)
+        speaker = segment.get("speaker")
+        if not speaker:
+            return segment_text
+        display = self._current_name_mapping().get(speaker, speaker)
+        return f"{display}: {segment_text}"
+
+    def _render_audio_ass_caption(self, segment, current_seconds, *, karaoke):
+        caption = self._audio_caption_segment_text(segment)
+        style_name, rgb = self._audio_ass_style_for_segment(segment)
+        word_states = (
+            self._audio_ass_word_states(segment, caption, current_seconds)
+            if karaoke
+            else ()
+        )
+        self._set_audio_caption_content(
+            caption,
+            base_tag="audio_caption_ass_base",
+            word_states=word_states,
+            primary_color=_rgb_hex(rgb),
+            style_name=style_name,
+        )
+
+    def _render_audio_srt_caption(self, segment):
+        self._set_audio_caption_content(
+            self._audio_srt_caption_text(segment),
+            base_tag="audio_caption_srt",
+        )
+
+    def _show_audio_playback_message(self):
+        self._set_audio_caption_content(
+            "Audio playback",
+            base_tag="audio_caption_message",
+            message=True,
+        )
+
+    def _update_audio_caption(self, current_seconds=None, *, force_message=False):
+        if self._loaded_media_kind != "audio":
+            self._audio_caption_render_key = None
+            self.audio_caption.place_forget()
+            return
+        choice = self.subtitle_var.get() or "Off"
+        if force_message or choice == "Off":
+            self._show_audio_playback_message()
+            return
+        if current_seconds is None:
+            current_seconds = self._reported_vlc_playback_seconds()
+        segment_record = self._caption_segment_at_playback_time(current_seconds)
+        if segment_record is None:
+            self._show_audio_playback_message()
+            return
+        segment = self.segments[segment_record["segment_index"]]
+        if choice == "ASS (word highlighting)":
+            self._render_audio_ass_caption(segment, current_seconds, karaoke=True)
+        elif choice == "ASS (plain)":
+            self._render_audio_ass_caption(segment, current_seconds, karaoke=False)
+        else:
+            self._render_audio_srt_caption(segment)
 
     def _initialize_embedded_player(self):
         self._vlc_status = get_embedded_vlc_status()
         if not self._vlc_status.get("available"):
             reason = self._vlc_status.get("reason") or "Embedded VLC playback is unavailable."
-            self._set_video_message(f"Embedded video unavailable\n{reason}")
+            self._set_video_message(f"Embedded media unavailable\n{reason}")
             for control in self._video_controls:
                 control.state(["disabled"])
             return
@@ -2865,9 +3324,6 @@ class NamingWorkspace(ttk.Frame):
             self._vlc_player = self._vlc_instance.media_player_new()
             if self._vlc_player is None:
                 raise RuntimeError("LibVLC returned no media player")
-            if os.name == "nt":
-                self.video_surface.update_idletasks()
-                self._vlc_player.set_hwnd(self.video_surface.winfo_id())
             self._vlc_player.audio_set_volume(80)
         except Exception as exc:
             failed_player = self._vlc_player
@@ -2886,7 +3342,7 @@ class NamingWorkspace(ttk.Frame):
                 "available": False,
                 "reason": f"The embedded media player could not be created: {exc}",
             }
-            self._set_video_message(f"Embedded video unavailable\n{self._vlc_status['reason']}")
+            self._set_video_message(f"Embedded media unavailable\n{self._vlc_status['reason']}")
             for control in self._video_controls:
                 control.state(["disabled"])
             return
@@ -2977,6 +3433,7 @@ class NamingWorkspace(ttk.Frame):
                 target_ms / 1000.0,
                 pending_seek=True,
             )
+            self._update_audio_caption(target_ms / 1000.0)
             self._schedule_word_synchronization()
         except Exception:
             pass
@@ -2992,8 +3449,8 @@ class NamingWorkspace(ttk.Frame):
     def _video_play_pause(self):
         if self._vlc_player is None or self._loaded_video_path is None:
             messagebox.showinfo(
-                "Video Preview",
-                "Load a video from a transcript hit first.",
+                "Media Preview",
+                "Load media from a transcript hit or timed word first.",
                 parent=self.winfo_toplevel(),
             )
             return
@@ -3002,6 +3459,7 @@ class NamingWorkspace(ttk.Frame):
             if self._vlc_player.is_playing():
                 self._vlc_player.pause()
                 self._rebase_interpolated_playback_clock_from_player()
+                self._update_audio_caption()
                 self.btn_video_play.configure(text="Play")
             else:
                 self._rebase_interpolated_playback_clock_from_player()
@@ -3011,7 +3469,7 @@ class NamingWorkspace(ttk.Frame):
                 self._schedule_word_synchronization()
         except Exception as exc:
             messagebox.showerror(
-                "Video Preview",
+                "Media Preview",
                 f"Could not control playback:\n{exc}",
                 parent=self.winfo_toplevel(),
             )
@@ -3052,6 +3510,7 @@ class NamingWorkspace(ttk.Frame):
             text=f"00:00 / {self._format_video_time(self._video_duration_seconds)}"
         )
         self.btn_video_play.configure(text="Play")
+        self._update_audio_caption(0.0, force_message=True)
 
     def _video_volume_changed(self, _value=None):
         if self._vlc_player is None:
@@ -3262,8 +3721,8 @@ class NamingWorkspace(ttk.Frame):
             self._schedule_apply_player_state_restore(snapshot)
         except Exception as exc:
             messagebox.showwarning(
-                "Video Preview",
-                "Apply finished, but the embedded video preview could not be fully restored:\n"
+                "Media Preview",
+                "Apply finished, but the embedded media preview could not be fully restored:\n"
                 f"{exc}",
                 parent=self.winfo_toplevel(),
             )
@@ -3292,6 +3751,7 @@ class NamingWorkspace(ttk.Frame):
             except Exception:
                 pass
         self._applied_subtitle_choice = "Off"
+        self._update_audio_caption(force_message=True)
 
     def _subtitle_file_candidates(self):
         subtitle_title = self.segments_data.get("title") or self.speakers_json.parent.name
@@ -3316,12 +3776,13 @@ class NamingWorkspace(ttk.Frame):
         self.subtitle_selector.configure(values=self._subtitle_choices)
         if previous_choice in self._subtitle_choices:
             self.subtitle_var.set(previous_choice)
+            self._update_audio_caption()
             return
         if previous_choice != "Off":
             missing_path = previous_paths.get(previous_choice) or "the selected subtitle file"
             self._report_subtitle_failure(
                 previous_choice,
-                f"The subtitle file is no longer available:\n{missing_path}\n\nVideo playback will continue without subtitles.",
+                f"The subtitle file is no longer available:\n{missing_path}\n\nMedia playback will continue without subtitles.",
             )
             return
         self.subtitle_var.set("Off")
@@ -3341,7 +3802,7 @@ class NamingWorkspace(ttk.Frame):
             self.subtitle_selector.configure(values=self._subtitle_choices)
         if not self._player_closing:
             messagebox.showwarning(
-                "Video subtitles",
+                "Media subtitles",
                 message,
                 parent=self.winfo_toplevel(),
             )
@@ -3432,7 +3893,7 @@ class NamingWorkspace(ttk.Frame):
         subtitle_path = self._subtitle_paths.get(choice)
         self._report_subtitle_failure(
             choice,
-            f"VLC could not activate the subtitle file:\n{subtitle_path}\n\nVideo playback will continue without subtitles.",
+            f"VLC could not activate the subtitle file:\n{subtitle_path}\n\nMedia playback will continue without subtitles.",
         )
 
     def _apply_selected_subtitle(self, preserve_state=True):
@@ -3450,9 +3911,16 @@ class NamingWorkspace(ttk.Frame):
             missing_path = subtitle_path or "the selected subtitle file"
             self._report_subtitle_failure(
                 choice,
-                f"The subtitle file is no longer available:\n{missing_path}\n\nVideo playback will continue without subtitles.",
+                f"The subtitle file is no longer available:\n{missing_path}\n\nMedia playback will continue without subtitles.",
                 remove_choice=True,
             )
+            self._restore_subtitle_playback_state(snapshot)
+            return
+
+        if self._loaded_media_kind == "audio":
+            self._subtitle_track_ids.pop(choice, None)
+            self._applied_subtitle_choice = choice
+            self._update_audio_caption()
             self._restore_subtitle_playback_state(snapshot)
             return
 
@@ -3475,7 +3943,7 @@ class NamingWorkspace(ttk.Frame):
         except Exception as exc:
             self._report_subtitle_failure(
                 choice,
-                f"VLC could not load the subtitle file:\n{subtitle_path}\n\n{exc}\n\nVideo playback will continue without subtitles.",
+                f"VLC could not load the subtitle file:\n{subtitle_path}\n\n{exc}\n\nMedia playback will continue without subtitles.",
             )
             self._restore_subtitle_playback_state(snapshot)
             return
@@ -3500,28 +3968,32 @@ class NamingWorkspace(ttk.Frame):
 
         self._pending_subtitle_after = self.after(250, apply_after_play)
 
-    def _load_embedded_video(self, video_path, start_seconds):
+    def _load_embedded_media(self, media_path, start_seconds):
         if self._vlc_player is None or self._vlc_instance is None:
             raise RuntimeError(self._vlc_status.get("reason") or "Embedded VLC playback is unavailable.")
 
         self._cancel_pending_apply_player_restore()
-        video_path = Path(video_path).resolve()
-        if not video_path.is_file():
-            raise FileNotFoundError(f"Video file not found: {video_path}")
-        normalized_path = os.path.normcase(str(video_path))
-        same_video = normalized_path == self._loaded_video_path and self._vlc_media is not None
+        media_path = Path(media_path).resolve()
+        if not media_path.is_file():
+            raise FileNotFoundError(f"Media file not found: {media_path}")
+        media_kind = _supported_media_kind(media_path)
+        if media_kind is None:
+            raise ValueError(f"Unsupported audio or video file: {media_path.name}")
+        normalized_path = os.path.normcase(str(media_path))
+        same_media = normalized_path == self._loaded_video_path and self._vlc_media is not None
 
         self._cancel_pending_video_seek()
         self._cancel_pending_subtitle_apply()
-        if not same_video:
+        if not same_media:
             self._vlc_player.stop()
-            media = self._vlc_instance.media_new(str(video_path))
+            media = self._vlc_instance.media_new(str(media_path))
             if media is None:
-                raise RuntimeError("LibVLC could not create media for the selected video")
+                raise RuntimeError("LibVLC could not create media for the selected source")
             old_media = self._vlc_media
             self._vlc_player.set_media(media)
             self._vlc_media = media
             self._loaded_video_path = normalized_path
+            self._loaded_media_kind = media_kind
             self._subtitle_track_ids.clear()
             self._applied_subtitle_choice = None
             if old_media is not None:
@@ -3530,9 +4002,14 @@ class NamingWorkspace(ttk.Frame):
                 except Exception:
                     pass
 
-        if os.name == "nt":
+        if os.name == "nt" and media_kind == "video":
             self._vlc_player.set_hwnd(self.video_surface.winfo_id())
         self.video_message.place_forget()
+        if media_kind == "video":
+            self._audio_caption_render_key = None
+            self.audio_caption.place_forget()
+        else:
+            self._update_audio_caption(start_seconds)
         self._vlc_player.audio_set_volume(max(0, min(100, int(self.video_volume_var.get()))))
         if self._vlc_player.play() == -1:
             raise RuntimeError("LibVLC could not start playback")
@@ -3541,6 +4018,10 @@ class NamingWorkspace(ttk.Frame):
         self._schedule_video_start_seek(start_seconds)
         self._schedule_selected_subtitle_after_play()
         self._schedule_word_synchronization()
+
+    def _load_embedded_video(self, video_path, start_seconds):
+        """Compatibility wrapper for existing callers and fixture-based integrations."""
+        return self._load_embedded_media(video_path, start_seconds)
 
     def _release_embedded_player(self, *, save_view_preferences=True):
         if self._player_closing:
@@ -3571,6 +4052,9 @@ class NamingWorkspace(ttk.Frame):
         media = self._vlc_media
         self._vlc_player = None
         self._vlc_media = None
+        self._loaded_video_path = None
+        self._loaded_media_kind = None
+        self._audio_caption_render_key = None
         if player is not None:
             try:
                 player.stop()
@@ -3673,7 +4157,7 @@ class NamingWorkspace(ttk.Frame):
             video_path = snapshot.get("video_path")
             if video_path is not None:
                 if not video_path.is_file():
-                    return False, f"The previously loaded video is no longer available: {video_path}"
+                    return False, f"The previously loaded media is no longer available: {video_path}"
                 self._load_embedded_video(
                     video_path,
                     max(0.0, snapshot["current_ms"] / 1000.0),
@@ -3726,6 +4210,20 @@ class NamingWorkspace(ttk.Frame):
             },
         }
 
+    def _set_result_local_speaker_names(self, stored_names):
+        result_names = _result_local_speaker_names(
+            {
+                "speakers": self.speakers,
+                "names": stored_names,
+            }
+        )
+        self.saved_names = result_names
+        for speaker in self.speakers:
+            variable = self.name_vars.get(speaker)
+            if variable is not None:
+                variable.set(result_names.get(speaker, ""))
+        return result_names
+
     def _set_dirty_indicator(self, dirty):
         if not hasattr(self, "lbl_dirty_status"):
             return
@@ -3738,6 +4236,9 @@ class NamingWorkspace(ttk.Frame):
     def _update_dirty_state(self, *_):
         if self._dirty_tracking_suspended or self._clean_baseline is None:
             return False
+        self._audio_ass_palette_cache = None
+        self._audio_caption_render_key = None
+        self._update_audio_caption()
         dirty = self._review_state_snapshot() != self._clean_baseline
         if not dirty:
             self.manual_corrections_pending = False
@@ -3824,19 +4325,15 @@ class NamingWorkspace(ttk.Frame):
             return False
         speakers_data = result_preflight.speakers_data
         segments_data = result_preflight.segments_data
-        disk_names = dict(
-            speakers_data.get("names") or speakers_data.get("name_map") or {}
-        )
+        disk_names = _result_local_speaker_names(speakers_data)
         disk_segments = copy.deepcopy(segments_data.get("segments") or [])
 
         self._dirty_tracking_suspended = True
         try:
             try:
-                self.saved_names = disk_names
                 self.segments_data = copy.deepcopy(segments_data)
                 self.segments = disk_segments
-                for speaker in self.speakers:
-                    self.inputs[speaker].set(str(disk_names.get(speaker, "") or ""))
+                self._set_result_local_speaker_names(disk_names)
                 self.name_pool.delete(0, "end")
                 for name in baseline["candidate_pool"]:
                     self.name_pool.insert("end", name)
@@ -3925,6 +4422,8 @@ class NamingWorkspace(ttk.Frame):
         self._word_tag_names = []
         self._timed_word_index = []
         self._timed_word_starts = []
+        self._timed_caption_index = []
+        self._timed_caption_starts = []
 
     @staticmethod
     def _valid_word_time_range(word):
@@ -3939,6 +4438,24 @@ class NamingWorkspace(ttk.Frame):
         if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start:
             return None
         return start, end
+
+    def _valid_segment_time_range(self, segment):
+        timing = self._valid_word_time_range(segment)
+        if timing is not None:
+            return timing
+        words = segment.get("words")
+        if not isinstance(words, list):
+            return None
+        word_ranges = [
+            timing
+            for word in words
+            if isinstance(word, dict)
+            for timing in (self._valid_word_time_range(word),)
+            if timing is not None
+        ]
+        if not word_ranges:
+            return None
+        return min(item[0] for item in word_ranges), max(item[1] for item in word_ranges)
 
     def _insert_segment_with_word_tags(self, segment, segment_index, segment_text):
         words = segment.get("words")
@@ -4032,6 +4549,8 @@ class NamingWorkspace(ttk.Frame):
         self._rebuild_timed_word_index()
 
     def _rebuild_timed_word_index(self):
+        self._audio_ass_palette_cache = None
+        self._audio_caption_render_key = None
         self._timed_word_index = sorted(
             self._word_records,
             key=lambda record: (
@@ -4042,7 +4561,29 @@ class NamingWorkspace(ttk.Frame):
             ),
         )
         self._timed_word_starts = [record["media_start"] for record in self._timed_word_index]
+        self._timed_caption_index = sorted(
+            (
+                {
+                    "segment_index": segment_index,
+                    "media_start": timing[0],
+                    "media_end": timing[1],
+                }
+                for segment_index, segment in enumerate(self.segments)
+                if isinstance(segment, dict)
+                for timing in (self._valid_segment_time_range(segment),)
+                if timing is not None
+            ),
+            key=lambda record: (
+                record["media_start"],
+                record["media_end"],
+                record["segment_index"],
+            ),
+        )
+        self._timed_caption_starts = [
+            record["media_start"] for record in self._timed_caption_index
+        ]
         self._rebase_interpolated_playback_clock_from_player()
+        self._update_audio_caption()
 
     def _timed_word_at_playback_time(self, current_seconds):
         if not self._timed_word_index:
@@ -4255,6 +4796,7 @@ class NamingWorkspace(ttk.Frame):
             ):
                 self._clear_current_word()
                 self._reset_interpolated_playback_clock()
+                self._update_audio_caption(force_message=True)
                 return
             current_seconds = (
                 self._interpolated_playback_time(
@@ -4271,6 +4813,7 @@ class NamingWorkspace(ttk.Frame):
                 else None
             )
             self._set_current_word(record)
+            self._update_audio_caption(current_seconds)
         except Exception:
             pass
         self._schedule_word_synchronization()
@@ -4329,36 +4872,23 @@ class NamingWorkspace(ttk.Frame):
         self.text.tag_remove("hover_word", "1.0", "end")
         self.text.configure(cursor=self._transcript_default_cursor)
 
-    def _video_path_for_timed_word(self):
-        if self._loaded_video_path:
-            loaded_path = Path(self._loaded_video_path)
-            if loaded_path.is_file():
-                return loaded_path, None
+    def _media_path_for_timed_word(self):
+        media_path, _media_kind, reason = self._source_media_for_playback()
+        return media_path, reason
 
-        source_path = self.segments_data.get("source_path") if isinstance(self.segments_data, dict) else None
-        if not source_path:
-            return None, "The original video path is not available for this transcript."
-        try:
-            source = Path(source_path).expanduser()
-        except (TypeError, ValueError):
-            return None, "The original video path is invalid."
-        if not source.is_file():
-            return None, "The original video file is missing. Use Preview video at hit to locate it first."
-        if source.suffix.lower() in _PIPELINE_AUDIO_EXTS:
-            return None, "Clickable word playback requires a video source; this transcript contains audio only."
-        if source.suffix.lower() not in _PIPELINE_VIDEO_EXTS:
-            return None, "The original source is not a supported video file."
-        return source, None
+    def _video_path_for_timed_word(self):
+        """Compatibility alias for the former video-only timed-word resolver."""
+        return self._media_path_for_timed_word()
 
     def _play_timed_word(self, record):
         if self._vlc_player is None or self._vlc_instance is None:
             reason = self._vlc_status.get("reason") or "Embedded VLC playback is unavailable."
-            messagebox.showinfo("Video Preview", reason, parent=self.winfo_toplevel())
+            messagebox.showinfo("Media Preview", reason, parent=self.winfo_toplevel())
             return
-        video_path, unavailable_reason = self._video_path_for_timed_word()
-        if video_path is None:
+        media_path, unavailable_reason = self._media_path_for_timed_word()
+        if media_path is None:
             messagebox.showinfo(
-                "Video Preview",
+                "Media Preview",
                 unavailable_reason,
                 parent=self.winfo_toplevel(),
             )
@@ -4369,11 +4899,11 @@ class NamingWorkspace(ttk.Frame):
                 max(0.0, float(record["media_start"])),
                 pending_seek=True,
             )
-            self._load_embedded_video(video_path, max(0.0, float(record["media_start"])))
+            self._load_embedded_media(media_path, max(0.0, float(record["media_start"])))
         except Exception as exc:
             self._rebase_interpolated_playback_clock_from_player()
             messagebox.showwarning(
-                "Video Preview",
+                "Media Preview",
                 f"Could not play the selected word:\n{exc}",
                 parent=self.winfo_toplevel(),
             )
@@ -4610,40 +5140,36 @@ class NamingWorkspace(ttk.Frame):
             return None
         return srt_path, dialog.result
 
+    def _locate_media_for_preview(self, _srt_path=None):
+        media_path, _media_kind, reason = self._source_media_for_playback()
+        if media_path is None:
+            messagebox.showinfo(
+                "Media Preview",
+                reason,
+                parent=self.winfo_toplevel(),
+            )
+        return media_path
+
     def _locate_video_for_preview(self, srt_path):
-        try:
-            project_root = program_root()
-        except Exception:
-            project_root = Path(".")
-        video_path = guess_video_for_srt(srt_path, project_root)
-        if video_path:
-            return Path(video_path)
-        selected = filedialog.askopenfilename(
-            parent=self.winfo_toplevel(),
-            title=f"Locate original video for {self.title_name}",
-            filetypes=[("Video files", "*.mp4 *.mkv *.mov *.avi *.webm *.m4v"), ("All Files", "*.*")],
-        )
-        return Path(selected) if selected else None
+        """Compatibility alias for the former video-only preview locator."""
+        return self._locate_media_for_preview(srt_path)
 
     def _open_selected_hit_externally(self, srt_path, chosen):
         try:
             start = max(0.0, float(chosen["start"]))
+            media_path, _media_kind, reason = self._source_media_for_playback()
+            if media_path is None:
+                messagebox.showinfo(
+                    "Open media externally",
+                    reason,
+                    parent=self.winfo_toplevel(),
+                )
+                return
             cfg = read_yaml(conf_path()) if callable(globals().get("read_yaml")) else {}
             vlc_p_str = cfg.get("video_player_path")
             vlc_path = Path(vlc_p_str) if vlc_p_str else None
-            try:
-                jump_video_to_srt_time(srt_path, start, vlc_path=vlc_path)
-            except FileNotFoundError:
-                video_path = filedialog.askopenfilename(
-                    parent=self.winfo_toplevel(),
-                    title=f"Locate original video for {self.title_name}",
-                    filetypes=[("Video files", "*.mp4 *.mkv *.mov *.avi *.webm *.m4v"), ("All Files", "*.*")],
-                )
-                if not video_path:
-                    return
-                video_path = Path(video_path)
-                if not _open_in_vlc(video_path, start, vlc_path=vlc_path):
-                    _open_in_ffplay(video_path, start)
+            if not _open_in_vlc(media_path, start, vlc_path=vlc_path):
+                _open_in_ffplay(media_path, start)
         except Exception as exc:
             messagebox.showerror(
                 "Jump by SRT",
@@ -4659,100 +5185,30 @@ class NamingWorkspace(ttk.Frame):
         if self._vlc_player is None:
             reason = self._vlc_status.get("reason") or "Embedded VLC playback is unavailable."
             if messagebox.askyesno(
-                "Embedded video unavailable",
-                f"{reason}\n\nOpen this hit in the external video player instead?",
+                "Embedded media unavailable",
+                f"{reason}\n\nOpen this hit in the external media player instead?",
                 parent=self.winfo_toplevel(),
             ):
                 self._open_selected_hit_externally(srt_path, chosen)
             return
         try:
-            video_path = self._locate_video_for_preview(srt_path)
-            if video_path is None:
+            media_path = self._locate_media_for_preview(srt_path)
+            if media_path is None:
                 return
             start = max(0.0, float(chosen["start"]))
-            self._load_embedded_video(video_path, start)
+            self._load_embedded_media(media_path, start)
         except Exception as exc:
             messagebox.showerror(
-                "Video Preview",
-                f"Failed to preview video:\n{exc}",
+                "Media Preview",
+                f"Failed to preview media:\n{exc}",
                 parent=self.winfo_toplevel(),
             )
 
     def open_video_at_query(self):
-        query = (self.find_var.get() if hasattr(self, "find_var") else "").strip()
-        if not query:
-            messagebox.showinfo(
-                "Jump by SRT",
-                "Type something in the Find box first, then try again.",
-                parent=self.winfo_toplevel(),
-            )
+        selected_hit = self._select_srt_hit_for_preview()
+        if selected_hit is None:
             return
-        out_dir = self.speakers_json.parent
-        srt_path = out_dir / f"{self.title_name}.srt"
-        if not srt_path.exists():
-            messagebox.showinfo(
-                "Jump by SRT",
-                f"SRT not found:\n{srt_path.name}\n\nRun transcription first or enable SRT output.",
-                parent=self.winfo_toplevel(),
-            )
-            return
-        try:
-            segs = parse_srt_segments(srt_path)
-        except Exception as e:
-            messagebox.showerror(
-                "Jump by SRT",
-                f"Could not read SRT:\n{e}",
-                parent=self.winfo_toplevel(),
-            )
-            return
-        hits = find_segments_matching_query(segs, query)
-        if not hits:
-            messagebox.showinfo(
-                "Jump by SRT",
-                f"No SRT lines matched:\n“{query}”",
-                parent=self.winfo_toplevel(),
-            )
-            return
-        if len(hits) > 1:
-            owner = self.winfo_toplevel()
-            dlg = _SrtHitsDialog(owner, hits)
-            owner.wait_window(dlg)
-            if not dlg.result:
-                return
-            chosen = dlg.result
-        else:
-            chosen = hits[0]
-        try:
-            start = max(0.0, float(chosen["start"]))
-            cfg = read_yaml(conf_path()) if callable(globals().get("read_yaml")) else {}
-            vlc_p_str = cfg.get("video_player_path")
-            vlc_path = Path(vlc_p_str) if vlc_p_str else None
-            
-            # Use improved fallback logic directly here
-            # First attempt: automatic
-            try:
-                jump_video_to_srt_time(srt_path, start, vlc_path=vlc_path)
-            except FileNotFoundError:
-                # If automatic fails, ask user to point to file
-                vid = filedialog.askopenfilename(
-                    parent=self.winfo_toplevel(),
-                    title=f"Locate original video for {self.title_name}",
-                    filetypes=[("Video files", "*.mp4 *.mkv *.mov *.avi *.webm *.m4v"), ("All Files", "*.*")]
-                )
-                if vid:
-                    path_vid = Path(vid)
-                    # Manually launch with the user-selected video
-                    if not _open_in_vlc(path_vid, start, vlc_path=vlc_path):
-                        _open_in_ffplay(path_vid, start)
-                else:
-                    return # User cancelled
-        except Exception as e:
-            messagebox.showerror(
-                "Jump by SRT",
-                f"Failed to open player:\n{e}",
-                parent=self.winfo_toplevel(),
-            )
-            return
+        self._open_selected_hit_externally(*selected_hit)
 
     def _prefill_first_two(self, per_spk_counts: dict, global_counts: list, title_counts: list):
         order = []
@@ -5276,6 +5732,381 @@ class NamingDialog(tk.Toplevel):
             pass
 
 
+_RESULT_BROWSER_COLUMNS = (
+    ("title", "Media title", 240),
+    ("engine", "Engine", 130),
+    ("model", "Model", 130),
+    ("mode", "Mode/style", 120),
+    ("modified", "Last modified", 165),
+    ("source", "Source state", 115),
+    ("status", "Status", 100),
+)
+
+
+class _ResultBrowserModel:
+    """Pure sorting/filtering model over catalog-provided descriptors."""
+
+    def __init__(self, descriptors):
+        self.descriptors = tuple(descriptors)
+        self.sort_column = "modified"
+        self.descending = True
+
+    @staticmethod
+    def display_status(descriptor):
+        return "pending" if descriptor.pending else descriptor.status
+
+    @staticmethod
+    def _sort_value(descriptor, column):
+        if column == "title":
+            return descriptor.display_title.casefold()
+        if column == "engine":
+            return descriptor.engine.casefold()
+        if column == "model":
+            return (descriptor.model or "").casefold()
+        if column == "mode":
+            return (descriptor.mode or "").casefold()
+        if column == "modified":
+            return (
+                descriptor.modified_at.timestamp()
+                if descriptor.modified_at is not None
+                else float("-inf")
+            )
+        if column == "source":
+            return descriptor.source_state.casefold()
+        if column == "status":
+            return _ResultBrowserModel.display_status(descriptor).casefold()
+        raise ValueError(f"Unknown result-browser sort column: {column}")
+
+    def set_sort(self, column):
+        if column not in {item[0] for item in _RESULT_BROWSER_COLUMNS}:
+            raise ValueError(f"Unknown result-browser sort column: {column}")
+        if column == self.sort_column:
+            self.descending = not self.descending
+        else:
+            self.sort_column = column
+            self.descending = column == "modified"
+
+    def visible(self, *, title="", engine="all", source="all", status="all"):
+        title_filter = str(title or "").strip().casefold()
+        engine_filter = str(engine or "all").strip().casefold()
+        source_filter = str(source or "all").strip().casefold()
+        status_filter = str(status or "all").strip().casefold()
+        matched = []
+        for descriptor in self.descriptors:
+            if title_filter and title_filter not in descriptor.display_title.casefold():
+                continue
+            if engine_filter != "all" and descriptor.engine.casefold() != engine_filter:
+                continue
+            if source_filter != "all" and descriptor.source_state.casefold() != source_filter:
+                continue
+            display_status = self.display_status(descriptor).casefold()
+            if status_filter != "all" and display_status != status_filter:
+                continue
+            matched.append(descriptor)
+
+        pending = [descriptor for descriptor in matched if descriptor.pending]
+        regular = [descriptor for descriptor in matched if not descriptor.pending]
+        sort_key = lambda descriptor: self._sort_value(descriptor, self.sort_column)
+        pending.sort(key=sort_key, reverse=self.descending)
+        regular.sort(key=sort_key, reverse=self.descending)
+        return tuple(pending + regular)
+
+
+class _OpenResultDialog(tk.Toplevel):
+    """Midnight Studio browser over validated result-catalog descriptors."""
+
+    def __init__(self, parent, descriptors, issues=()):
+        super().__init__(parent)
+        style_midnightstudio_toplevel(self)
+        self.title("Open Result")
+        self.geometry("1180x620")
+        self.minsize(900, 460)
+        self.resizable(True, True)
+        self.transient(parent)
+        self.result = None
+        self.issues = tuple(issues)
+        self.model = _ResultBrowserModel(descriptors)
+        self._row_descriptors = {}
+
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        main = ttk.Frame(
+            self,
+            padding=12,
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
+        main.grid(row=0, column=0, sticky="nsew")
+        main.columnconfigure(0, weight=1)
+        main.rowconfigure(2, weight=1)
+
+        ttk.Label(
+            main,
+            text="Open Result",
+            style=MIDNIGHTSTUDIO_STYLES["review_title"],
+        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+
+        filters = ttk.LabelFrame(main, text="Filters", padding=8)
+        filters.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        filters.columnconfigure(1, weight=1)
+        self.var_title = tk.StringVar()
+        self.var_engine = tk.StringVar(value="All")
+        self.var_source = tk.StringVar(value="All")
+        self.var_status = tk.StringVar(value="All")
+
+        ttk.Label(filters, text="Title").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.entry_title = ttk.Entry(
+            filters,
+            textvariable=self.var_title,
+            width=32,
+        )
+        self.entry_title.grid(row=0, column=1, sticky="ew", padx=(0, 12))
+        ttk.Label(filters, text="Engine").grid(row=0, column=2, sticky="w", padx=(0, 6))
+        ttk.Combobox(
+            filters,
+            textvariable=self.var_engine,
+            values=("All", "WhisperX", "CrisperWhisper"),
+            state="readonly",
+            width=16,
+        ).grid(row=0, column=3, sticky="w", padx=(0, 12))
+        ttk.Label(filters, text="Source").grid(row=0, column=4, sticky="w", padx=(0, 6))
+        ttk.Combobox(
+            filters,
+            textvariable=self.var_source,
+            values=("All", "Available", "Missing", "Changed", "Unverified"),
+            state="readonly",
+            width=12,
+        ).grid(row=0, column=5, sticky="w", padx=(0, 12))
+        ttk.Label(filters, text="Status").grid(row=0, column=6, sticky="w", padx=(0, 6))
+        ttk.Combobox(
+            filters,
+            textvariable=self.var_status,
+            values=("All", "Pending", "Complete", "Failed", "Incomplete", "Processing"),
+            state="readonly",
+            width=12,
+        ).grid(row=0, column=7, sticky="w")
+        apply_midnightstudio_card_style(filters)
+
+        table_frame = ttk.Frame(
+            main,
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
+        table_frame.grid(row=2, column=0, sticky="nsew")
+        table_frame.columnconfigure(0, weight=1)
+        table_frame.rowconfigure(0, weight=1)
+        column_names = tuple(column[0] for column in _RESULT_BROWSER_COLUMNS)
+        self.tree = ttk.Treeview(
+            table_frame,
+            columns=column_names,
+            show="headings",
+            selectmode="browse",
+            style=MIDNIGHTSTUDIO_STYLES["result_tree"],
+        )
+        for column_name, heading, width in _RESULT_BROWSER_COLUMNS:
+            self.tree.heading(
+                column_name,
+                text=heading,
+                command=lambda name=column_name: self._sort_by(name),
+            )
+            self.tree.column(
+                column_name,
+                width=width,
+                minwidth=80,
+                anchor="w",
+                stretch=column_name == "title",
+            )
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        ybar = ttk.Scrollbar(
+            table_frame,
+            orient="vertical",
+            command=self.tree.yview,
+            style=MIDNIGHTSTUDIO_STYLES["review_scrollbar"],
+        )
+        xbar = ttk.Scrollbar(
+            table_frame,
+            orient="horizontal",
+            command=self.tree.xview,
+            style=MIDNIGHTSTUDIO_STYLES["dialog_hscrollbar"],
+        )
+        self.tree.configure(yscrollcommand=ybar.set, xscrollcommand=xbar.set)
+        ybar.grid(row=0, column=1, sticky="ns")
+        xbar.grid(row=1, column=0, sticky="ew")
+
+        footer = ttk.Frame(main, style=MIDNIGHTSTUDIO_STYLES["page"])
+        footer.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        footer.columnconfigure(0, weight=1)
+        self.lbl_details = ttk.Label(
+            footer,
+            text="",
+            style=MIDNIGHTSTUDIO_STYLES["secondary"],
+        )
+        self.lbl_details.grid(row=0, column=0, sticky="w")
+        self.lbl_catalog = ttk.Label(
+            footer,
+            text="",
+            style=MIDNIGHTSTUDIO_STYLES["secondary"],
+        )
+        self.lbl_catalog.grid(row=1, column=0, sticky="w", pady=(3, 0))
+        buttons = ttk.Frame(footer, style=MIDNIGHTSTUDIO_STYLES["page"])
+        buttons.grid(row=0, column=1, rowspan=2, sticky="e")
+        tb.Button(
+            buttons,
+            text="Cancel",
+            command=self._cancel,
+            bootstyle="secondary-outline",
+        ).pack(side="right")
+        self.btn_open = tb.Button(
+            buttons,
+            text="Open Selected",
+            command=self._accept_selected,
+            bootstyle="primary",
+        )
+        self.btn_open.pack(side="right", padx=(0, 8))
+
+        for variable in (
+            self.var_title,
+            self.var_engine,
+            self.var_source,
+            self.var_status,
+        ):
+            variable.trace_add("write", self._filters_changed)
+        self.tree.bind("<<TreeviewSelect>>", self._selection_changed, add="+")
+        self.tree.bind("<ButtonRelease-1>", self._select_clicked_row, add="+")
+        self.tree.bind("<Double-1>", self._double_click, add="+")
+        self.bind("<Return>", self._accept_selected)
+        self.bind("<Escape>", self._cancel)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        reinforce_midnightstudio_control_states(tb.Style.get_instance() or tb.Style())
+        self._render_results()
+        self.grab_set()
+        self.after_idle(self.tree.focus_set)
+
+    @staticmethod
+    def _descriptor_key(descriptor):
+        return (
+            descriptor.result_id,
+            descriptor.speakers_json,
+            descriptor.segments_json,
+            descriptor.speakers_sha256,
+            descriptor.segments_sha256,
+        )
+
+    @staticmethod
+    def _format_engine(engine):
+        return "CrisperWhisper" if engine == "crisperwhisper" else "WhisperX"
+
+    @staticmethod
+    def _format_modified(value):
+        if value is None:
+            return "Unknown"
+        return value.astimezone().strftime("%Y-%m-%d %H:%M")
+
+    def _current_descriptor(self):
+        selection = self.tree.selection()
+        return self._row_descriptors.get(selection[0]) if selection else None
+
+    def _filters_changed(self, *_args):
+        self._render_results()
+
+    def _sort_by(self, column):
+        self.model.set_sort(column)
+        self._render_results()
+
+    def _update_headings(self):
+        for column_name, heading, _width in _RESULT_BROWSER_COLUMNS:
+            marker = ""
+            if column_name == self.model.sort_column:
+                marker = " ▼" if self.model.descending else " ▲"
+            self.tree.heading(column_name, text=heading + marker)
+
+    def _render_results(self):
+        selected = self._current_descriptor()
+        selected_key = self._descriptor_key(selected) if selected is not None else None
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self._row_descriptors = {}
+        visible = self.model.visible(
+            title=self.var_title.get(),
+            engine=self.var_engine.get(),
+            source=self.var_source.get(),
+            status=self.var_status.get(),
+        )
+        selected_item = None
+        for index, descriptor in enumerate(visible):
+            item = f"result-{index}"
+            values = (
+                descriptor.display_title,
+                self._format_engine(descriptor.engine),
+                descriptor.model or "Unknown",
+                descriptor.mode or "—",
+                self._format_modified(descriptor.modified_at),
+                descriptor.source_state.title(),
+                self.model.display_status(descriptor).title(),
+            )
+            self.tree.insert("", "end", iid=item, values=values)
+            self._row_descriptors[item] = descriptor
+            if selected_key == self._descriptor_key(descriptor):
+                selected_item = item
+        children = self.tree.get_children()
+        if selected_item is None and children:
+            selected_item = children[0]
+        if selected_item is not None:
+            self.tree.selection_set(selected_item)
+            self.tree.focus(selected_item)
+            self.tree.see(selected_item)
+        self.btn_open.configure(state="normal" if children else "disabled")
+        issue_text = (
+            f"{len(self.issues)} invalid result{'s were' if len(self.issues) != 1 else ' was'} "
+            "skipped; see Activity for details."
+            if self.issues
+            else "All discovered results passed catalog validation."
+        )
+        self.lbl_catalog.configure(
+            text=f"Showing {len(visible)} of {len(self.model.descriptors)} result(s). {issue_text}"
+        )
+        self._update_headings()
+        self._selection_changed()
+
+    def _selection_changed(self, _event=None):
+        descriptor = self._current_descriptor()
+        if descriptor is None:
+            self.lbl_details.configure(text="No result selected.")
+            return
+        source_name = descriptor.source_path.name if descriptor.source_path else "Unknown source"
+        self.lbl_details.configure(
+            text=(
+                f"Source: {source_name} ({descriptor.source_state})  •  "
+                f"Result folder: {descriptor.speakers_json.parent.name}"
+            )
+        )
+
+    def _select_clicked_row(self, event):
+        item = self.tree.identify_row(event.y)
+        if item:
+            self.tree.selection_set(item)
+            self.tree.focus(item)
+
+    def _double_click(self, event):
+        item = self.tree.identify_row(event.y)
+        if not item:
+            return None
+        self.tree.selection_set(item)
+        self.tree.focus(item)
+        return self._accept_selected()
+
+    def _accept_selected(self, _event=None):
+        descriptor = self._current_descriptor()
+        if descriptor is None:
+            return "break"
+        self.result = descriptor
+        self.destroy()
+        return "break"
+
+    def _cancel(self, _event=None):
+        self.result = None
+        self.destroy()
+        return "break"
+
+
 class ReviewNamePage(ttk.Frame):
     """Persistent host for at most one embedded Name Speakers workspace."""
 
@@ -5284,12 +6115,14 @@ class ReviewNamePage(ttk.Frame):
         master,
         *,
         open_latest_callback,
+        open_result_browser_callback,
         back_to_transcribe_callback,
         apply_complete_callback=None,
         report_callback=None,
     ):
         super().__init__(master, style=MIDNIGHTSTUDIO_STYLES["page"])
         self._open_latest_callback = open_latest_callback
+        self._open_result_browser_callback = open_result_browser_callback
         self._back_to_transcribe_callback = back_to_transcribe_callback
         self._apply_complete_callback = apply_complete_callback
         self._report_callback = report_callback
@@ -5297,14 +6130,29 @@ class ReviewNamePage(ttk.Frame):
         self.current_result_paths = None
         self.current_result_identity = None
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        toolbar = ttk.Frame(
+            self,
+            padding=(16, 10, 16, 0),
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
+        toolbar.grid(row=0, column=0, sticky="ew")
+        toolbar.columnconfigure(0, weight=1)
+        tb.Button(
+            toolbar,
+            text="Open Result...",
+            command=self._open_result_browser_callback,
+            bootstyle="primary-outline",
+            padding=(14, 5),
+        ).grid(row=0, column=1, sticky="e")
 
         self.empty_state = ttk.Frame(
             self,
             padding=16,
             style=MIDNIGHTSTUDIO_STYLES["page"],
         )
-        self.empty_state.grid(row=0, column=0, sticky="nsew")
+        self.empty_state.grid(row=1, column=0, sticky="nsew")
         self.empty_state.columnconfigure(0, weight=1)
         self.empty_state.rowconfigure(2, weight=1)
         ttk.Label(
@@ -5324,13 +6172,22 @@ class ReviewNamePage(ttk.Frame):
             wraplength=760,
             justify="left",
         ).grid(row=0, column=0, sticky="w")
+        empty_buttons = ttk.Frame(empty_card)
+        empty_buttons.grid(row=1, column=0, sticky="w", pady=(12, 0))
         tb.Button(
-            empty_card,
+            empty_buttons,
+            text="Open Result...",
+            command=self._open_result_browser_callback,
+            bootstyle="primary",
+            padding=(16, 6),
+        ).pack(side="left")
+        tb.Button(
+            empty_buttons,
             text="Open latest result",
             command=self._open_latest_callback,
-            bootstyle="primary-outline",
+            bootstyle="secondary-outline",
             padding=(16, 6),
-        ).grid(row=1, column=0, sticky="w", pady=(12, 0))
+        ).pack(side="left", padx=(8, 0))
         apply_midnightstudio_card_style(empty_card)
 
     @staticmethod
@@ -5390,11 +6247,22 @@ class ReviewNamePage(ttk.Frame):
         except (AttributeError, tk.TclError):
             pass
 
-    def load_result(self, speakers_json, segments_json=None, *, confirm_replacement=True):
+    def load_result(
+        self,
+        speakers_json,
+        segments_json=None,
+        *,
+        confirm_replacement=True,
+        result_descriptor=None,
+    ):
         requested_descriptor = (
-            speakers_json
-            if isinstance(speakers_json, ResultDescriptor) and segments_json is None
-            else None
+            result_descriptor
+            if isinstance(result_descriptor, ResultDescriptor)
+            else (
+                speakers_json
+                if isinstance(speakers_json, ResultDescriptor) and segments_json is None
+                else None
+            )
         )
         requested_identity = None
         if isinstance(speakers_json, ReviewResultIdentity) and segments_json is None:
@@ -5505,6 +6373,12 @@ class ReviewNamePage(ttk.Frame):
                 on_discard=self._back_to_transcribe_callback,
                 discard_label="Back to Transcribe",
                 result_preflight=verified_preflight,
+                result_descriptor=(
+                    current_descriptor
+                    if requested_descriptor is not None
+                    and current_descriptor.file_identity == verified_preflight.identity
+                    else None
+                ),
             )
         except Exception as exc:
             if new_workspace is not None:
@@ -5534,7 +6408,7 @@ class ReviewNamePage(ttk.Frame):
         try:
             if old_workspace is not None:
                 old_player_snapshot = old_workspace._suspend_embedded_player_for_replacement()
-            new_workspace.grid(row=0, column=0, sticky="nsew")
+            new_workspace.grid(row=1, column=0, sticky="nsew")
             new_workspace.start()
         except Exception as exc:
             self._dispose_workspace(
@@ -5564,7 +6438,7 @@ class ReviewNamePage(ttk.Frame):
             restore_note = (
                 "The current review was restored unchanged."
                 if restored
-                else "The current review data was retained, but its video preview could not be fully restored."
+                else "The current review data was retained, but its media preview could not be fully restored."
             )
             messagebox.showerror(
                 "Could not open result",
@@ -5700,6 +6574,7 @@ class App(ttk.Frame):
         self.review_page = ReviewNamePage(
             self.notebook,
             open_latest_callback=self.on_name_speakers,
+            open_result_browser_callback=self.on_open_result_browser,
             back_to_transcribe_callback=lambda: self.show_page("transcribe"),
             apply_complete_callback=lambda: self.show_page("review"),
             report_callback=self.log,
@@ -7092,6 +7967,54 @@ class App(ttk.Frame):
             "Completed-result folders were found, but none contained compatible review data.",
         )
         return None
+
+    def on_open_result_browser(self):
+        out = output_root()
+        pending = (
+            (self.pending_review_result,)
+            if isinstance(self.pending_review_result, ResultDescriptor)
+            else ()
+        )
+        catalog = discover_results(out, pending=pending)
+        for issue in catalog.issues:
+            try:
+                issue_label = str(issue.path.resolve().relative_to(out.resolve()))
+            except (OSError, ValueError):
+                issue_label = issue.path.name
+            self.log(f"[review] Skipped invalid result {issue_label}: {issue.message}")
+
+        dialog = _OpenResultDialog(
+            self.winfo_toplevel(),
+            catalog.results,
+            catalog.issues,
+        )
+        self.wait_window(dialog)
+        selected = dialog.result
+        if selected is None:
+            return False
+
+        try:
+            selected = revalidate_descriptor(selected)
+        except Exception as exc:
+            self.log(f"[review] Selected result could not be opened: {exc}")
+            messagebox.showerror(
+                "Could not open result",
+                "The selected result changed or became unavailable before it could be opened:\n"
+                f"{exc}\n\nThe current Review workspace was left unchanged.",
+                parent=self.winfo_toplevel(),
+            )
+            return False
+
+        engine = self._current_ner_engine()
+        self.log(f"[ner] Engine set to: {engine}  |  {_ner_device_info(engine)}")
+        if not self.review_page.load_result(
+            selected.speakers_json,
+            selected.segments_json,
+            result_descriptor=selected,
+        ):
+            return False
+        self.show_page("review")
+        return True
 
     def on_name_speakers(self):
         latest = self._latest_review_result()
