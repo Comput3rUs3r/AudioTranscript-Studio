@@ -26,6 +26,14 @@ from crisperwhisper_backend import (
     SUPPORTED_CRISPERWHISPER_VERSION as _SUPPORTED_CRISPERWHISPER_VERSION,
     validate_probe_response as _validate_crisper_probe_response,
 )
+from result_catalog import (
+    ResultDescriptor,
+    ResultFileIdentity as ReviewResultIdentity,
+    descriptor_from_json_pair,
+    discover_results,
+    preflight_result_pair,
+    revalidate_descriptor,
+)
 
 
 MIDNIGHTSTUDIO_THEME_NAME = "midnightstudio"
@@ -2029,93 +2037,10 @@ class SegmentCorrectionDialog(tk.Toplevel):
         self.destroy()
 
 
-@dataclass(frozen=True)
-class ReviewResultIdentity:
-    speakers_json: Path
-    segments_json: Path
-    speakers_sha256: str
-    segments_sha256: str
-
-    @property
-    def paths(self):
-        return self.speakers_json, self.segments_json
-
-
-@dataclass(frozen=True)
-class _ReviewResultPreflight:
-    identity: ReviewResultIdentity
-    speakers_data: dict
-    segments_data: dict
-
-
-def _read_review_json(path: Path, label: str):
-    try:
-        raw = path.read_bytes()
-    except Exception as exc:
-        raise ValueError(f"Could not read {label}: {exc}") from exc
-    try:
-        data = json.loads(raw.decode("utf-8"))
-    except Exception as exc:
-        raise ValueError(f"{label} is not valid UTF-8 JSON: {exc}") from exc
-    if not isinstance(data, dict):
-        raise ValueError(f"{label} must contain a top-level JSON object.")
-    return data, hashlib.sha256(raw).hexdigest()
-
-
 def _preflight_review_result(speakers_json, segments_json):
-    speakers_path = Path(speakers_json).resolve()
-    segments_path = Path(segments_json).resolve()
-    if not speakers_path.is_file():
-        raise FileNotFoundError(f"Missing speakers.json: {speakers_path}")
-    if not segments_path.is_file():
-        raise FileNotFoundError(f"Missing segments.json: {segments_path}")
+    """Compatibility wrapper around the shared result-catalog preflight."""
 
-    speakers_data, speakers_sha256 = _read_review_json(speakers_path, "speakers.json")
-    segments_data, segments_sha256 = _read_review_json(segments_path, "segments.json")
-
-    speakers = speakers_data.get("speakers")
-    if not isinstance(speakers, list):
-        raise ValueError("speakers.json must contain a 'speakers' list.")
-    if any(not isinstance(speaker, str) or not speaker.strip() for speaker in speakers):
-        raise ValueError("Every speakers.json speaker entry must be a non-empty string.")
-    if len(set(speakers)) != len(speakers):
-        raise ValueError("speakers.json contains duplicate speaker IDs.")
-    for mapping_key in ("names", "name_map"):
-        mapping = speakers_data.get(mapping_key)
-        if mapping is not None and not isinstance(mapping, dict):
-            raise ValueError(f"speakers.json '{mapping_key}' must be an object when present.")
-
-    segments = segments_data.get("segments")
-    if not isinstance(segments, list):
-        raise ValueError("segments.json must contain a 'segments' list.")
-    for segment_index, segment in enumerate(segments):
-        if not isinstance(segment, dict):
-            raise ValueError(
-                f"segments.json segment {segment_index + 1} must be a JSON object."
-            )
-        speaker = segment.get("speaker")
-        if speaker is not None and not isinstance(speaker, str):
-            raise ValueError(
-                f"segments.json segment {segment_index + 1} has an invalid speaker value."
-            )
-        words = segment.get("words")
-        if words is not None:
-            if not isinstance(words, list):
-                raise ValueError(
-                    f"segments.json segment {segment_index + 1} has a non-list words value."
-                )
-            if any(not isinstance(word, dict) for word in words):
-                raise ValueError(
-                    f"segments.json segment {segment_index + 1} contains an invalid word entry."
-                )
-
-    identity = ReviewResultIdentity(
-        speakers_json=speakers_path,
-        segments_json=segments_path,
-        speakers_sha256=speakers_sha256,
-        segments_sha256=segments_sha256,
-    )
-    return _ReviewResultPreflight(identity, speakers_data, segments_data)
+    return preflight_result_pair(speakers_json, segments_json)
 
 
 class NamingWorkspace(ttk.Frame):
@@ -5417,7 +5342,17 @@ class ReviewNamePage(ttk.Frame):
         return _preflight_review_result(speakers_json, segments_json).identity
 
     @staticmethod
+    def _validated_result_descriptor(speakers_json, segments_json, *, pending=False):
+        return descriptor_from_json_pair(
+            speakers_json,
+            segments_json,
+            pending=pending,
+        )
+
+    @staticmethod
     def _result_key(result):
+        if isinstance(result, ResultDescriptor):
+            result = result.file_identity
         if isinstance(result, ReviewResultIdentity):
             return (
                 os.path.normcase(str(result.speakers_json)),
@@ -5429,7 +5364,11 @@ class ReviewNamePage(ttk.Frame):
 
     @staticmethod
     def _result_path_key(result):
-        paths = result.paths if isinstance(result, ReviewResultIdentity) else result
+        paths = (
+            result.paths
+            if isinstance(result, (ResultDescriptor, ReviewResultIdentity))
+            else result
+        )
         return tuple(os.path.normcase(str(path)) for path in paths)
 
     def _report(self, message):
@@ -5452,17 +5391,31 @@ class ReviewNamePage(ttk.Frame):
             pass
 
     def load_result(self, speakers_json, segments_json=None, *, confirm_replacement=True):
-        requested_identity = (
+        requested_descriptor = (
             speakers_json
-            if isinstance(speakers_json, ReviewResultIdentity) and segments_json is None
+            if isinstance(speakers_json, ResultDescriptor) and segments_json is None
             else None
         )
+        requested_identity = None
+        if isinstance(speakers_json, ReviewResultIdentity) and segments_json is None:
+            requested_identity = speakers_json
+        elif requested_descriptor is not None:
+            requested_identity = requested_descriptor.file_identity
+        supplied_identity = requested_identity
         requested_paths = (
             requested_identity.paths
             if requested_identity is not None
             else (speakers_json, segments_json)
         )
         try:
+            if requested_descriptor is not None:
+                current_descriptor = revalidate_descriptor(requested_descriptor)
+                requested_identity = current_descriptor.file_identity
+                requested_paths = current_descriptor.paths
+                if supplied_identity != requested_identity:
+                    self._report(
+                        "[review] The pending result changed before loading; using the latest validated revision."
+                    )
             result_preflight = _preflight_review_result(*requested_paths)
         except Exception as exc:
             self._report(f"[review] Result validation failed: {exc}")
@@ -6885,9 +6838,10 @@ class App(ttk.Frame):
                             self.log(event[1])
                     elif kind == "speakers":
                         try:
-                            self.pending_review_result = ReviewNamePage._validated_result_identity(
+                            self.pending_review_result = ReviewNamePage._validated_result_descriptor(
                                 event[1],
                                 event[2],
+                                pending=True,
                             )
                         except Exception as exc:
                             self.log(f"[review] Ignored an invalid speaker result: {exc}")
@@ -7058,16 +7012,18 @@ class App(ttk.Frame):
             return None
         pending = self.pending_review_result
         try:
-            current = ReviewNamePage._validated_result_identity(*pending.paths)
+            current = revalidate_descriptor(pending)
         except Exception as exc:
             self.pending_review_result = None
             self.log(f"[review] Rejected the pending result because it is no longer valid: {exc}")
             return None
-        if current != pending:
+        if current.file_identity != pending.file_identity:
             self.pending_review_result = current
             self.log(
                 "[review] The pending result changed before loading; using its latest validated revision."
             )
+        elif current != pending:
+            self.pending_review_result = current
         return self.pending_review_result
 
     def _open_completed_review_result(self):
@@ -7098,37 +7054,42 @@ class App(ttk.Frame):
         if not out.exists():
             messagebox.showinfo("No output", f"No output folder {out}")
             return None
-        candidates = []
-        for child in out.iterdir():
-            if child.is_dir() and (child / "speakers.json").exists() and (child / "segments.json").exists():
-                candidates.append(
-                    (
-                        child.stat().st_mtime,
-                        (child / "speakers.json").resolve(),
-                        (child / "segments.json").resolve(),
-                    )
-                )
+        catalog = discover_results(out)
+        for issue in catalog.issues:
+            self.log(f"[review] Skipped invalid result in {issue.path.name}: {issue.message}")
+        candidates = [
+            descriptor
+            for descriptor in catalog.results
+            if descriptor.status == "complete"
+        ]
         if not candidates:
-            messagebox.showinfo("Nothing to name", "No speakers.json found in output folders.")
-            return None
-        validation_errors = []
-        for _modified, speakers_path, segments_path in sorted(
-            candidates,
-            key=lambda item: item[0],
-            reverse=True,
-        ):
-            try:
-                return ReviewNamePage._validated_result_identity(
-                    speakers_path,
-                    segments_path,
+            if catalog.issues:
+                details = "\n".join(
+                    f"{issue.path.name}: {issue.message}"
+                    for issue in catalog.issues[:5]
                 )
+                messagebox.showerror(
+                    "No valid result",
+                    "Completed-result folders were found, but none contained compatible "
+                    f"review data.\n\n{details}",
+                )
+            else:
+                messagebox.showinfo(
+                    "Nothing to name",
+                    "No speakers.json found in output folders.",
+                )
+            return None
+        for descriptor in candidates:
+            try:
+                return revalidate_descriptor(descriptor)
             except Exception as exc:
-                validation_errors.append(f"{speakers_path.parent.name}: {exc}")
-                self.log(f"[review] Skipped invalid result in {speakers_path.parent.name}: {exc}")
+                self.log(
+                    f"[review] Skipped invalid result in "
+                    f"{descriptor.speakers_json.parent.name}: {exc}"
+                )
         messagebox.showerror(
             "No valid result",
-            "Completed-result folders were found, but none contained compatible review data.\n\n"
-            + "\n".join(validation_errors[:5]),
+            "Completed-result folders were found, but none contained compatible review data.",
         )
         return None
 
@@ -7143,7 +7104,7 @@ class App(ttk.Frame):
         if (
             self.pending_review_result is not None
             and self.review_page.current_result_identity
-            == self.pending_review_result
+            == self.pending_review_result.file_identity
         ):
             self.pending_review_result = None
         self.show_page("review")
