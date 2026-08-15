@@ -15,6 +15,14 @@ from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from result_catalog import preflight_result_pair
+from result_storage import (
+    ResultRevision,
+    cleanup_abandoned_staging,
+    create_or_reuse_cached_wav,
+    project_layout_for_source,
+)
+
 PIPELINE_VERSION = "v1.6.0"
 
 ROOT = Path(__file__).resolve().parent
@@ -422,7 +430,12 @@ def discover_sources(explicit_files: List[str] = None) -> List[Path]:
     
     if WAV_DIR.exists():
         for p in WAV_DIR.rglob("*.wav"):
-            if p.is_file():
+            cache_hash = p.stem.rpartition("--")[2]
+            identity_cache_name = (
+                len(cache_hash) == 64
+                and all(character in "0123456789abcdef" for character in cache_hash)
+            )
+            if p.is_file() and not identity_cache_name:
                 wavs.append(p.resolve())
     
     def stemkey(p: Path) -> str: return p.stem.lower()
@@ -440,13 +453,31 @@ def to_safe_title(path: Path) -> str:
     return "".join(ch if ch.isalnum() or ch in (" ", "_", "-") else "_" for ch in name).strip("_ ")
 
 def convert_to_wav16k(src: Path, dst_dir: Path) -> Path:
-    safe_mkdir(dst_dir)
-    out = dst_dir / (src.stem + ".wav")
-    if out.exists() and out.stat().st_size > 0:
-        print(f"Using existing WAV: {out.name}")
-        return out
-    print(f"Converting to WAV: {src.name}")
-    run_ffmpeg([ "-y", "-i", str(src), "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(out) ])
+    def convert(source: Path, output: Path) -> None:
+        print(f"Converting to WAV: {source.name}")
+        run_ffmpeg(
+            [
+                "-y",
+                "-i",
+                str(source),
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-c:a",
+                "pcm_s16le",
+                str(output),
+            ]
+        )
+
+    out, reused = create_or_reuse_cached_wav(
+        src,
+        dst_dir,
+        to_safe_title(src),
+        convert,
+    )
+    if reused:
+        print(f"Using verified WAV cache: {out.name}")
     return out
 
 def load_asr_model(device: str, cfg: Conf):
@@ -608,6 +639,25 @@ def transcribe_configured_backend(
         status_callback=worker_status,
     )
     normalized = normalize_worker_result(worker_response)
+    repair_metadata = normalized["transcription"].get(
+        "word_timestamp_repairs",
+        {},
+    )
+    repair_count = repair_metadata.get("repair_count", 0)
+    if isinstance(repair_count, int) and not isinstance(repair_count, bool) and repair_count:
+        untimed_count = repair_metadata.get("untimed_word_count", 0)
+        untimed_note = (
+            f" {untimed_count} word{'s' if untimed_count != 1 else ''} remained "
+            "untimed with transcript text preserved."
+            if isinstance(untimed_count, int)
+            and not isinstance(untimed_count, bool)
+            and untimed_count > 0
+            else ""
+        )
+        print(
+            f"[crisper] Repaired {repair_count} minor word timestamp "
+            f"anomal{'y' if repair_count == 1 else 'ies'}.{untimed_note}"
+        )
     result = {"segments": normalized["segments"]}
     result = apply_diarization(
         result,
@@ -659,10 +709,9 @@ def write_txt(segments, out_path: Path, diarized: bool, include_speakers: bool) 
             if joined: f.write(joined + _os.linesep)
 
 def _worker_ffmpeg_wrapper(cmd: List[str]):
-    try:
-        run_ffmpeg(cmd)
-    except Exception as e:
-        print(f"[!] Worker Error: {e}")
+    # Propagate cutting failures so the staged revision cannot be committed
+    # with partial media that merely happens to be non-empty.
+    run_ffmpeg(cmd)
 
 def cut_segments_to_wavs(audio_path: Path, segments, out_dir: Path, padding: float = 0.25, merge_all: bool = False, workers: int = 4) -> None:
     safe_mkdir(out_dir)
@@ -721,8 +770,109 @@ def cut_segments_to_video(video_path: Path, segments, out_dir: Path, padding: fl
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
         list(executor.map(_worker_ffmpeg_wrapper, tasks))
 
+
+def result_manifest_engine_settings(
+    cfg: Conf,
+    backend_name: str,
+    transcription_metadata: Optional[Dict[str, Any]],
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    if backend_name == "whisperx":
+        return str(cfg.model), None, "ctranslate2"
+
+    metadata = transcription_metadata or {}
+    model_data = metadata.get("model")
+    model = model_data.get("family") if isinstance(model_data, dict) else None
+    requested = metadata.get("requested_settings")
+    requested_transcription = (
+        requested.get("transcription") if isinstance(requested, dict) else None
+    )
+    mode = (
+        requested_transcription.get("mode")
+        if isinstance(requested_transcription, dict)
+        else None
+    )
+    execution_backend = metadata.get("execution_backend")
+    values = (
+        str(model).strip() if model else None,
+        str(mode).strip() if mode else None,
+        str(execution_backend).strip() if execution_backend else None,
+    )
+    if any(value is None for value in values):
+        raise RuntimeError(
+            "CrisperWhisper result metadata is missing its model, mode, or execution backend."
+        )
+    return values
+
+
+def validate_staged_pipeline_outputs(
+    result_dir: Path,
+    cfg: Conf,
+    segments,
+    source_path: Path,
+    title: str,
+) -> None:
+    preflight_result_pair(
+        result_dir / "speakers.json",
+        result_dir / "segments.json",
+    )
+    output_format = (cfg.output_format or "both").lower().strip()
+    required_files = []
+    if output_format in ("srt", "both"):
+        required_files.append(result_dir / f"{title}.srt")
+    if output_format in ("txt", "both"):
+        required_files.append(result_dir / f"{title}.txt")
+    for required_file in required_files:
+        if not required_file.is_file():
+            raise RuntimeError(
+                f"Requested output was not created: {required_file.name}"
+            )
+
+    expected_segments = len(segments)
+    if cfg.slice_audio:
+        audio_outputs = list(result_dir.rglob("*.wav"))
+        if len(audio_outputs) != expected_segments or any(
+            not output.is_file() or output.stat().st_size <= 0
+            for output in audio_outputs
+        ):
+            raise RuntimeError(
+                "Requested audio segment outputs were incomplete."
+            )
+    if cfg.slice_video and source_path.suffix.lower() in VIDEO_EXTS:
+        video_outputs = list(result_dir.rglob("*.mp4"))
+        if len(video_outputs) != expected_segments or any(
+            not output.is_file() or output.stat().st_size <= 0
+            for output in video_outputs
+        ):
+            raise RuntimeError(
+                "Requested video segment outputs were incomplete."
+            )
+
+
+def write_result_local_names(
+    result_dir: Path,
+    source_identity: Dict[str, Any],
+    speaker_names: Dict[str, str],
+) -> None:
+    if not speaker_names:
+        return
+    with (result_dir / "names.yaml").open(
+        "w", encoding="utf-8", newline="\n"
+    ) as names_file:
+        yaml.safe_dump(
+            {
+                "source_identity": dict(source_identity),
+                "speaker_names": dict(speaker_names),
+            },
+            names_file,
+            sort_keys=False,
+            allow_unicode=True,
+        )
+
 def run_pipeline(explicit_files: List[str] = None, explicit_workers: int = None) -> None:
     print("Starting processing...")
+    removed_staging = cleanup_abandoned_staging(OUT_DIR)
+    if removed_staging:
+        print(f"[storage] Removed {len(removed_staging)} abandoned staging director{'y' if len(removed_staging) == 1 else 'ies'}.")
     pipeline_start = time.perf_counter()
     cfg, hf_token = load_conf(ROOT / "conf.yaml")
     from crisperwhisper_backend import (
@@ -788,8 +938,13 @@ def run_pipeline(explicit_files: List[str] = None, explicit_workers: int = None)
         print(f"\nProcessing {idx}/{file_total}: {print_rel_or_abs(src)}")
         file_progress("preparing_input", "Preparing input", 0)
         start_file = time.perf_counter()
-        title = to_safe_title(src); title_dir = OUT_DIR / title; safe_mkdir(title_dir)
-        saved_names, saved_names_status = load_speaker_names_with_migration(src, title_dir / "names.yaml")
+        title = to_safe_title(src) or "untitled"
+        project_layout = project_layout_for_source(OUT_DIR, title, src)
+        legacy_names_path = OUT_DIR / title / "names.yaml"
+        saved_names, saved_names_status = load_speaker_names_with_migration(
+            src,
+            legacy_names_path,
+        )
         if saved_names_status == "migrated":
             print("[names] Migrated verified output-local speaker names to persistent storage.")
         elif saved_names_status == "migration_failed":
@@ -804,7 +959,7 @@ def run_pipeline(explicit_files: List[str] = None, explicit_workers: int = None)
             print("[names] Saved names not restored: current source identity is unavailable.")
         
         wav_path = src
-        if src.suffix.lower() != ".wav" or src.parent != WAV_DIR:
+        if src.suffix.lower() != ".wav":
             wav_path = convert_to_wav16k(src, WAV_DIR)
             
         dur = probe_duration_seconds(wav_path)
@@ -833,38 +988,98 @@ def run_pipeline(explicit_files: List[str] = None, explicit_workers: int = None)
             else "Writing JSON outputs"
         )
         file_progress("writing_json", writing_json_label, 80)
-        seg_json = {"title": title, "segments": segments, "source_path": str(src.resolve())}
-        if transcription_metadata is not None:
-            seg_json["transcription"] = transcription_metadata
-        spk_json = {"title": title, "diarization": diar_ok, "speakers": speakers}
-        if restored_names:
-            spk_json["names"] = restored_names
-        (title_dir / "segments.json").write_text(json.dumps(seg_json, ensure_ascii=False, indent=2), encoding="utf-8")
-        (title_dir / "speakers.json").write_text(json.dumps(spk_json, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"[segments-json] {print_rel_or_abs(title_dir / 'segments.json')}")
-        print(f"[speakers-json] {print_rel_or_abs(title_dir / 'speakers.json')}")
-        
-        writing_transcripts_label = (
-            "Writing CrisperWhisper outputs"
-            if backend_name == "crisperwhisper"
-            else "Writing SRT/TXT"
-        )
-        file_progress("writing_transcripts", writing_transcripts_label, 84)
-        fmt = (cfg.output_format or "both").lower().strip()
-        srt_path = title_dir / f"{title}.srt"; txt_path = title_dir / f"{title}.txt"
-        if fmt in ("srt", "both"): write_srt(segments, srt_path)
-        if fmt in ("txt", "both"): write_txt(segments, txt_path, diarized=diar_ok, include_speakers=cfg.txt_speaker_tags)
-        
-        if cfg.slice_audio:
-            file_progress("cutting_audio", "Cutting audio", 90)
-            cut_segments_to_wavs(wav_path, segments, title_dir, padding=cfg.padding_seconds,
-                                 merge_all=cfg.merge_all_segments_into_one_folder, workers=workers)
-        
-        if cfg.slice_video and src.suffix.lower() in VIDEO_EXTS:
-            file_progress("cutting_video", "Cutting video", 95)
-            cut_segments_to_video(src, segments, title_dir, padding=cfg.padding_seconds,
-                                  merge_all=cfg.merge_all_segments_into_one_folder,
-                                  fast_cut=cfg.fast_cut_video, workers=workers)
+        with ResultRevision(project_layout, backend_name) as revision:
+            result_dir = revision.output_root
+            seg_json = {
+                "title": title,
+                "segments": segments,
+                "source_path": str(src.resolve()),
+            }
+            if transcription_metadata is not None:
+                seg_json["transcription"] = transcription_metadata
+            spk_json = {
+                "title": title,
+                "diarization": diar_ok,
+                "speakers": speakers,
+            }
+            if restored_names:
+                spk_json["names"] = restored_names
+            (result_dir / "segments.json").write_text(
+                json.dumps(seg_json, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            (result_dir / "speakers.json").write_text(
+                json.dumps(spk_json, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            write_result_local_names(
+                result_dir,
+                dict(project_layout.source_identity),
+                restored_names,
+            )
+
+            writing_transcripts_label = (
+                "Writing CrisperWhisper outputs"
+                if backend_name == "crisperwhisper"
+                else "Writing SRT/TXT"
+            )
+            file_progress("writing_transcripts", writing_transcripts_label, 84)
+            fmt = (cfg.output_format or "both").lower().strip()
+            srt_path = result_dir / f"{title}.srt"
+            txt_path = result_dir / f"{title}.txt"
+            if fmt in ("srt", "both"):
+                write_srt(segments, srt_path)
+            if fmt in ("txt", "both"):
+                write_txt(
+                    segments,
+                    txt_path,
+                    diarized=diar_ok,
+                    include_speakers=cfg.txt_speaker_tags,
+                )
+
+            if cfg.slice_audio:
+                file_progress("cutting_audio", "Cutting audio", 90)
+                cut_segments_to_wavs(
+                    wav_path,
+                    segments,
+                    result_dir,
+                    padding=cfg.padding_seconds,
+                    merge_all=cfg.merge_all_segments_into_one_folder,
+                    workers=workers,
+                )
+
+            if cfg.slice_video and src.suffix.lower() in VIDEO_EXTS:
+                file_progress("cutting_video", "Cutting video", 95)
+                cut_segments_to_video(
+                    src,
+                    segments,
+                    result_dir,
+                    padding=cfg.padding_seconds,
+                    merge_all=cfg.merge_all_segments_into_one_folder,
+                    fast_cut=cfg.fast_cut_video,
+                    workers=workers,
+                )
+
+            model, mode, execution_backend = result_manifest_engine_settings(
+                cfg,
+                backend_name,
+                transcription_metadata,
+            )
+            final_dir = revision.commit(
+                model=model,
+                mode=mode,
+                execution_backend=execution_backend,
+                validate_outputs=lambda path: validate_staged_pipeline_outputs(
+                    path,
+                    cfg,
+                    segments,
+                    src,
+                    title,
+                ),
+            )
+
+        print(f"[segments-json] {print_rel_or_abs(final_dir / 'segments.json')}")
+        print(f"[speakers-json] {print_rel_or_abs(final_dir / 'speakers.json')}")
 
         file_time = time.perf_counter() - start_file
         rtf = (dur / file_time) if (dur and file_time > 0) else None

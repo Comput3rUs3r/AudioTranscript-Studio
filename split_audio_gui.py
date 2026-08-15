@@ -12,7 +12,6 @@ from split_audio import (
     PROGRESS_PREFIX as _PIPELINE_PROGRESS_PREFIX,
     VIDEO_EXTS as _PIPELINE_VIDEO_EXTS,
     build_source_identity,
-    discover_sources,
     speaker_name_record_path,
 )
 from crisperwhisper_backend import (
@@ -35,6 +34,7 @@ from result_catalog import (
     preflight_result_pair,
     revalidate_descriptor,
 )
+from result_storage import build_apply_manifest_updates, cleanup_process_staging
 
 
 MIDNIGHTSTUDIO_THEME_NAME = "midnightstudio"
@@ -97,6 +97,7 @@ MIDNIGHTSTUDIO_STYLES = {
     "srt_tree": "MidnightStudio.SrtMatches.Treeview",
     "segment_tree": "MidnightStudio.SegmentCorrection.Treeview",
     "result_tree": "MidnightStudio.ResultBrowser.Treeview",
+    "media_tree": "MidnightStudio.SelectedMedia.Treeview",
 }
 
 
@@ -286,6 +287,7 @@ def _configure_midnightstudio_styles(style):
         styles["srt_tree"],
         styles["segment_tree"],
         styles["result_tree"],
+        styles["media_tree"],
     ):
         style.configure(
             tree_style,
@@ -888,9 +890,6 @@ def find_segments_matching_query(segments, query: str):
     q = (query or "").strip().lower()
     return [seg for seg in segments if q and q in (seg.get("text","").lower())]
 
-_VIDEO_EXTS = tuple(sorted(_PIPELINE_VIDEO_EXTS))
-_MEDIA_EXTS = tuple(sorted(_PIPELINE_AUDIO_EXTS | _PIPELINE_VIDEO_EXTS))
-
 _EMBEDDED_VLC_CHECKED = False
 _EMBEDDED_VLC_INSTANCE = None
 _EMBEDDED_VLC_VERSION = None
@@ -1020,34 +1019,115 @@ def _supported_media_kind(path):
     return None
 
 
+@dataclass(frozen=True)
+class SelectedMediaRow:
+    sequence: int
+    path: Path
+    filename: str
+    media_type: str
+    parent_location: str
+    issue: str | None
+
+
+def _compact_location_text(value, maximum=64):
+    text = str(value)
+    if len(text) <= maximum:
+        return text
+    left = max(12, maximum // 3)
+    right = max(12, maximum - left - 1)
+    return f"{text[:left]}…{text[-right:]}"
+
+
+def _selected_media_parent_locations(paths):
+    """Return compact, minimally disambiguated parent-folder labels."""
+
+    parents = [path.parent for path in paths]
+    if not parents:
+        return ()
+    depths = [1] * len(parents)
+    parent_parts = [parent.parts or (str(parent),) for parent in parents]
+    while True:
+        labels = [
+            os.path.join(*parts[-min(depth, len(parts)) :])
+            for parts, depth in zip(parent_parts, depths)
+        ]
+        groups = {}
+        for index, label in enumerate(labels):
+            groups.setdefault(os.path.normcase(label), []).append(index)
+        changed = False
+        for indexes in groups.values():
+            distinct_parents = {
+                os.path.normcase(str(parents[index])) for index in indexes
+            }
+            if len(distinct_parents) <= 1:
+                continue
+            for index in indexes:
+                if depths[index] < len(parent_parts[index]):
+                    depths[index] += 1
+                    changed = True
+        if not changed:
+            break
+
+    rendered = []
+    for parent, parts, depth in zip(parents, parent_parts, depths):
+        suffix = os.path.join(*parts[-min(depth, len(parts)) :])
+        if depth < len(parts):
+            suffix = f"…{os.sep}{suffix}"
+        elif not suffix:
+            suffix = str(parent)
+        rendered.append(_compact_location_text(suffix))
+    return tuple(rendered)
+
+
+def selected_media_rows(paths):
+    resolved_paths = []
+    for value in paths:
+        resolved_paths.append(Path(value).expanduser().resolve(strict=False))
+    locations = _selected_media_parent_locations(resolved_paths)
+    rows = []
+    for sequence, (path, location) in enumerate(
+        zip(resolved_paths, locations),
+        1,
+    ):
+        media_kind = _supported_media_kind(path)
+        if not path.is_file():
+            issue = "Missing file"
+        elif media_kind is None:
+            issue = "Unsupported media type"
+        else:
+            issue = None
+        rows.append(
+            SelectedMediaRow(
+                sequence=sequence,
+                path=path,
+                filename=path.name,
+                media_type=(media_kind.title() if media_kind else "Unsupported"),
+                parent_location=location,
+                issue=issue,
+            )
+        )
+    return tuple(rows)
+
+
 def guess_media_for_srt(srt_path: _PathMod, project_root: _PathMod):
+    del project_root  # Exact saved source paths are authoritative; no basename search.
     try:
         seg_json = srt_path.parent / "segments.json"
-        if seg_json.exists():
-            data = json.loads(seg_json.read_text(encoding="utf-8"))
-            src_str = data.get("source_path")
-            if src_str:
-                p = _PathMod(src_str)
-                if p.exists() and _supported_media_kind(p) is not None:
-                    return p
+        speakers_json = srt_path.parent / "speakers.json"
+        if not seg_json.is_file():
+            return None
+        if speakers_json.is_file():
+            descriptor = descriptor_from_json_pair(speakers_json, seg_json)
+            if descriptor.source_state in ("missing", "changed"):
+                return None
+        data = json.loads(seg_json.read_text(encoding="utf-8"))
+        src_str = data.get("source_path")
+        if src_str:
+            source = _PathMod(src_str).expanduser()
+            if source.is_file() and _supported_media_kind(source) is not None:
+                return source
     except Exception:
-        pass
-
-    base = srt_path.stem
-    candidates = []
-    candidates += [srt_path.with_suffix(ext) for ext in _MEDIA_EXTS]
-    candidates += [(srt_path.parent / (base + ext)) for ext in _MEDIA_EXTS]
-    data_input = project_root / "data" / "input"
-    if data_input.exists():
-        candidates += [data_input / (base + ext) for ext in _MEDIA_EXTS]
-        for ext in _MEDIA_EXTS:
-            candidates += list(data_input.glob(f"{base}*{ext}"))
-    for c in candidates:
-        if c.exists():
-            return c
-    for ext in _MEDIA_EXTS:
-        for p in project_root.rglob(f"{base}*{ext}"):
-            return p
+        return None
     return None
 
 
@@ -5648,6 +5728,29 @@ class NamingWorkspace(ttk.Frame):
                     expected_data=persistent_data,
                 )
 
+            staged_by_target = {
+                target_path: staged_path
+                for target_path, staged_path in staged_files
+            }
+            staged_speakers = staged_by_target[self.speakers_json.resolve()]
+            staged_segments = staged_by_target.get(
+                self.segments_json.resolve(),
+                self.segments_json,
+            )
+            for manifest_path, manifest_data in build_apply_manifest_updates(
+                out_dir,
+                staged_speakers,
+                staged_segments,
+            ):
+                self._stage_apply_file(
+                    staging_dir,
+                    staged_files,
+                    manifest_path,
+                    "json",
+                    lambda path, data=manifest_data: self._write_apply_json(path, data),
+                    expected_data=manifest_data,
+                )
+
             final_preflight = self._preflight_current_disk_result("apply changes")
             if final_preflight is None:
                 return False
@@ -6629,9 +6732,101 @@ class App(ttk.Frame):
 
         files = ttk.LabelFrame(transcribe, text="Files", padding=12)
         files.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        files.columnconfigure(3, weight=1)
         tb.Button(files, text="Select Files", command=self.select_input_files, bootstyle="primary-outline").grid(row=0, column=0, sticky="w")
         tb.Button(files, text="Open Output", command=self.open_output_folder, bootstyle="secondary-outline").grid(row=0, column=1, sticky="w", padx=(8, 0))
         tb.Button(files, text="Clear Output", command=self.on_clear_output, bootstyle="danger-outline").grid(row=0, column=2, sticky="w", padx=(8, 0))
+
+        selected_media = ttk.LabelFrame(files, text="Selected Media", padding=(10, 8))
+        selected_media.grid(
+            row=1,
+            column=0,
+            columnspan=4,
+            sticky="ew",
+            pady=(10, 0),
+        )
+        selected_media.columnconfigure(0, weight=1)
+        media_header = ttk.Frame(selected_media)
+        media_header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        media_header.columnconfigure(0, weight=1)
+        self.lbl_media_summary = ttk.Label(
+            media_header,
+            text="No media selected",
+            style=MIDNIGHTSTUDIO_STYLES["card_secondary"],
+        )
+        self.lbl_media_summary.grid(row=0, column=0, sticky="w")
+        self.btn_remove_media = tb.Button(
+            media_header,
+            text="Remove Selected",
+            command=self.remove_selected_media,
+            bootstyle="secondary-outline",
+            state="disabled",
+        )
+        self.btn_remove_media.grid(row=0, column=1, sticky="e")
+        self.btn_clear_media = tb.Button(
+            media_header,
+            text="Clear Selection",
+            command=self.clear_input_selection,
+            bootstyle="secondary-outline",
+            state="disabled",
+        )
+        self.btn_clear_media.grid(row=0, column=2, sticky="e", padx=(8, 0))
+
+        self.selected_media_tree = ttk.Treeview(
+            selected_media,
+            columns=("sequence", "filename", "type", "location"),
+            show="headings",
+            selectmode="browse",
+            height=3,
+            style=MIDNIGHTSTUDIO_STYLES["media_tree"],
+        )
+        self.selected_media_tree.heading("sequence", text="#")
+        self.selected_media_tree.heading("filename", text="Filename")
+        self.selected_media_tree.heading("type", text="Type")
+        self.selected_media_tree.heading("location", text="Parent folder")
+        self.selected_media_tree.column("sequence", width=44, minwidth=38, anchor="center", stretch=False)
+        self.selected_media_tree.column("filename", width=300, minwidth=150, anchor="w")
+        self.selected_media_tree.column("type", width=90, minwidth=80, anchor="w", stretch=False)
+        self.selected_media_tree.column("location", width=360, minwidth=160, anchor="w")
+        self.selected_media_tree.grid(row=1, column=0, sticky="ew")
+        media_scrollbar = ttk.Scrollbar(
+            selected_media,
+            orient="vertical",
+            command=self.selected_media_tree.yview,
+            style=MIDNIGHTSTUDIO_STYLES["review_scrollbar"],
+        )
+        media_scrollbar.grid(row=1, column=1, sticky="ns")
+        self.selected_media_tree.configure(yscrollcommand=media_scrollbar.set)
+        self.selected_media_tree.bind(
+            "<<TreeviewSelect>>",
+            self._on_selected_media_changed,
+            add="+",
+        )
+        self.selected_media_tree.bind(
+            "<ButtonRelease-1>",
+            self._focus_clicked_media_row,
+            add="+",
+        )
+        self.lbl_media_details = ttk.Label(
+            selected_media,
+            text="Select a row to view its full path.",
+            style=MIDNIGHTSTUDIO_STYLES["card_secondary"],
+            anchor="w",
+            justify="left",
+            wraplength=900,
+        )
+        self.lbl_media_details.grid(
+            row=2,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            pady=(5, 0),
+        )
+        selected_media.bind(
+            "<Configure>",
+            self._resize_selected_media_details,
+            add="+",
+        )
 
         transcription_settings = ttk.LabelFrame(transcribe, text="Transcription Settings", padding=12)
         transcription_settings.grid(row=2, column=0, sticky="ew", pady=(0, 8))
@@ -6735,6 +6930,7 @@ class App(ttk.Frame):
         )
         self.progress.pack(fill="x", pady=(2, 0))
         self._last_progress = 0
+        self._refresh_selected_media_display()
         self._set_runtime_state("Ready")
 
         settings_page = self.pages["settings"]
@@ -6877,6 +7073,7 @@ class App(ttk.Frame):
 
         for card in (
             files,
+            selected_media,
             transcription_settings,
             self.advanced_content,
             ner_settings,
@@ -7223,6 +7420,7 @@ class App(ttk.Frame):
             "Complete": "success",
             "Failed": "danger",
         }
+        self._runtime_status = status
         self.lbl_status.configure(text=status, bootstyle=styles[status])
         if status == "Running":
             self.btn_start.configure(state="disabled")
@@ -7232,7 +7430,7 @@ class App(ttk.Frame):
             self.btn_cancel.configure(state="disabled")
             self._set_progress_display("Cancelling", self._last_progress)
         else:
-            self.btn_start.configure(state="normal")
+            self._update_start_button_state()
             self.btn_cancel.configure(state="disabled")
             if status == "Ready":
                 self._reset_progress("Ready")
@@ -7241,6 +7439,22 @@ class App(ttk.Frame):
                 self._set_progress_display("Complete", 100)
             elif status in ("Failed", "Cancelled"):
                 self._set_progress_display(status, self._last_progress)
+
+    def _update_start_button_state(self):
+        if not hasattr(self, "btn_start"):
+            return
+        runtime_status = getattr(self, "_runtime_status", "Ready")
+        if runtime_status in ("Running", "Cancelling"):
+            state = "disabled"
+        else:
+            try:
+                has_valid_media = any(
+                    row.issue is None for row in selected_media_rows(self.input_files)
+                )
+            except (OSError, TypeError, ValueError):
+                has_valid_media = False
+            state = "normal" if has_valid_media else "disabled"
+        self.btn_start.configure(state=state)
 
     def _set_progress_display(self, label: str, percent: int, file_index=None, file_total=None):
         if file_total and file_total > 1:
@@ -7460,16 +7674,114 @@ class App(ttk.Frame):
         if fn:
             self.var_player.set(fn)
 
+    def _selected_media_path(self):
+        selected = self.selected_media_tree.selection()
+        if not selected:
+            return None
+        try:
+            index = int(selected[0])
+            return Path(self.input_files[index]).resolve(strict=False)
+        except (IndexError, TypeError, ValueError, OSError):
+            return None
+
+    def _refresh_selected_media_display(self):
+        previously_selected = self._selected_media_path()
+        rows = selected_media_rows(self.input_files)
+        self.selected_media_tree.delete(*self.selected_media_tree.get_children())
+        selected_iid = None
+        for index, row in enumerate(rows):
+            iid = str(index)
+            self.selected_media_tree.insert(
+                "",
+                "end",
+                iid=iid,
+                values=(
+                    row.sequence,
+                    row.filename,
+                    row.media_type,
+                    row.parent_location,
+                ),
+            )
+            if previously_selected is not None and row.path == previously_selected:
+                selected_iid = iid
+        count = len(rows)
+        summary = (
+            "No media selected"
+            if count == 0
+            else f"{count} file{'s' if count != 1 else ''} selected"
+        )
+        self.lbl_media_summary.configure(text=summary)
+        self.btn_clear_media.configure(state="normal" if count else "disabled")
+        if selected_iid is not None:
+            self.selected_media_tree.selection_set(selected_iid)
+            self.selected_media_tree.focus(selected_iid)
+            self.selected_media_tree.see(selected_iid)
+        self._on_selected_media_changed()
+        self._update_start_button_state()
+
+    def _on_selected_media_changed(self, _event=None):
+        selected_path = self._selected_media_path()
+        if selected_path is None:
+            self.btn_remove_media.configure(state="disabled")
+            self.lbl_media_details.configure(
+                text=(
+                    "Select a row to view its full path."
+                    if self.input_files
+                    else "Select Files to choose audio or video media."
+                )
+            )
+            return
+        row = selected_media_rows((selected_path,))[0]
+        detail = str(row.path)
+        if row.issue:
+            detail = f"{row.issue}: {detail}"
+        self.lbl_media_details.configure(text=detail)
+        self.btn_remove_media.configure(state="normal")
+
+    def _resize_selected_media_details(self, event):
+        self.lbl_media_details.configure(wraplength=max(280, int(event.width) - 24))
+
+    def _focus_clicked_media_row(self, event):
+        item = self.selected_media_tree.identify_row(event.y)
+        if item:
+            self.selected_media_tree.selection_set(item)
+            self.selected_media_tree.focus(item)
+            self.selected_media_tree.see(item)
+
+    def remove_selected_media(self):
+        selected = self.selected_media_tree.selection()
+        if not selected:
+            return
+        indexes = sorted(
+            (int(item) for item in selected if str(item).isdigit()),
+            reverse=True,
+        )
+        removed = []
+        for index in indexes:
+            if 0 <= index < len(self.input_files):
+                removed.append(Path(self.input_files.pop(index)).name)
+        self._refresh_selected_media_display()
+        for filename in reversed(removed):
+            self.log(f"[selection] Removed: {filename}")
+
+    def clear_input_selection(self):
+        if not self.input_files:
+            return
+        self.input_files.clear()
+        self._refresh_selected_media_display()
+        self.log("[selection] Cleared selected media.")
+
     def select_input_files(self):
         files = filedialog.askopenfilenames(title="Select Audio/Video Files", filetypes=[("Media Files", "*.mp4 *.mkv *.mov *.avi *.mp3 *.wav *.m4a *.flac"), ("All Files", "*.*")])
         if files:
-            self.input_files = list(files)
+            self.input_files = [
+                str(Path(filename).expanduser().resolve(strict=False))
+                for filename in files
+            ]
+            self._refresh_selected_media_display()
             self.log(f"[selection] Selected {len(files)} file(s):")
             for f in files:
                 self.log(f" - {Path(f).name}")
-        else:
-            self.input_files = []
-            self.log("[selection] Cleared selection (will use data/input folder).")
 
     def on_stop(self):
         if self._crisper_launch_waiting:
@@ -7503,7 +7815,37 @@ class App(ttk.Frame):
             self.log("[stop] No active process to stop.")
 
     def _effective_input_files(self):
-        return discover_sources(self.input_files or None)
+        return [row.path for row in selected_media_rows(self.input_files)]
+
+    def _validate_selected_media_inputs(self):
+        rows = selected_media_rows(self.input_files)
+        self._refresh_selected_media_display()
+        if not rows:
+            self.log("[validation] Select at least one media file before starting.")
+            messagebox.showwarning(
+                "No media selected",
+                "Select at least one supported audio or video file before starting transcription.",
+                parent=self.winfo_toplevel(),
+            )
+            return False
+        invalid_rows = [row for row in rows if row.issue is not None]
+        if not invalid_rows:
+            return True
+        details = "\n".join(
+            f"{row.sequence}. {row.issue}: {row.path}" for row in invalid_rows
+        )
+        self.log("[validation] The selected media list contains unavailable or unsupported files:")
+        for row in invalid_rows:
+            self.log(
+                f" - {row.sequence}. {row.filename} ({row.parent_location}): {row.issue}"
+            )
+        messagebox.showwarning(
+            "Invalid media selection",
+            "Transcription was not started. Correct or remove every listed item; no files "
+            f"were processed.\n\n{details}",
+            parent=self.winfo_toplevel(),
+        )
+        return False
 
     def _validate_slice_video_inputs(self):
         if not self.var_slice_video.get():
@@ -7542,6 +7884,9 @@ class App(ttk.Frame):
 
     def on_run(self):
         self.cancel_requested = False
+        if not self._validate_selected_media_inputs():
+            self._set_runtime_state("Ready")
+            return
         if not self._validate_diarization_speaker_count():
             return
         try:
@@ -7566,7 +7911,7 @@ class App(ttk.Frame):
             "crisper_model": self.var_crisper_model.get().strip(),
             "crisper_mode": self.var_crisper_mode.get().strip(),
             "workers": self.var_workers.get(),
-            "input_files": list(self.input_files),
+            "input_files": [str(path) for path in self._effective_input_files()],
         }
         if context["backend"] == "crisperwhisper":
             self._begin_crisper_launch(context)
@@ -7700,7 +8045,13 @@ class App(ttk.Frame):
             if returncode is None or (reader_failed and returncode == 0):
                 returncode = 1
             self.queue.put(("log", "[process finished]"))
-            self.queue.put(("process_finished", returncode))
+            self.queue.put(
+                (
+                    "process_finished",
+                    returncode,
+                    getattr(proc, "pid", None),
+                )
+            )
 
     def _poll_queue(self):
         try:
@@ -7721,7 +8072,24 @@ class App(ttk.Frame):
                         except Exception as exc:
                             self.log(f"[review] Ignored an invalid speaker result: {exc}")
                     elif kind == "process_finished":
+                        finished_process_id = event[2] if len(event) > 2 else None
                         self.proc = None
+                        if isinstance(finished_process_id, int):
+                            try:
+                                removed = cleanup_process_staging(
+                                    output_root(),
+                                    finished_process_id,
+                                    require_stopped=True,
+                                )
+                                if removed:
+                                    self.log(
+                                        f"[storage] Removed {len(removed)} incomplete staging "
+                                        f"director{'y' if len(removed) == 1 else 'ies'}."
+                                    )
+                            except Exception as exc:
+                                self.log(
+                                    f"[storage] Could not remove incomplete staging output: {exc}"
+                                )
                         if self.cancel_requested:
                             self._set_runtime_state("Cancelled")
                         elif event[1] == 0:

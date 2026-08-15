@@ -10,6 +10,7 @@ import unittest
 from unittest import mock
 
 import crisperwhisper_backend as backend
+import crisperwhisper_worker as worker
 
 
 def make_settings(*, family="medium", mode="verbatim"):
@@ -102,6 +103,245 @@ def make_probe_response():
         "compatibility": {
             "installed_version_supported": True,
         },
+    }
+
+
+def make_coverage_metadata(*, fallback=False):
+    configuration = {
+        "substantial_gap_seconds": 5.0,
+        "sample_rate": 16000,
+        "frame_seconds": 0.03,
+        "block_seconds": 1.0,
+        "absolute_floor_dbfs": -50.0,
+        "noise_percentile": 20.0,
+        "reference_percentile": 90.0,
+        "noise_margin_db": 10.0,
+        "minimum_active_seconds": 0.75,
+        "minimum_active_blocks": 2,
+        "minimum_block_active_ratio": 0.2,
+        "minimum_zero_crossing_rate": 0.01,
+        "maximum_zero_crossing_rate": 0.4,
+        "effective_threshold_dbfs": -42.0,
+        "measured_noise_floor_dbfs": -60.0,
+        "measured_reference_dbfs": -24.0,
+    }
+    initial_active_count = 2 if fallback else 0
+    initial_active_duration = 45.7 if fallback else 0.0
+
+    def audit(active_count, active_duration, substantial_count=2, substantial_duration=45.7):
+        return {
+            "substantial_gap_count": substantial_count,
+            "substantial_gap_duration": substantial_duration,
+            "speech_active_gap_count": active_count,
+            "speech_active_gap_duration": active_duration,
+            "active_frame_seconds": 25.0 if active_count else 0.0,
+            "configuration": copy.deepcopy(configuration),
+        }
+
+    attempted = ["continuation", "chunked_lcs"] if fallback else ["continuation"]
+    selected = "chunked_lcs" if fallback else "continuation"
+    candidate_audits = {
+        "continuation": audit(initial_active_count, initial_active_duration)
+    }
+    if fallback:
+        candidate_audits["chunked_lcs"] = audit(0, 0.0, 0, 0.0)
+    return {
+        "requested_strategy": "continuation",
+        "attempted_strategies": attempted,
+        "selected_strategy": selected,
+        "fallback_used": fallback,
+        "substantial_gap_count": 2,
+        "substantial_gap_duration": 45.7,
+        "speech_active_gap_count": initial_active_count,
+        "speech_active_gap_duration": initial_active_duration,
+        "recovered_gap_count": initial_active_count if fallback else 0,
+        "recovered_duration": initial_active_duration if fallback else 0.0,
+        "remaining_speech_active_gap_count": 0,
+        "remaining_speech_active_gap_duration": 0.0,
+        "configuration": configuration,
+        "candidate_audits": candidate_audits,
+        "warnings": (
+            ["Continuation coverage was incomplete; chunked LCS passed the speech-active coverage audit."]
+            if fallback
+            else ["Substantial interior timeline gaps were classified as non-speech audio."]
+        ),
+    }
+
+
+def make_timestamp_diagnostic():
+    return {
+        "diagnostic_type": "timestamp_overlap",
+        "model_family": "large",
+        "effective_strategy": "continuation",
+        "previous_native_chunk_index": 11,
+        "current_native_chunk_index": 12,
+        "previous_word_index": 430,
+        "current_word_index": 431,
+        "previous_start": 182.2,
+        "previous_end": 184.0,
+        "current_start": 182.58,
+        "current_end": 183.1,
+        "overlap_duration": 1.42,
+        "crosses_native_chunk_boundary": True,
+        "previous_chunk_window": {"chunk_index": 11, "start": 156.0, "end": 186.0},
+        "current_chunk_window": {"chunk_index": 12, "start": 182.0, "end": 212.0},
+        "normalized_tokens_identical": False,
+        "repeated_token_sequence": False,
+        "repeated_sequence_length": 0,
+        "timestamp_reset_relative_to_chunk_start": False,
+        "previous_boundary_was_repaired": False,
+        "current_boundary_was_repaired": False,
+        "repair_actions_attempted": [],
+        "reason": "previous_end_exceeds_current_start_beyond_tolerance",
+        "tolerance_seconds": 0.25,
+    }
+
+
+def make_error_coverage_audit(ranges):
+    gap_ranges = [
+        {
+            "start": start,
+            "end": end,
+            "duration": round(end - start, 3),
+            "active_seconds": 2.0,
+            "active_blocks": 2,
+        }
+        for start, end in ranges
+    ]
+    active_duration = round(sum(item["duration"] for item in gap_ranges), 3)
+    return {
+        "substantial_gap_count": len(gap_ranges) + 1,
+        "substantial_gap_duration": active_duration + 5.0,
+        "speech_active_gap_count": len(gap_ranges),
+        "speech_active_gap_duration": active_duration,
+        "silence_gap_count": 1,
+        "silence_gap_duration": 5.0,
+        "speech_active_gap_ranges": gap_ranges,
+        "active_frame_seconds": 2.0 * len(gap_ranges),
+        "known_diagnostic_interval": {
+            "start": 168.2,
+            "end": 177.42,
+            "covered": False,
+        },
+        "configuration": {
+            "substantial_gap_seconds": 5.0,
+            "sample_rate": 16000,
+            "frame_seconds": 0.03,
+            "block_seconds": 1.0,
+            "absolute_floor_dbfs": -50.0,
+            "noise_percentile": 20.0,
+            "reference_percentile": 90.0,
+            "noise_margin_db": 10.0,
+            "minimum_dynamic_range_db": 6.0,
+            "minimum_active_seconds": 0.75,
+            "minimum_active_blocks": 2,
+            "minimum_block_active_ratio": 0.2,
+            "minimum_zero_crossing_rate": 0.01,
+            "maximum_zero_crossing_rate": 0.4,
+            "effective_threshold_dbfs": -42.0,
+            "measured_noise_floor_dbfs": -60.0,
+            "measured_reference_dbfs": -24.0,
+            "measured_dynamic_range_db": 36.0,
+        },
+    }
+
+
+def make_coverage_failure_diagnostic():
+    continuation = make_error_coverage_audit([(159.06, 182.46), (185.9, 208.2)])
+    fallback = make_error_coverage_audit([(159.06, 170.0)])
+    return {
+        "diagnostic_type": "coverage_failure",
+        "model_family": "medium",
+        "requested_strategy": "continuation",
+        "attempted_strategies": ["continuation", "chunked_lcs"],
+        "fallback_rejection_reason": "speech_active_gaps_remain",
+        "recovered_gap_count": 1,
+        "recovered_duration": round(
+            continuation["speech_active_gap_duration"]
+            - fallback["speech_active_gap_duration"],
+            3,
+        ),
+        "remaining_speech_active_gap_count": 1,
+        "remaining_speech_active_gap_duration": fallback["speech_active_gap_duration"],
+        "candidate_audits": {
+            "continuation": continuation,
+            "chunked_lcs": fallback,
+        },
+    }
+
+
+def make_targeted_recovery_metadata(*, complete=True):
+    base = make_error_coverage_audit([(1.0, 12.0)])
+    final = make_error_coverage_audit([] if complete else [(6.0, 12.0)])
+    unresolved_count = final["speech_active_gap_count"]
+    unresolved_duration = final["speech_active_gap_duration"]
+    return {
+        "base_strategy": "continuation",
+        "base_selection_reason": "chunked_lcs_not_improved",
+        "attempted": True,
+        "target_gap_count": base["speech_active_gap_count"],
+        "target_gap_duration": base["speech_active_gap_duration"],
+        "short_window_attempt_count": 1,
+        "failed_window_attempt_count": 0,
+        "framing_geometries": [
+            {
+                "attempt": 1,
+                "gap_index": 1,
+                "window_index": 1,
+                "core_start": 1.0,
+                "core_end": 12.0,
+                "slice_start": 0.0,
+                "slice_end": 14.0,
+                "padding_seconds": 2.0,
+                "shift_seconds": 0.0,
+                "input_duration": 14.0,
+            }
+        ],
+        "recovered_gap_count": max(0, 1 - unresolved_count),
+        "recovered_duration": round(
+            base["speech_active_gap_duration"] - unresolved_duration,
+            3,
+        ),
+        "unresolved_gap_count": unresolved_count,
+        "unresolved_gap_duration": unresolved_duration,
+        "final_coverage_audit": final,
+        "warnings": [],
+    }
+
+
+def make_targeted_coverage_metadata():
+    targeted = make_targeted_recovery_metadata()
+    primary = make_error_coverage_audit([(1.0, 12.0)])
+    fallback = copy.deepcopy(primary)
+    return {
+        "requested_strategy": "continuation",
+        "attempted_strategies": ["continuation", "chunked_lcs"],
+        "selected_strategy": "continuation_plus_targeted_recovery",
+        "fallback_used": False,
+        "substantial_gap_count": primary["substantial_gap_count"],
+        "substantial_gap_duration": primary["substantial_gap_duration"],
+        "speech_active_gap_count": primary["speech_active_gap_count"],
+        "speech_active_gap_duration": primary["speech_active_gap_duration"],
+        "silence_gap_count": primary["silence_gap_count"],
+        "silence_gap_duration": primary["silence_gap_duration"],
+        "speech_active_gap_ranges": copy.deepcopy(primary["speech_active_gap_ranges"]),
+        "recovered_gap_count": primary["speech_active_gap_count"],
+        "recovered_duration": primary["speech_active_gap_duration"],
+        "remaining_speech_active_gap_count": 0,
+        "remaining_speech_active_gap_duration": 0.0,
+        "remaining_speech_active_gap_ranges": [],
+        "known_diagnostic_interval": copy.deepcopy(
+            targeted["final_coverage_audit"]["known_diagnostic_interval"]
+        ),
+        "configuration": copy.deepcopy(primary["configuration"]),
+        "candidate_audits": {
+            "continuation": primary,
+            "chunked_lcs": fallback,
+        },
+        "targeted_recovery": targeted,
+        "warnings": [
+            "Targeted context-free short windows passed the final speech-active coverage audit."
+        ],
     }
 
 
@@ -236,6 +476,230 @@ class ProtocolTests(AdapterTestCase):
         with self.assertRaisesRegex(backend.CrisperWhisperProtocolError, "mode"):
             backend.validate_transcribe_response(response, settings)
 
+    def test_optional_repair_metadata_is_backward_compatible_and_strictly_validated(self):
+        settings = make_settings()
+        legacy_response = make_response(settings)
+        validated = backend.validate_transcribe_response(legacy_response, settings)
+        self.assertNotIn("word_timestamp_repairs", validated["transcription"])
+
+        response = make_response(settings)
+        response["transcription"]["word_timestamp_repairs"] = {
+            "repair_count": 2,
+            "categories": {"zero_duration": 1, "adjacent_overlap": 1},
+            "words_remained_untimed": False,
+            "untimed_word_count": 0,
+            "warnings": ["Minor word timestamp anomalies were normalized conservatively."],
+        }
+        validated = backend.validate_transcribe_response(response, settings)
+        self.assertEqual(
+            validated["transcription"]["word_timestamp_repairs"]["repair_count"],
+            2,
+        )
+
+        malformed = copy.deepcopy(response)
+        malformed["transcription"]["word_timestamp_repairs"]["repair_count"] = 1
+        with self.assertRaisesRegex(backend.CrisperWhisperProtocolError, "counts"):
+            backend.validate_transcribe_response(malformed, settings)
+
+    def test_optional_coverage_metadata_accepts_valid_fallback_and_rejects_inconsistency(self):
+        settings = make_settings()
+        legacy_response = make_response(settings)
+        validated_legacy = backend.validate_transcribe_response(
+            legacy_response,
+            settings,
+        )
+        self.assertNotIn("longform_coverage", validated_legacy["transcription"])
+
+        unreported_fallback = make_response(settings)
+        unreported_fallback["settings"]["effective"]["longform"][
+            "strategy"
+        ] = "chunked_lcs"
+        with self.assertRaisesRegex(
+            backend.CrisperWhisperProtocolError,
+            "unreported",
+        ):
+            backend.validate_transcribe_response(unreported_fallback, settings)
+
+        response = make_response(settings)
+        response["settings"]["effective"]["longform"]["strategy"] = "chunked_lcs"
+        response["transcription"]["longform_coverage"] = make_coverage_metadata(
+            fallback=True
+        )
+        validated = backend.validate_transcribe_response(response, settings)
+        normalized = backend.normalize_worker_result(validated)
+        self.assertEqual(
+            normalized["transcription"]["longform_coverage"]["selected_strategy"],
+            "chunked_lcs",
+        )
+
+        malformed_cases = []
+        malformed = copy.deepcopy(response)
+        malformed["transcription"]["longform_coverage"][
+            "remaining_speech_active_gap_count"
+        ] = 1
+        malformed_cases.append(malformed)
+        malformed = copy.deepcopy(response)
+        malformed["settings"]["effective"]["longform"]["strategy"] = "continuation"
+        malformed_cases.append(malformed)
+        malformed = copy.deepcopy(response)
+        del malformed["transcription"]["longform_coverage"]["candidate_audits"][
+            "chunked_lcs"
+        ]
+        malformed_cases.append(malformed)
+        malformed = copy.deepcopy(response)
+        malformed["transcription"]["longform_coverage"]["recovered_gap_count"] = 1
+        malformed_cases.append(malformed)
+        for malformed in malformed_cases:
+            with self.subTest(malformed=malformed):
+                with self.assertRaises(backend.CrisperWhisperProtocolError):
+                    backend.validate_transcribe_response(malformed, settings)
+
+    def test_targeted_recovery_metadata_is_optional_backward_compatible_and_strict(self):
+        settings = make_settings()
+        response = make_response(settings)
+        response["settings"]["effective"]["longform"][
+            "strategy"
+        ] = "continuation_plus_targeted_recovery"
+        response["transcription"][
+            "longform_coverage"
+        ] = make_targeted_coverage_metadata()
+        validated = backend.validate_transcribe_response(response, settings)
+        targeted = validated["transcription"]["longform_coverage"][
+            "targeted_recovery"
+        ]
+        self.assertEqual(targeted["base_strategy"], "continuation")
+        self.assertEqual(targeted["unresolved_gap_count"], 0)
+
+        legacy = backend.validate_transcribe_response(make_response(settings), settings)
+        self.assertNotIn("longform_coverage", legacy["transcription"])
+
+        malformed_cases = []
+        malformed = copy.deepcopy(response)
+        malformed["transcription"]["longform_coverage"]["targeted_recovery"][
+            "source_path"
+        ] = "C:/private/source.wav"
+        malformed_cases.append(malformed)
+        malformed = copy.deepcopy(response)
+        malformed["transcription"]["longform_coverage"]["targeted_recovery"][
+            "framing_geometries"
+        ][0]["input_duration"] = 25.1
+        malformed_cases.append(malformed)
+        malformed = copy.deepcopy(response)
+        malformed["transcription"]["longform_coverage"]["targeted_recovery"][
+            "base_strategy"
+        ] = "chunked_lcs"
+        malformed_cases.append(malformed)
+        malformed = copy.deepcopy(response)
+        malformed["transcription"]["longform_coverage"]["targeted_recovery"][
+            "unresolved_gap_count"
+        ] = 1
+        malformed_cases.append(malformed)
+        malformed = copy.deepcopy(response)
+        malformed["transcription"]["longform_coverage"]["targeted_recovery"][
+            "warnings"
+        ] = ["private transcript content"]
+        malformed_cases.append(malformed)
+        for malformed in malformed_cases:
+            with self.subTest(malformed=malformed):
+                with self.assertRaises(backend.CrisperWhisperProtocolError):
+                    backend.validate_transcribe_response(malformed, settings)
+
+    def test_incomplete_targeted_recovery_error_details_are_strictly_validated(self):
+        details = make_coverage_failure_diagnostic()
+        targeted = make_targeted_recovery_metadata(complete=False)
+        details["fallback_rejection_reason"] = "targeted_recovery_incomplete"
+        details["remaining_speech_active_gap_count"] = targeted[
+            "unresolved_gap_count"
+        ]
+        details["remaining_speech_active_gap_duration"] = targeted[
+            "unresolved_gap_duration"
+        ]
+        details["candidate_audits"]["continuation"] = make_error_coverage_audit(
+            [(1.0, 12.0)]
+        )
+        details["targeted_recovery"] = targeted
+        validated = backend.validate_worker_error_details(details)
+        self.assertEqual(validated, details)
+
+        malformed = copy.deepcopy(details)
+        malformed["targeted_recovery"]["framing_geometries"][0][
+            "transcript"
+        ] = "private"
+        with self.assertRaises(backend.CrisperWhisperProtocolError):
+            backend.validate_worker_error_details(malformed)
+
+    def test_content_free_timestamp_error_diagnostic_is_strictly_validated(self):
+        details = make_timestamp_diagnostic()
+        validated = backend.validate_worker_error_details(details)
+        self.assertEqual(validated, details)
+
+        malformed_cases = []
+        malformed = copy.deepcopy(details)
+        malformed["source_path"] = "C:/private/source.wav"
+        malformed_cases.append(malformed)
+        malformed = copy.deepcopy(details)
+        malformed["previous_word"] = "private transcript content"
+        malformed_cases.append(malformed)
+        malformed = copy.deepcopy(details)
+        malformed["current_native_chunk_index"] = 11
+        malformed_cases.append(malformed)
+        malformed = copy.deepcopy(details)
+        malformed["repair_actions_attempted"] = ["discarded_duplicate_text"]
+        malformed_cases.append(malformed)
+        for malformed in malformed_cases:
+            with self.subTest(malformed=malformed):
+                with self.assertRaises(backend.CrisperWhisperProtocolError):
+                    backend.validate_worker_error_details(malformed)
+
+    def test_coverage_failure_diagnostic_retains_both_audits_and_rejects_unsafe_data(self):
+        details = make_coverage_failure_diagnostic()
+        validated = backend.validate_worker_error_details(details)
+        self.assertEqual(validated, details)
+
+        malformed = copy.deepcopy(details)
+        malformed["candidate_audits"]["continuation"]["source_path"] = "C:/private.wav"
+        with self.assertRaises(backend.CrisperWhisperProtocolError):
+            backend.validate_worker_error_details(malformed)
+
+        malformed = copy.deepcopy(details)
+        malformed["candidate_audits"]["chunked_lcs"]["speech_active_gap_ranges"][0][
+            "transcript"
+        ] = "private words"
+        with self.assertRaises(backend.CrisperWhisperProtocolError):
+            backend.validate_worker_error_details(malformed)
+
+    def test_legacy_worker_error_without_diagnostics_remains_supported(self):
+        with self.assertRaises(backend.CrisperWhisperRuntimeError) as raised:
+            backend.CrisperWhisperBackend._worker_failure(
+                "transcription",
+                5,
+                {
+                    "protocol_version": 1,
+                    "event": "error",
+                    "operation": "transcribe",
+                    "code": "transcription_failed",
+                    "message": "CrisperWhisper transcription failed.",
+                },
+            )
+        self.assertIsNone(raised.exception.diagnostic_details)
+
+    def test_worker_error_diagnostics_survive_adapter_failure(self):
+        details = make_timestamp_diagnostic()
+        with self.assertRaises(backend.CrisperWhisperRuntimeError) as raised:
+            backend.CrisperWhisperBackend._worker_failure(
+                "transcription",
+                5,
+                {
+                    "protocol_version": 1,
+                    "event": "error",
+                    "operation": "transcribe",
+                    "code": "transcription_failed",
+                    "message": "CrisperWhisper timestamp validation failed.",
+                    "details": details,
+                },
+            )
+        self.assertEqual(raised.exception.diagnostic_details, details)
+
 
 class NormalizationTests(AdapterTestCase):
     def test_words_are_preserved_once_and_segments_are_sensible(self):
@@ -285,6 +749,124 @@ class NormalizationTests(AdapterTestCase):
         validated = backend.validate_transcribe_response(response, settings)
         with self.assertRaisesRegex(backend.CrisperWhisperProtocolError, "reconciled"):
             backend.normalize_worker_result(validated)
+
+    def test_repaired_words_form_valid_segments_and_retain_untimed_native_text(self):
+        settings = make_settings()
+        source_words = [
+            {"word": "Hello,", "start": -0.02, "end": 0.45},
+            {"word": "hello", "start": 0.40, "end": 0.40},
+            {"word": "untimed", "start": 4.5, "end": None},
+        ]
+        native_text = "Hello, hello untimed"
+        repaired_words, repair_metadata = worker.normalize_word_timestamps(
+            source_words,
+            native_text,
+            4.5,
+        )
+        response = make_response(settings)
+        response["transcription"]["text"] = native_text
+        response["transcription"]["chunks"] = None
+        response["transcription"]["words"] = repaired_words
+        response["transcription"]["word_timestamp_repairs"] = repair_metadata
+
+        validated = backend.validate_transcribe_response(response, settings)
+        normalized = backend.normalize_worker_result(validated)
+        segments = normalized["segments"]
+        flattened = [word for segment in segments for word in segment["words"]]
+
+        self.assertEqual([word["word"] for word in flattened], ["Hello,", "hello"])
+        self.assertEqual(" ".join(segment["text"] for segment in segments), native_text)
+        self.assertTrue(
+            all(segment["start"] < segment["end"] for segment in segments)
+        )
+        self.assertTrue(
+            all(
+                current["end"] <= following["start"]
+                for current, following in zip(flattened, flattened[1:])
+            )
+        )
+        self.assertTrue(
+            normalized["transcription"]["word_timestamp_repairs"]["words_remained_untimed"]
+        )
+
+    def test_normalization_preserves_a_decoded_middle_sentence_exactly(self):
+        settings = make_settings()
+        phrase = "I am here because this sentence must survive."
+        native_text = f"Before. {phrase} After."
+        tokens = native_text.split()
+        starts = [150.0] + [168.2 + index * 0.6 for index in range(8)] + [208.2]
+        response = make_response(settings)
+        response["transcription"].update(
+            {
+                "text": native_text,
+                "duration": 220.0,
+                "chunks": [
+                    {
+                        "position": 0,
+                        "chunk_index": 0,
+                        "start": 130.0,
+                        "end": 160.0,
+                        "text": "Before.",
+                        "context": None,
+                        "is_last": False,
+                        "stitch_lcs_length": None,
+                        "stitch_lcs_words": None,
+                    },
+                    {
+                        "position": 1,
+                        "chunk_index": 1,
+                        "start": 156.0,
+                        "end": 186.0,
+                        "text": phrase,
+                        "context": "Before.",
+                        "is_last": False,
+                        "stitch_lcs_length": None,
+                        "stitch_lcs_words": None,
+                    },
+                    {
+                        "position": 2,
+                        "chunk_index": 2,
+                        "start": 182.0,
+                        "end": 212.0,
+                        "text": "After.",
+                        "context": phrase,
+                        "is_last": True,
+                        "stitch_lcs_length": None,
+                        "stitch_lcs_words": None,
+                    },
+                ],
+                "words": [
+                    {
+                        "index": index,
+                        "word": token,
+                        "start": starts[index],
+                        "end": starts[index] + 0.4,
+                    }
+                    for index, token in enumerate(tokens)
+                ],
+            }
+        )
+
+        validated = backend.validate_transcribe_response(response, settings)
+        normalized = backend.normalize_worker_result(validated)
+        normalized_text = " ".join(
+            segment["text"] for segment in normalized["segments"]
+        )
+        normalized_words = [
+            word["word"]
+            for segment in normalized["segments"]
+            for word in segment["words"]
+        ]
+
+        self.assertEqual(normalized_text, native_text)
+        self.assertEqual(normalized_words, tokens)
+        self.assertIn(phrase, normalized_text)
+        self.assertTrue(
+            all(
+                segment["start"] < segment["end"]
+                for segment in normalized["segments"]
+            )
+        )
 
 
 class SubprocessTests(AdapterTestCase):
@@ -380,6 +962,188 @@ class SubprocessTests(AdapterTestCase):
         self.assertEqual(len(calls), 2)
         self.assertTrue(temporary_directories)
         self.assertFalse(temporary_directories[0].exists())
+
+    def test_coverage_status_events_are_activity_compatible(self):
+        settings = make_settings()
+        response = make_response(settings)
+        logs = []
+        statuses = []
+
+        def factory(command, **_kwargs):
+            output_path = Path(command[command.index("--output") + 1])
+            output_path.write_text(json.dumps(response), encoding="utf-8")
+            return FakeProcess(
+                [
+                    event(
+                        {
+                            "protocol_version": 1,
+                            "event": "status",
+                            "operation": "transcribe",
+                            "stage": "auditing_coverage",
+                            "message": "Auditing long-form transcript coverage.",
+                        }
+                    ),
+                    event(
+                        {
+                            "protocol_version": 1,
+                            "event": "status",
+                            "operation": "transcribe",
+                            "stage": "coverage_fallback",
+                            "message": "Detected 2 speech-active coverage gaps; retrying with chunked LCS.",
+                        }
+                    ),
+                    event(
+                        {
+                            "protocol_version": 1,
+                            "event": "status",
+                            "operation": "transcribe",
+                            "stage": "coverage_summary",
+                            "message": "Continuation coverage: 13 speech-active gaps totaling 198.40 seconds.",
+                        }
+                    ),
+                    event(
+                        {
+                            "protocol_version": 1,
+                            "event": "status",
+                            "operation": "transcribe",
+                            "stage": "coverage_summary",
+                            "message": "Chunked LCS coverage: 4 speech-active gaps totaling 31.20 seconds.",
+                        }
+                    ),
+                    event(
+                        {
+                            "protocol_version": 1,
+                            "event": "status",
+                            "operation": "transcribe",
+                            "stage": "coverage_recovery_summary",
+                            "message": "Chunked LCS recovered 9 gaps totaling 167.20 seconds.",
+                        }
+                    ),
+                    event(
+                        {
+                            "protocol_version": 1,
+                            "event": "status",
+                            "operation": "transcribe",
+                            "stage": "coverage_rejected",
+                            "message": "Coverage recovery rejected: 4 speech-active gaps remain.",
+                        }
+                    ),
+                    event(
+                        {
+                            "protocol_version": 1,
+                            "event": "status",
+                            "operation": "transcribe",
+                            "stage": "coverage_remaining_ranges",
+                            "message": "Remaining gap ranges: 02:39.06-02:50.00",
+                        }
+                    ),
+                    event(
+                        {
+                            "protocol_version": 1,
+                            "event": "status",
+                            "operation": "transcribe",
+                            "stage": "timestamp_rejected",
+                            "message": "Timestamp validation rejected a 1.42-second overlap at continuation chunk boundary 11->12.",
+                        }
+                    ),
+                    event(
+                        {
+                            "protocol_version": 1,
+                            "event": "status",
+                            "operation": "transcribe",
+                            "stage": "targeted_recovery_start",
+                            "message": "Starting targeted recovery for 9 speech-active gaps.",
+                        }
+                    ),
+                    event(
+                        {
+                            "protocol_version": 1,
+                            "event": "status",
+                            "operation": "transcribe",
+                            "stage": "targeted_recovery_gap",
+                            "message": "Recovering gap 1/9: 00:11.02-00:28.40.",
+                        }
+                    ),
+                    event(
+                        {
+                            "protocol_version": 1,
+                            "event": "status",
+                            "operation": "transcribe",
+                            "stage": "targeted_recovery_summary",
+                            "message": "Targeted recovery restored 8 gaps totaling 132.40 seconds.",
+                        }
+                    ),
+                    event(
+                        {
+                            "protocol_version": 1,
+                            "event": "status",
+                            "operation": "transcribe",
+                            "stage": "targeted_recovery_failed",
+                            "message": "Targeted recovery left 1 speech-active gap totaling 12.32 seconds; no result was committed.",
+                        }
+                    ),
+                    event(
+                        {
+                            "protocol_version": 1,
+                            "event": "status",
+                            "operation": "transcribe",
+                            "stage": "targeted_recovery_passed",
+                            "message": "Final coverage audit passed.",
+                        }
+                    ),
+                    event(
+                        {
+                            "protocol_version": 1,
+                            "event": "success",
+                            "operation": "transcribe",
+                        }
+                    ),
+                ]
+            )
+
+        adapter = self.adapter(factory, logs)
+        adapter._probe_response = make_probe_response()
+        adapter.transcribe(
+            self.audio,
+            settings,
+            status_callback=lambda stage, message: statuses.append((stage, message)),
+        )
+        self.assertEqual(
+            logs,
+            [
+                "[crisper] Auditing long-form transcript coverage.",
+                "[crisper] Detected 2 speech-active coverage gaps; retrying with chunked LCS.",
+                "[crisper] Continuation coverage: 13 speech-active gaps totaling 198.40 seconds.",
+                "[crisper] Chunked LCS coverage: 4 speech-active gaps totaling 31.20 seconds.",
+                "[crisper] Chunked LCS recovered 9 gaps totaling 167.20 seconds.",
+                "[crisper] Coverage recovery rejected: 4 speech-active gaps remain.",
+                "[crisper] Remaining gap ranges: 02:39.06-02:50.00",
+                "[crisper] Timestamp validation rejected a 1.42-second overlap at continuation chunk boundary 11->12.",
+                "[crisper] Starting targeted recovery for 9 speech-active gaps.",
+                "[crisper] Recovering gap 1/9: 00:11.02-00:28.40.",
+                "[crisper] Targeted recovery restored 8 gaps totaling 132.40 seconds.",
+                "[crisper] Targeted recovery left 1 speech-active gap totaling 12.32 seconds; no result was committed.",
+                "[crisper] Final coverage audit passed.",
+            ],
+        )
+        self.assertEqual(
+            [stage for stage, _message in statuses],
+            [
+                "auditing_coverage",
+                "coverage_fallback",
+                "coverage_summary",
+                "coverage_summary",
+                "coverage_recovery_summary",
+                "coverage_rejected",
+                "coverage_remaining_ranges",
+                "timestamp_rejected",
+                "targeted_recovery_start",
+                "targeted_recovery_gap",
+                "targeted_recovery_summary",
+                "targeted_recovery_failed",
+                "targeted_recovery_passed",
+            ],
+        )
 
     def test_nonzero_missing_and_malformed_results_fail(self):
         settings = make_settings()

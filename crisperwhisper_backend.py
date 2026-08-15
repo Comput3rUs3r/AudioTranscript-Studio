@@ -28,6 +28,36 @@ OFFICIAL_MODEL_IDS = {
     "large": "nyralabs/CrisperWhisper2.0_large",
     "turbo": "nyralabs/CrisperWhisper2.0_turbo",
 }
+_TIMESTAMP_DIAGNOSTIC_REASONS = {
+    "current_start_precedes_previous_end_beyond_tolerance",
+    "previous_end_exceeds_current_start_beyond_tolerance",
+    "overlap_has_no_positive_repair_interval",
+}
+_COVERAGE_REJECTION_REASONS = {
+    "candidate_duration_mismatch",
+    "speech_active_gaps_remain",
+    "coverage_not_improved",
+    "fallback_strict_validation_failed",
+    "targeted_recovery_incomplete",
+}
+_TIMESTAMP_REPAIR_ACTIONS = {
+    "clamped_to_media_start",
+    "clamped_to_media_end",
+    "inferred_missing_start",
+    "inferred_missing_end",
+    "retained_untimed_text",
+    "adjacent_overlap",
+    "tiny_end_before_start",
+    "neighbor_reconciled_reversal",
+    "zero_duration",
+}
+_TARGETED_SELECTED_STRATEGIES = {
+    "continuation_plus_targeted_recovery": "continuation",
+    "chunked_lcs_plus_targeted_recovery": "chunked_lcs",
+}
+_TARGETED_RECOVERY_WARNINGS = {
+    "One or more targeted windows failed strict validation and were not merged.",
+}
 
 DEFAULT_CRISPERWHISPER_CONFIG = {
     "schema_version": 1,
@@ -75,6 +105,19 @@ _CONFIG_SECTIONS = {"model", "transcription", "longform", "decoding", "speculati
 
 class CrisperWhisperBackendError(RuntimeError):
     """A safe, actionable adapter failure suitable for the pipeline log."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        diagnostic_details: Optional[dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.diagnostic_details = (
+            copy.deepcopy(diagnostic_details)
+            if diagnostic_details is not None
+            else None
+        )
 
 
 class CrisperWhisperConfigurationError(CrisperWhisperBackendError):
@@ -179,6 +222,854 @@ def _expect_object(value: Any, label: str) -> dict[str, Any]:
     return value
 
 
+def _validate_word_timestamp_repairs(value: Any) -> Optional[dict[str, Any]]:
+    if value is None:
+        return None
+    metadata = _expect_object(value, "transcription.word_timestamp_repairs")
+    repair_count = metadata.get("repair_count")
+    untimed_count = metadata.get("untimed_word_count")
+    remained_untimed = metadata.get("words_remained_untimed")
+    if (
+        isinstance(repair_count, bool)
+        or not isinstance(repair_count, int)
+        or repair_count < 0
+        or isinstance(untimed_count, bool)
+        or not isinstance(untimed_count, int)
+        or untimed_count < 0
+        or not isinstance(remained_untimed, bool)
+    ):
+        raise CrisperWhisperProtocolError(
+            "Worker result word timestamp repair summary is invalid."
+        )
+    categories = metadata.get("categories")
+    if not isinstance(categories, dict) or any(
+        not isinstance(category, str)
+        or not category
+        or isinstance(count, bool)
+        or not isinstance(count, int)
+        or count < 0
+        for category, count in categories.items()
+    ):
+        raise CrisperWhisperProtocolError(
+            "Worker result word timestamp repair categories are invalid."
+        )
+    if sum(categories.values()) != repair_count:
+        raise CrisperWhisperProtocolError(
+            "Worker result word timestamp repair counts are inconsistent."
+        )
+    if remained_untimed != bool(untimed_count):
+        raise CrisperWhisperProtocolError(
+            "Worker result untimed-word repair summary is inconsistent."
+        )
+    warnings = metadata.get("warnings")
+    if not isinstance(warnings, list) or any(
+        not isinstance(warning, str)
+        or not warning
+        or len(warning) > 240
+        for warning in warnings
+    ):
+        raise CrisperWhisperProtocolError(
+            "Worker result word timestamp repair warnings are invalid."
+        )
+    return copy.deepcopy(metadata)
+
+
+def _validate_coverage_audit(value: Any, label: str) -> dict[str, Any]:
+    audit = _expect_object(value, label)
+    count_keys = ("substantial_gap_count", "speech_active_gap_count")
+    duration_keys = (
+        "substantial_gap_duration",
+        "speech_active_gap_duration",
+        "active_frame_seconds",
+    )
+    for key in count_keys:
+        current = audit.get(key)
+        if isinstance(current, bool) or not isinstance(current, int) or current < 0:
+            raise CrisperWhisperProtocolError(
+                "Worker result long-form coverage counts are invalid."
+            )
+    for key in duration_keys:
+        current = audit.get(key)
+        if (
+            isinstance(current, bool)
+            or not isinstance(current, (int, float))
+            or not math.isfinite(float(current))
+            or float(current) < 0
+        ):
+            raise CrisperWhisperProtocolError(
+                "Worker result long-form coverage durations are invalid."
+            )
+    if audit["speech_active_gap_count"] > audit["substantial_gap_count"]:
+        raise CrisperWhisperProtocolError(
+            "Worker result long-form coverage counts are inconsistent."
+        )
+    silence_count = audit.get("silence_gap_count")
+    silence_duration = audit.get("silence_gap_duration")
+    if silence_count is not None or silence_duration is not None:
+        if (
+            isinstance(silence_count, bool)
+            or not isinstance(silence_count, int)
+            or silence_count < 0
+            or isinstance(silence_duration, bool)
+            or not isinstance(silence_duration, (int, float))
+            or not math.isfinite(float(silence_duration))
+            or float(silence_duration) < 0
+            or silence_count + audit["speech_active_gap_count"]
+            != audit["substantial_gap_count"]
+        ):
+            raise CrisperWhisperProtocolError(
+                "Worker result long-form silence-gap summary is invalid."
+            )
+    ranges = audit.get("speech_active_gap_ranges")
+    if ranges is not None:
+        if not isinstance(ranges, list) or len(ranges) != audit["speech_active_gap_count"]:
+            raise CrisperWhisperProtocolError(
+                "Worker result long-form coverage gap ranges are invalid."
+            )
+        for item in ranges:
+            if not isinstance(item, dict) or set(item) != {
+                "start",
+                "end",
+                "duration",
+                "active_seconds",
+                "active_blocks",
+            }:
+                raise CrisperWhisperProtocolError(
+                    "Worker result long-form coverage gap ranges are invalid."
+                )
+            numeric = (item["start"], item["end"], item["duration"], item["active_seconds"])
+            if any(
+                isinstance(current, bool)
+                or not isinstance(current, (int, float))
+                or not math.isfinite(float(current))
+                or float(current) < 0
+                for current in numeric
+            ) or (
+                isinstance(item["active_blocks"], bool)
+                or not isinstance(item["active_blocks"], int)
+                or item["active_blocks"] < 0
+                or float(item["end"]) <= float(item["start"])
+                or not math.isclose(
+                    float(item["duration"]),
+                    float(item["end"]) - float(item["start"]),
+                    abs_tol=0.002,
+                )
+            ):
+                raise CrisperWhisperProtocolError(
+                    "Worker result long-form coverage gap ranges are invalid."
+                )
+    known = audit.get("known_diagnostic_interval")
+    if known is not None:
+        if not isinstance(known, dict) or set(known) != {"start", "end", "covered"}:
+            raise CrisperWhisperProtocolError(
+                "Worker result diagnostic interval coverage is invalid."
+            )
+        start = known["start"]
+        end = known["end"]
+        if (
+            isinstance(start, bool)
+            or not isinstance(start, (int, float))
+            or not math.isfinite(float(start))
+            or isinstance(end, bool)
+            or not isinstance(end, (int, float))
+            or not math.isfinite(float(end))
+            or float(end) <= float(start)
+            or known["covered"] is not None
+            and not isinstance(known["covered"], bool)
+        ):
+            raise CrisperWhisperProtocolError(
+                "Worker result diagnostic interval coverage is invalid."
+            )
+    configuration = _expect_object(audit.get("configuration"), f"{label}.configuration")
+    if not configuration:
+        raise CrisperWhisperProtocolError(
+            "Worker result long-form coverage configuration is missing."
+        )
+    allowed_configuration_keys = {
+        "substantial_gap_seconds",
+        "sample_rate",
+        "frame_seconds",
+        "block_seconds",
+        "absolute_floor_dbfs",
+        "noise_percentile",
+        "reference_percentile",
+        "noise_margin_db",
+        "minimum_dynamic_range_db",
+        "minimum_active_seconds",
+        "minimum_active_blocks",
+        "minimum_block_active_ratio",
+        "minimum_zero_crossing_rate",
+        "maximum_zero_crossing_rate",
+        "effective_threshold_dbfs",
+        "measured_noise_floor_dbfs",
+        "measured_reference_dbfs",
+        "measured_dynamic_range_db",
+    }
+    for key, current in configuration.items():
+        if key not in allowed_configuration_keys:
+            raise CrisperWhisperProtocolError(
+                "Worker result long-form coverage configuration is invalid."
+            )
+        if current is None:
+            continue
+        if (
+            isinstance(current, bool)
+            or not isinstance(current, (int, float))
+            or not math.isfinite(float(current))
+        ):
+            raise CrisperWhisperProtocolError(
+                "Worker result long-form coverage configuration is invalid."
+            )
+    return copy.deepcopy(audit)
+
+
+def _validate_targeted_recovery_metadata(
+    value: Any,
+    *,
+    require_complete: bool,
+) -> dict[str, Any]:
+    metadata = _expect_object(value, "targeted recovery metadata")
+    required = {
+        "base_strategy",
+        "base_selection_reason",
+        "attempted",
+        "target_gap_count",
+        "target_gap_duration",
+        "short_window_attempt_count",
+        "failed_window_attempt_count",
+        "framing_geometries",
+        "recovered_gap_count",
+        "recovered_duration",
+        "unresolved_gap_count",
+        "unresolved_gap_duration",
+        "final_coverage_audit",
+        "warnings",
+    }
+    if set(metadata) != required:
+        raise CrisperWhisperProtocolError(
+            "Worker targeted recovery metadata fields are invalid."
+        )
+    if metadata["base_strategy"] not in {"continuation", "chunked_lcs"}:
+        raise CrisperWhisperProtocolError(
+            "Worker targeted recovery base strategy is invalid."
+        )
+    expected_reason = {
+        "continuation": "chunked_lcs_not_improved",
+        "chunked_lcs": "chunked_lcs_improved_but_incomplete",
+    }[metadata["base_strategy"]]
+    if metadata["base_selection_reason"] != expected_reason:
+        raise CrisperWhisperProtocolError(
+            "Worker targeted recovery base selection reason is invalid."
+        )
+    if metadata["attempted"] is not True:
+        raise CrisperWhisperProtocolError(
+            "Worker targeted recovery attempt state is invalid."
+        )
+    for key in (
+        "target_gap_count",
+        "short_window_attempt_count",
+        "failed_window_attempt_count",
+        "recovered_gap_count",
+        "unresolved_gap_count",
+    ):
+        current = metadata[key]
+        if isinstance(current, bool) or not isinstance(current, int) or current < 0:
+            raise CrisperWhisperProtocolError(
+                "Worker targeted recovery counts are invalid."
+            )
+    if metadata["target_gap_count"] <= 0:
+        raise CrisperWhisperProtocolError(
+            "Worker targeted recovery target count is invalid."
+        )
+    for key in (
+        "target_gap_duration",
+        "recovered_duration",
+        "unresolved_gap_duration",
+    ):
+        current = metadata[key]
+        if (
+            isinstance(current, bool)
+            or not isinstance(current, (int, float))
+            or not math.isfinite(float(current))
+            or float(current) < 0
+        ):
+            raise CrisperWhisperProtocolError(
+                "Worker targeted recovery durations are invalid."
+            )
+    if (
+        metadata["recovered_gap_count"]
+        != max(0, metadata["target_gap_count"] - metadata["unresolved_gap_count"])
+        or not math.isclose(
+            float(metadata["recovered_duration"]),
+            max(
+                0.0,
+                float(metadata["target_gap_duration"])
+                - float(metadata["unresolved_gap_duration"]),
+            ),
+            abs_tol=0.002,
+        )
+        or metadata["failed_window_attempt_count"]
+        > metadata["short_window_attempt_count"]
+    ):
+        raise CrisperWhisperProtocolError(
+            "Worker targeted recovery summary is inconsistent."
+        )
+    if require_complete and (
+        metadata["unresolved_gap_count"] != 0
+        or float(metadata["unresolved_gap_duration"]) != 0.0
+    ):
+        raise CrisperWhisperProtocolError(
+            "Worker accepted incomplete targeted recovery metadata."
+        )
+
+    geometry_fields = {
+        "attempt",
+        "gap_index",
+        "window_index",
+        "core_start",
+        "core_end",
+        "slice_start",
+        "slice_end",
+        "padding_seconds",
+        "shift_seconds",
+        "input_duration",
+    }
+    geometries = metadata["framing_geometries"]
+    if not isinstance(geometries, list):
+        raise CrisperWhisperProtocolError(
+            "Worker targeted recovery framing data is invalid."
+        )
+    for geometry in geometries:
+        if not isinstance(geometry, dict) or set(geometry) != geometry_fields:
+            raise CrisperWhisperProtocolError(
+                "Worker targeted recovery framing data is invalid."
+            )
+        for key, current in geometry.items():
+            if (
+                isinstance(current, bool)
+                or not isinstance(current, (int, float))
+                or not math.isfinite(float(current))
+                or float(current) < 0
+            ):
+                raise CrisperWhisperProtocolError(
+                    "Worker targeted recovery framing values are invalid."
+                )
+        if any(
+            not isinstance(geometry[key], int) or isinstance(geometry[key], bool)
+            for key in ("attempt", "gap_index", "window_index")
+        ):
+            raise CrisperWhisperProtocolError(
+                "Worker targeted recovery framing indexes are invalid."
+            )
+        expected = {
+            1: (2.0, 0.0),
+            2: (3.0, 0.5),
+        }.get(geometry["attempt"])
+        if (
+            expected is None
+            or geometry["gap_index"] <= 0
+            or geometry["window_index"] <= 0
+            or not math.isclose(float(geometry["padding_seconds"]), expected[0])
+            or not math.isclose(float(geometry["shift_seconds"]), expected[1])
+            or not (
+                float(geometry["slice_start"])
+                <= float(geometry["core_start"])
+                < float(geometry["core_end"])
+                <= float(geometry["slice_end"])
+            )
+            or float(geometry["core_end"]) - float(geometry["core_start"])
+            > 21.0 + 1.0e-6
+            or float(geometry["input_duration"]) > 25.0 + 1.0e-6
+            or not math.isclose(
+                float(geometry["input_duration"]),
+                float(geometry["slice_end"]) - float(geometry["slice_start"]),
+                abs_tol=0.001,
+            )
+        ):
+            raise CrisperWhisperProtocolError(
+                "Worker targeted recovery framing geometry is inconsistent."
+            )
+    if len(geometries) > metadata["short_window_attempt_count"]:
+        raise CrisperWhisperProtocolError(
+            "Worker targeted recovery framing count is inconsistent."
+        )
+
+    final_audit = _validate_coverage_audit(
+        metadata["final_coverage_audit"],
+        "targeted recovery final coverage audit",
+    )
+    if (
+        final_audit.get("speech_active_gap_count")
+        != metadata["unresolved_gap_count"]
+        or not math.isclose(
+            float(final_audit.get("speech_active_gap_duration")),
+            float(metadata["unresolved_gap_duration"]),
+            abs_tol=0.002,
+        )
+    ):
+        raise CrisperWhisperProtocolError(
+            "Worker targeted recovery final audit is inconsistent."
+        )
+    warnings = metadata["warnings"]
+    if (
+        not isinstance(warnings, list)
+        or any(warning not in _TARGETED_RECOVERY_WARNINGS for warning in warnings)
+    ):
+        raise CrisperWhisperProtocolError(
+            "Worker targeted recovery warnings are invalid."
+        )
+    return copy.deepcopy(metadata)
+
+
+def _validate_longform_coverage(
+    value: Any,
+    effective_settings: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    if value is None:
+        effective_longform = _expect_object(
+            effective_settings.get("longform"), "settings.effective.longform"
+        )
+        if effective_longform.get("strategy") != "continuation":
+            raise CrisperWhisperProtocolError(
+                "Worker result used an unreported long-form recovery strategy."
+            )
+        return None
+    coverage = _expect_object(value, "transcription.longform_coverage")
+    attempted = coverage.get("attempted_strategies")
+    selected = coverage.get("selected_strategy")
+    requested = coverage.get("requested_strategy")
+    fallback_used = coverage.get("fallback_used")
+    if requested != "continuation" or attempted not in (
+        ["continuation"],
+        ["continuation", "chunked_lcs"],
+    ):
+        raise CrisperWhisperProtocolError(
+            "Worker result long-form coverage strategies are invalid."
+        )
+    targeted_value = coverage.get("targeted_recovery")
+    targeted = None
+    if selected in _TARGETED_SELECTED_STRATEGIES:
+        targeted = _validate_targeted_recovery_metadata(
+            targeted_value,
+            require_complete=True,
+        )
+        base_strategy = _TARGETED_SELECTED_STRATEGIES[selected]
+        if targeted["base_strategy"] != base_strategy:
+            raise CrisperWhisperProtocolError(
+                "Worker result targeted recovery strategy is inconsistent."
+            )
+    else:
+        base_strategy = selected
+        if targeted_value is not None:
+            raise CrisperWhisperProtocolError(
+                "Worker result reports unused targeted recovery metadata."
+            )
+    if (
+        base_strategy not in attempted
+        or selected
+        not in {
+            "continuation",
+            "chunked_lcs",
+            *_TARGETED_SELECTED_STRATEGIES,
+        }
+    ):
+        raise CrisperWhisperProtocolError(
+            "Worker result selected an invalid long-form coverage strategy."
+        )
+    if not isinstance(fallback_used, bool) or fallback_used != (
+        base_strategy == "chunked_lcs"
+    ):
+        raise CrisperWhisperProtocolError(
+            "Worker result long-form coverage fallback state is inconsistent."
+        )
+    effective_longform = _expect_object(
+        effective_settings.get("longform"), "settings.effective.longform"
+    )
+    if effective_longform.get("strategy") != selected:
+        raise CrisperWhisperProtocolError(
+            "Worker result effective long-form strategy differs from its coverage selection."
+        )
+
+    count_keys = (
+        "substantial_gap_count",
+        "speech_active_gap_count",
+        "recovered_gap_count",
+        "remaining_speech_active_gap_count",
+    )
+    duration_keys = (
+        "substantial_gap_duration",
+        "speech_active_gap_duration",
+        "recovered_duration",
+        "remaining_speech_active_gap_duration",
+    )
+    for key in count_keys:
+        current = coverage.get(key)
+        if isinstance(current, bool) or not isinstance(current, int) or current < 0:
+            raise CrisperWhisperProtocolError(
+                "Worker result long-form coverage summary is invalid."
+            )
+    for key in duration_keys:
+        current = coverage.get(key)
+        if (
+            isinstance(current, bool)
+            or not isinstance(current, (int, float))
+            or not math.isfinite(float(current))
+            or float(current) < 0
+        ):
+            raise CrisperWhisperProtocolError(
+                "Worker result long-form coverage summary is invalid."
+            )
+    if coverage["remaining_speech_active_gap_count"] != 0 or float(
+        coverage["remaining_speech_active_gap_duration"]
+    ) != 0.0:
+        raise CrisperWhisperProtocolError(
+            "Worker result still contains unrecovered speech-active coverage gaps."
+        )
+    targeted_used = targeted is not None
+    if fallback_used or targeted_used:
+        if (
+            coverage["speech_active_gap_count"] <= 0
+            or coverage["recovered_gap_count"] != coverage["speech_active_gap_count"]
+            or float(coverage["recovered_duration"])
+            != float(coverage["speech_active_gap_duration"])
+        ):
+            raise CrisperWhisperProtocolError(
+                "Worker result long-form coverage recovery summary is inconsistent."
+            )
+    elif coverage["recovered_gap_count"] != 0 or float(coverage["recovered_duration"]) != 0.0:
+        raise CrisperWhisperProtocolError(
+            "Worker result reports coverage recovery without using its fallback."
+        )
+
+    configuration = _expect_object(
+        coverage.get("configuration"), "transcription.longform_coverage.configuration"
+    )
+    if not configuration:
+        raise CrisperWhisperProtocolError(
+            "Worker result long-form coverage configuration is missing."
+        )
+    candidate_audits = _expect_object(
+        coverage.get("candidate_audits"),
+        "transcription.longform_coverage.candidate_audits",
+    )
+    if set(candidate_audits) != set(attempted):
+        raise CrisperWhisperProtocolError(
+            "Worker result long-form coverage candidate audits are incomplete."
+        )
+    for strategy in attempted:
+        _validate_coverage_audit(candidate_audits[strategy], f"coverage audit {strategy}")
+    if configuration != candidate_audits["continuation"].get("configuration"):
+        raise CrisperWhisperProtocolError(
+            "Worker result long-form coverage configuration is inconsistent."
+        )
+    if targeted is not None:
+        base_audit = candidate_audits[targeted["base_strategy"]]
+        if (
+            targeted["target_gap_count"]
+            != base_audit["speech_active_gap_count"]
+            or not math.isclose(
+                float(targeted["target_gap_duration"]),
+                float(base_audit["speech_active_gap_duration"]),
+                abs_tol=0.002,
+            )
+            or targeted["final_coverage_audit"]["speech_active_gap_count"]
+            != coverage["remaining_speech_active_gap_count"]
+            or not math.isclose(
+                float(
+                    targeted["final_coverage_audit"][
+                        "speech_active_gap_duration"
+                    ]
+                ),
+                float(coverage["remaining_speech_active_gap_duration"]),
+                abs_tol=0.002,
+            )
+        ):
+            raise CrisperWhisperProtocolError(
+                "Worker result targeted recovery coverage is inconsistent."
+            )
+    warnings = coverage.get("warnings")
+    if not isinstance(warnings, list) or any(
+        not isinstance(warning, str) or not warning or len(warning) > 240
+        for warning in warnings
+    ):
+        raise CrisperWhisperProtocolError(
+            "Worker result long-form coverage warnings are invalid."
+        )
+    return copy.deepcopy(coverage)
+
+
+def _validate_diagnostic_chunk_window(value: Any, label: str) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    window = _expect_object(value, label)
+    if set(window) != {"chunk_index", "start", "end"}:
+        raise CrisperWhisperProtocolError("Worker timestamp diagnostic chunk data is invalid.")
+    chunk_index = window["chunk_index"]
+    start = window["start"]
+    end = window["end"]
+    if (
+        isinstance(chunk_index, bool)
+        or not isinstance(chunk_index, int)
+        or chunk_index < 0
+        or isinstance(start, bool)
+        or not isinstance(start, (int, float))
+        or not math.isfinite(float(start))
+        or float(start) < 0
+        or isinstance(end, bool)
+        or not isinstance(end, (int, float))
+        or not math.isfinite(float(end))
+        or float(end) < float(start)
+    ):
+        raise CrisperWhisperProtocolError("Worker timestamp diagnostic chunk data is invalid.")
+    return copy.deepcopy(window)
+
+
+def _validate_timestamp_overlap_diagnostic(value: Any) -> dict[str, Any]:
+    details = _expect_object(value, "timestamp-overlap diagnostic")
+    required = {
+        "diagnostic_type",
+        "model_family",
+        "effective_strategy",
+        "previous_native_chunk_index",
+        "current_native_chunk_index",
+        "previous_word_index",
+        "current_word_index",
+        "previous_start",
+        "previous_end",
+        "current_start",
+        "current_end",
+        "overlap_duration",
+        "crosses_native_chunk_boundary",
+        "previous_chunk_window",
+        "current_chunk_window",
+        "normalized_tokens_identical",
+        "repeated_token_sequence",
+        "repeated_sequence_length",
+        "timestamp_reset_relative_to_chunk_start",
+        "previous_boundary_was_repaired",
+        "current_boundary_was_repaired",
+        "repair_actions_attempted",
+        "reason",
+        "tolerance_seconds",
+    }
+    if set(details) != required:
+        raise CrisperWhisperProtocolError("Worker timestamp diagnostic fields are invalid.")
+    if (
+        details["diagnostic_type"] != "timestamp_overlap"
+        or details["model_family"] not in OFFICIAL_MODEL_IDS
+        or details["effective_strategy"]
+        not in {"continuation", "chunked_lcs", "targeted_short_window"}
+        or details["reason"] not in _TIMESTAMP_DIAGNOSTIC_REASONS
+    ):
+        raise CrisperWhisperProtocolError("Worker timestamp diagnostic identity is invalid.")
+    for key in ("previous_word_index", "current_word_index", "repeated_sequence_length"):
+        current = details[key]
+        if isinstance(current, bool) or not isinstance(current, int) or current < 0:
+            raise CrisperWhisperProtocolError("Worker timestamp diagnostic indexes are invalid.")
+    if details["current_word_index"] <= details["previous_word_index"]:
+        raise CrisperWhisperProtocolError("Worker timestamp diagnostic word order is invalid.")
+    for key in (
+        "previous_start",
+        "previous_end",
+        "current_start",
+        "current_end",
+        "overlap_duration",
+        "tolerance_seconds",
+    ):
+        current = details[key]
+        if current is None and key in {"previous_start", "previous_end", "current_end"}:
+            continue
+        if (
+            isinstance(current, bool)
+            or not isinstance(current, (int, float))
+            or not math.isfinite(float(current))
+            or float(current) < 0
+        ):
+            raise CrisperWhisperProtocolError("Worker timestamp diagnostic times are invalid.")
+    if float(details["overlap_duration"]) <= 0 or float(details["tolerance_seconds"]) != 0.25:
+        raise CrisperWhisperProtocolError("Worker timestamp diagnostic overlap is invalid.")
+    for key in (
+        "crosses_native_chunk_boundary",
+        "normalized_tokens_identical",
+        "repeated_token_sequence",
+        "timestamp_reset_relative_to_chunk_start",
+        "previous_boundary_was_repaired",
+        "current_boundary_was_repaired",
+    ):
+        if not isinstance(details[key], bool):
+            raise CrisperWhisperProtocolError("Worker timestamp diagnostic flags are invalid.")
+    if details["repeated_token_sequence"] != bool(details["repeated_sequence_length"]):
+        raise CrisperWhisperProtocolError("Worker repeated-sequence diagnostic is inconsistent.")
+    actions = details["repair_actions_attempted"]
+    if (
+        not isinstance(actions, list)
+        or len(actions) != len(set(actions))
+        or any(action not in _TIMESTAMP_REPAIR_ACTIONS for action in actions)
+    ):
+        raise CrisperWhisperProtocolError("Worker timestamp diagnostic repairs are invalid.")
+    previous_window = _validate_diagnostic_chunk_window(
+        details["previous_chunk_window"],
+        "previous timestamp chunk",
+    )
+    current_window = _validate_diagnostic_chunk_window(
+        details["current_chunk_window"],
+        "current timestamp chunk",
+    )
+    previous_index = details["previous_native_chunk_index"]
+    current_index = details["current_native_chunk_index"]
+    for index in (previous_index, current_index):
+        if index is not None and (
+            isinstance(index, bool) or not isinstance(index, int) or index < 0
+        ):
+            raise CrisperWhisperProtocolError("Worker timestamp diagnostic chunk indexes are invalid.")
+    if (
+        (previous_window is None) != (previous_index is None)
+        or (current_window is None) != (current_index is None)
+        or previous_window is not None
+        and previous_window["chunk_index"] != previous_index
+        or current_window is not None
+        and current_window["chunk_index"] != current_index
+        or details["crosses_native_chunk_boundary"]
+        != (
+            previous_index is not None
+            and current_index is not None
+            and previous_index != current_index
+        )
+    ):
+        raise CrisperWhisperProtocolError("Worker timestamp diagnostic chunks are inconsistent.")
+    return copy.deepcopy(details)
+
+
+def _validate_coverage_failure_diagnostic(value: Any) -> dict[str, Any]:
+    details = _expect_object(value, "coverage-failure diagnostic")
+    required = {
+        "diagnostic_type",
+        "model_family",
+        "requested_strategy",
+        "attempted_strategies",
+        "fallback_rejection_reason",
+        "recovered_gap_count",
+        "recovered_duration",
+        "remaining_speech_active_gap_count",
+        "remaining_speech_active_gap_duration",
+        "candidate_audits",
+    }
+    allowed = required | {"fallback_diagnostic", "targeted_recovery"}
+    if not required.issubset(details) or not set(details).issubset(allowed):
+        raise CrisperWhisperProtocolError("Worker coverage diagnostic fields are invalid.")
+    if (
+        details["diagnostic_type"] != "coverage_failure"
+        or details["model_family"] not in OFFICIAL_MODEL_IDS
+        or details["requested_strategy"] != "continuation"
+        or details["attempted_strategies"] != ["continuation", "chunked_lcs"]
+        or details["fallback_rejection_reason"] not in _COVERAGE_REJECTION_REASONS
+    ):
+        raise CrisperWhisperProtocolError("Worker coverage diagnostic identity is invalid.")
+    for key in ("recovered_gap_count", "remaining_speech_active_gap_count"):
+        current = details[key]
+        if isinstance(current, bool) or not isinstance(current, int) or current < 0:
+            raise CrisperWhisperProtocolError("Worker coverage diagnostic counts are invalid.")
+    for key in ("recovered_duration", "remaining_speech_active_gap_duration"):
+        current = details[key]
+        if (
+            isinstance(current, bool)
+            or not isinstance(current, (int, float))
+            or not math.isfinite(float(current))
+            or float(current) < 0
+        ):
+            raise CrisperWhisperProtocolError("Worker coverage diagnostic durations are invalid.")
+    candidate_audits = _expect_object(details["candidate_audits"], "coverage candidates")
+    if "continuation" not in candidate_audits or not set(candidate_audits).issubset(
+        {"continuation", "chunked_lcs"}
+    ):
+        raise CrisperWhisperProtocolError("Worker coverage diagnostic candidates are invalid.")
+    required_audit_fields = {
+        "substantial_gap_count",
+        "substantial_gap_duration",
+        "speech_active_gap_count",
+        "speech_active_gap_duration",
+        "silence_gap_count",
+        "silence_gap_duration",
+        "speech_active_gap_ranges",
+        "active_frame_seconds",
+        "known_diagnostic_interval",
+        "configuration",
+    }
+    for strategy, audit in candidate_audits.items():
+        if not isinstance(audit, dict) or set(audit) != required_audit_fields:
+            raise CrisperWhisperProtocolError("Worker coverage diagnostic audit fields are invalid.")
+        validated_audit = _validate_coverage_audit(audit, f"error coverage audit {strategy}")
+        if (
+            "silence_gap_count" not in validated_audit
+            or "speech_active_gap_ranges" not in validated_audit
+            or "known_diagnostic_interval" not in validated_audit
+        ):
+            raise CrisperWhisperProtocolError("Worker coverage diagnostic audit is incomplete.")
+    fallback_audit = candidate_audits.get("chunked_lcs")
+    targeted_value = details.get("targeted_recovery")
+    targeted = None
+    if targeted_value is not None:
+        targeted = _validate_targeted_recovery_metadata(
+            targeted_value,
+            require_complete=False,
+        )
+    if details["fallback_rejection_reason"] == "targeted_recovery_incomplete":
+        if targeted is None or targeted["unresolved_gap_count"] <= 0:
+            raise CrisperWhisperProtocolError(
+                "Worker coverage diagnostic targeted recovery is missing."
+            )
+        base_audit = candidate_audits.get(targeted["base_strategy"])
+        if (
+            base_audit is None
+            or targeted["target_gap_count"]
+            != base_audit["speech_active_gap_count"]
+            or not math.isclose(
+                float(targeted["target_gap_duration"]),
+                float(base_audit["speech_active_gap_duration"]),
+                abs_tol=0.002,
+            )
+            or details["remaining_speech_active_gap_count"]
+            != targeted["unresolved_gap_count"]
+            or not math.isclose(
+                float(details["remaining_speech_active_gap_duration"]),
+                float(targeted["unresolved_gap_duration"]),
+                abs_tol=0.002,
+            )
+        ):
+            raise CrisperWhisperProtocolError(
+                "Worker coverage diagnostic targeted recovery is inconsistent."
+            )
+    elif targeted is not None:
+        raise CrisperWhisperProtocolError(
+            "Worker coverage diagnostic contains unexpected targeted recovery."
+        )
+    elif fallback_audit is not None:
+        if (
+            details["remaining_speech_active_gap_count"]
+            != fallback_audit["speech_active_gap_count"]
+            or not math.isclose(
+                float(details["remaining_speech_active_gap_duration"]),
+                float(fallback_audit["speech_active_gap_duration"]),
+                abs_tol=0.002,
+            )
+        ):
+            raise CrisperWhisperProtocolError("Worker coverage diagnostic remainder is inconsistent.")
+    fallback_diagnostic = details.get("fallback_diagnostic")
+    if fallback_diagnostic is not None:
+        _validate_timestamp_overlap_diagnostic(fallback_diagnostic)
+    return copy.deepcopy(details)
+
+
+def validate_worker_error_details(value: Any) -> dict[str, Any]:
+    details = _expect_object(value, "worker error details")
+    diagnostic_type = details.get("diagnostic_type")
+    if diagnostic_type == "timestamp_overlap":
+        return _validate_timestamp_overlap_diagnostic(details)
+    if diagnostic_type == "coverage_failure":
+        return _validate_coverage_failure_diagnostic(details)
+    raise CrisperWhisperProtocolError("Worker returned an unsupported diagnostic type.")
+
+
 def validate_probe_response(response: Any) -> dict[str, Any]:
     root = _expect_object(response, "probe response")
     if root.get("protocol_version") != PROTOCOL_VERSION:
@@ -268,22 +1159,29 @@ def validate_transcribe_response(
         raise CrisperWhisperProtocolError("Worker transcript mode differs from the request.")
     if not isinstance(transcription.get("language"), str) or not transcription["language"]:
         raise CrisperWhisperProtocolError("Worker result language is invalid.")
-    _finite_number(transcription.get("duration"), "duration")
+    duration = _finite_number(transcription.get("duration"), "duration")
     _finite_number(transcription.get("processing_time"), "processing time")
+    _validate_word_timestamp_repairs(
+        transcription.get("word_timestamp_repairs")
+    )
+    _validate_longform_coverage(
+        transcription.get("longform_coverage"),
+        effective,
+    )
 
     words = transcription.get("words")
     if not isinstance(words, list):
         raise CrisperWhisperProtocolError("Worker result words must be an array.")
-    previous_start = -1.0
+    previous_end = 0.0
     for word in words:
         item = _expect_object(word, "word")
         if not isinstance(item.get("word"), str) or not item["word"].strip():
             raise CrisperWhisperProtocolError("Worker result contains a word without speech text.")
         start = _finite_number(item.get("start"), "word start time")
         end = _finite_number(item.get("end"), "word end time")
-        if end <= start or start < previous_start:
+        if end <= start or start < previous_end or end > duration:
             raise CrisperWhisperProtocolError("Worker result word timestamps are invalid or out of order.")
-        previous_start = start
+        previous_end = end
     if transcription["text"].strip() and not words:
         raise CrisperWhisperProtocolError("Worker returned transcript text without word timestamps.")
 
@@ -443,6 +1341,25 @@ def normalize_worker_result(response: dict[str, Any]) -> dict[str, Any]:
         "native_chunks": copy.deepcopy(chunks),
         "duration": float(transcription["duration"]),
         "processing_time": float(transcription["processing_time"]),
+        "word_timestamp_repairs": copy.deepcopy(
+            transcription.get("word_timestamp_repairs")
+            or {
+                "repair_count": 0,
+                "categories": {},
+                "words_remained_untimed": False,
+                "untimed_word_count": 0,
+                "warnings": [],
+            }
+        ),
+        **(
+            {
+                "longform_coverage": copy.deepcopy(
+                    transcription["longform_coverage"]
+                )
+            }
+            if "longform_coverage" in transcription
+            else {}
+        ),
     }
     return {"segments": segments, "transcription": metadata}
 
@@ -600,12 +1517,18 @@ class CrisperWhisperBackend:
 
     @staticmethod
     def _worker_failure(operation: str, return_code: int, event: Optional[dict[str, Any]]) -> None:
+        diagnostic_details = None
+        if isinstance(event, dict) and "details" in event:
+            diagnostic_details = validate_worker_error_details(event["details"])
         if isinstance(event, dict) and event.get("code") == "cancelled":
             raise KeyboardInterrupt
         message = event.get("message") if isinstance(event, dict) else None
         if not isinstance(message, str) or not message:
             message = f"CrisperWhisper worker {operation} failed with exit code {return_code}."
-        raise CrisperWhisperRuntimeError(message)
+        raise CrisperWhisperRuntimeError(
+            message,
+            diagnostic_details=diagnostic_details,
+        )
 
     def probe(self, *, force: bool = False) -> dict[str, Any]:
         if self._probe_response is not None and not force:

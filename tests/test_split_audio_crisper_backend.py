@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+from contextlib import redirect_stdout
+import io
 import json
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -9,9 +11,18 @@ import unittest
 from unittest import mock
 
 import crisperwhisper_backend as backend
+import crisperwhisper_worker as worker
 import split_audio
 
-from test_crisperwhisper_backend import make_response, make_settings
+from test_crisperwhisper_backend import (
+    make_coverage_failure_diagnostic,
+    make_coverage_metadata,
+    make_response,
+    make_settings,
+    make_targeted_coverage_metadata,
+    make_targeted_recovery_metadata,
+    make_timestamp_diagnostic,
+)
 
 
 class FakeAdapter:
@@ -358,6 +369,11 @@ class PipelineOutputTests(unittest.TestCase):
             mock.patch.object(split_audio, "WAV_DIR", self.wav_dir),
         )
 
+    def committed_result_dir(self, engine):
+        matches = list(self.output_dir.glob(f"sample--*/{engine}/*"))
+        self.assertEqual(len(matches), 1)
+        return matches[0]
+
     def test_default_whisperx_pipeline_keeps_original_json_shape_and_filenames(self):
         cfg = split_audio.Conf(
             diarize=False,
@@ -387,12 +403,16 @@ class PipelineOutputTests(unittest.TestCase):
             split_audio.run_pipeline()
 
         crisper_class.assert_not_called()
-        result_dir = self.output_dir / "sample"
+        result_dir = self.committed_result_dir("whisperx")
         segment_json = json.loads((result_dir / "segments.json").read_text(encoding="utf-8"))
         self.assertEqual(set(segment_json), {"title", "segments", "source_path"})
         self.assertEqual(segment_json["segments"], whisper_result["segments"])
         self.assertTrue((result_dir / "sample.srt").is_file())
         self.assertTrue((result_dir / "sample.txt").is_file())
+        result_manifest = json.loads((result_dir / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result_manifest["engine"], "whisperx")
+        self.assertEqual(result_manifest["model"], "large-v3")
+        self.assertIsNone(result_manifest["mode"])
 
     def test_crisper_pipeline_adds_metadata_only_after_success(self):
         cfg = split_audio.Conf(
@@ -431,13 +451,473 @@ class PipelineOutputTests(unittest.TestCase):
 
         load_whisper.assert_not_called()
         transcribe_whisper.assert_not_called()
-        result_dir = self.output_dir / "sample"
+        result_dir = self.committed_result_dir("crisperwhisper")
         segment_json = json.loads((result_dir / "segments.json").read_text(encoding="utf-8"))
         metadata = segment_json["transcription"]
         self.assertEqual(metadata["engine"], "crisperwhisper")
         self.assertEqual(metadata["model"]["model_id"], backend.OFFICIAL_MODEL_IDS["medium"])
         self.assertEqual(metadata["execution_backend"], "transformers")
         self.assertNotIn("transcription", json.loads((result_dir / "speakers.json").read_text(encoding="utf-8")))
+        result_manifest = json.loads((result_dir / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result_manifest["engine"], "crisperwhisper")
+        self.assertEqual(result_manifest["model"], "medium")
+        self.assertEqual(result_manifest["mode"], "verbatim")
+
+
+class TimestampRepairStorageTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.root = Path(self.temp_dir.name)
+        self.wav_dir = self.root / "wav"
+        self.output_dir = self.root / "output"
+        self.wav_dir.mkdir()
+        self.output_dir.mkdir()
+        self.audio = self.wav_dir / "sample.wav"
+        self.audio.write_bytes(b"synthetic")
+        self.cfg = split_audio.Conf(
+            diarize=False,
+            slice_audio=False,
+            slice_video=False,
+            transcription_backend="crisperwhisper",
+        )
+        self.settings = make_settings()
+
+    def run_pipeline_with(self, adapter_class):
+        with mock.patch.object(split_audio, "load_conf", return_value=(self.cfg, None)), mock.patch.object(
+            split_audio, "setup_device", return_value="cuda"
+        ), mock.patch.object(
+            split_audio, "discover_sources", return_value=[self.audio]
+        ), mock.patch.object(
+            split_audio, "probe_duration_seconds", return_value=4.5
+        ), mock.patch.object(
+            split_audio, "load_speaker_names_with_migration", return_value=({}, "missing")
+        ), mock.patch.object(
+            split_audio, "OUT_DIR", self.output_dir
+        ), mock.patch.object(
+            split_audio, "WAV_DIR", self.wav_dir
+        ), mock.patch.object(
+            backend, "CrisperWhisperBackend", adapter_class
+        ), mock.patch.object(
+            backend, "resolve_crisperwhisper_settings", return_value=self.settings
+        ):
+            split_audio.run_pipeline()
+
+    def repaired_response(self):
+        native_text = "First repeated repeated."
+        source_words = [
+            {"word": "First", "start": -0.02, "end": 0.50},
+            {"word": "repeated", "start": 0.48, "end": 0.48},
+            {"word": "repeated.", "start": 0.80, "end": 1.20},
+        ]
+        words, repairs = worker.normalize_word_timestamps(
+            source_words,
+            native_text,
+            4.5,
+        )
+        response = make_response(self.settings)
+        response["transcription"]["text"] = native_text
+        response["transcription"]["chunks"] = None
+        response["transcription"]["words"] = words
+        response["transcription"]["word_timestamp_repairs"] = repairs
+        return backend.validate_transcribe_response(response, self.settings)
+
+    def test_safe_repairs_commit_revision_with_metadata_and_one_summary_log(self):
+        response = self.repaired_response()
+
+        class SuccessfulAdapter:
+            def __init__(adapter_self, _root):
+                adapter_self.response = response
+
+            def probe(adapter_self):
+                return {}
+
+            def transcribe(adapter_self, *_args, **_kwargs):
+                return copy.deepcopy(adapter_self.response)
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            self.run_pipeline_with(SuccessfulAdapter)
+
+        revisions = list(self.output_dir.glob("sample--*/crisperwhisper/*"))
+        self.assertEqual(len(revisions), 1)
+        segments_data = json.loads(
+            (revisions[0] / "segments.json").read_text(encoding="utf-8")
+        )
+        repairs = segments_data["transcription"]["word_timestamp_repairs"]
+        self.assertGreater(repairs["repair_count"], 0)
+        self.assertEqual(stdout.getvalue().count("[crisper] Repaired "), 1)
+        self.assertNotIn("First repeated repeated.", stdout.getvalue())
+        self.assertFalse(any(self.output_dir.rglob(".staging-*")))
+
+    def test_unrecoverable_timing_failure_preserves_previous_revision_and_project(self):
+        response = self.repaired_response()
+
+        class SuccessfulAdapter:
+            def __init__(adapter_self, _root):
+                adapter_self.response = response
+
+            def probe(adapter_self):
+                return {}
+
+            def transcribe(adapter_self, *_args, **_kwargs):
+                return copy.deepcopy(adapter_self.response)
+
+        self.run_pipeline_with(SuccessfulAdapter)
+        project_dir = next(self.output_dir.glob("sample--*"))
+        before = {
+            path.relative_to(project_dir): path.read_bytes()
+            for path in project_dir.rglob("*")
+            if path.is_file()
+        }
+
+        class FailingAdapter:
+            def __init__(adapter_self, _root):
+                pass
+
+            def probe(adapter_self):
+                return {}
+
+            def transcribe(adapter_self, *_args, **_kwargs):
+                worker.normalize_word_timestamps(
+                    [{"word": "fatal", "start": 2.0, "end": 0.1}],
+                    "fatal",
+                    4.5,
+                )
+
+        with self.assertRaises(worker.TranscriptionError):
+            self.run_pipeline_with(FailingAdapter)
+
+        after = {
+            path.relative_to(project_dir): path.read_bytes()
+            for path in project_dir.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
+        self.assertFalse(any(self.output_dir.rglob(".staging-*")))
+
+    def test_revision_storage_preserves_a_decoded_middle_sentence(self):
+        phrase = "I am here because this sentence must survive."
+        native_text = f"Before. {phrase} After."
+        tokens = native_text.split()
+        starts = [150.0] + [168.2 + index * 0.6 for index in range(8)] + [208.2]
+        response = make_response(self.settings)
+        response["transcription"].update(
+            {
+                "text": native_text,
+                "duration": 220.0,
+                "chunks": None,
+                "words": [
+                    {
+                        "index": index,
+                        "word": token,
+                        "start": starts[index],
+                        "end": starts[index] + 0.4,
+                    }
+                    for index, token in enumerate(tokens)
+                ],
+            }
+        )
+        validated = backend.validate_transcribe_response(response, self.settings)
+
+        class SuccessfulAdapter:
+            def __init__(adapter_self, _root):
+                adapter_self.response = validated
+
+            def probe(adapter_self):
+                return {}
+
+            def transcribe(adapter_self, *_args, **_kwargs):
+                return copy.deepcopy(adapter_self.response)
+
+        self.run_pipeline_with(SuccessfulAdapter)
+
+        result_dir = next(
+            self.output_dir.glob("sample--*/crisperwhisper/*")
+        )
+        committed = json.loads(
+            (result_dir / "segments.json").read_text(encoding="utf-8")
+        )
+        committed_text = " ".join(
+            segment["text"] for segment in committed["segments"]
+        )
+
+        self.assertEqual(committed_text, native_text)
+        self.assertIn(phrase, committed_text)
+
+    def test_successful_coverage_fallback_metadata_commits_atomically(self):
+        response = make_response(self.settings)
+        response["settings"]["effective"]["longform"]["strategy"] = "chunked_lcs"
+        response["transcription"]["longform_coverage"] = make_coverage_metadata(
+            fallback=True
+        )
+        validated = backend.validate_transcribe_response(response, self.settings)
+
+        class SuccessfulAdapter:
+            def __init__(adapter_self, _root):
+                adapter_self.response = validated
+
+            def probe(adapter_self):
+                return {}
+
+            def transcribe(adapter_self, *_args, **_kwargs):
+                return copy.deepcopy(adapter_self.response)
+
+        self.run_pipeline_with(SuccessfulAdapter)
+        result_dir = next(self.output_dir.glob("sample--*/crisperwhisper/*"))
+        committed = json.loads(
+            (result_dir / "segments.json").read_text(encoding="utf-8")
+        )
+        coverage = committed["transcription"]["longform_coverage"]
+        self.assertEqual(coverage["selected_strategy"], "chunked_lcs")
+        self.assertEqual(coverage["remaining_speech_active_gap_count"], 0)
+        self.assertFalse(any(self.output_dir.rglob(".staging-*")))
+
+    def test_successful_targeted_recovery_metadata_commits_atomically(self):
+        response = make_response(self.settings)
+        response["settings"]["effective"]["longform"][
+            "strategy"
+        ] = "continuation_plus_targeted_recovery"
+        response["transcription"][
+            "longform_coverage"
+        ] = make_targeted_coverage_metadata()
+        validated = backend.validate_transcribe_response(response, self.settings)
+
+        class SuccessfulAdapter:
+            def __init__(adapter_self, _root):
+                adapter_self.response = validated
+
+            def probe(adapter_self):
+                return {}
+
+            def transcribe(adapter_self, *_args, **_kwargs):
+                return copy.deepcopy(adapter_self.response)
+
+        self.run_pipeline_with(SuccessfulAdapter)
+        result_dir = next(self.output_dir.glob("sample--*/crisperwhisper/*"))
+        committed = json.loads(
+            (result_dir / "segments.json").read_text(encoding="utf-8")
+        )
+        coverage = committed["transcription"]["longform_coverage"]
+        self.assertEqual(
+            coverage["selected_strategy"],
+            "continuation_plus_targeted_recovery",
+        )
+        self.assertEqual(
+            coverage["targeted_recovery"]["unresolved_gap_count"],
+            0,
+        )
+        self.assertFalse(any(self.output_dir.rglob(".staging-*")))
+
+    def test_coverage_failure_leaves_previous_revision_and_project_unchanged(self):
+        response = self.repaired_response()
+        diagnostic_details = make_coverage_failure_diagnostic()
+
+        class SuccessfulAdapter:
+            def __init__(adapter_self, _root):
+                adapter_self.response = response
+
+            def probe(adapter_self):
+                return {}
+
+            def transcribe(adapter_self, *_args, **_kwargs):
+                return copy.deepcopy(adapter_self.response)
+
+        self.run_pipeline_with(SuccessfulAdapter)
+        project_dir = next(self.output_dir.glob("sample--*"))
+        before = {
+            path.relative_to(project_dir): path.read_bytes()
+            for path in project_dir.rglob("*")
+            if path.is_file()
+        }
+
+        class CoverageFailureAdapter:
+            def __init__(adapter_self, _root):
+                pass
+
+            def probe(adapter_self):
+                return {}
+
+            def transcribe(adapter_self, *_args, **_kwargs):
+                raise backend.CrisperWhisperRuntimeError(
+                    "CrisperWhisper long-form coverage remained incomplete after chunked LCS recovery.",
+                    diagnostic_details=diagnostic_details,
+                )
+
+        with self.assertRaisesRegex(backend.CrisperWhisperRuntimeError, "coverage") as raised:
+            self.run_pipeline_with(CoverageFailureAdapter)
+        self.assertEqual(raised.exception.diagnostic_details, diagnostic_details)
+
+        after = {
+            path.relative_to(project_dir): path.read_bytes()
+            for path in project_dir.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
+        self.assertFalse(any(self.output_dir.rglob(".staging-*")))
+
+    def test_incomplete_targeted_recovery_leaves_previous_revision_unchanged(self):
+        response = self.repaired_response()
+
+        class SuccessfulAdapter:
+            def __init__(adapter_self, _root):
+                adapter_self.response = response
+
+            def probe(adapter_self):
+                return {}
+
+            def transcribe(adapter_self, *_args, **_kwargs):
+                return copy.deepcopy(adapter_self.response)
+
+        self.run_pipeline_with(SuccessfulAdapter)
+        project_dir = next(self.output_dir.glob("sample--*"))
+        before = {
+            path.relative_to(project_dir): path.read_bytes()
+            for path in project_dir.rglob("*")
+            if path.is_file()
+        }
+        details = make_coverage_failure_diagnostic()
+        targeted = make_targeted_recovery_metadata(complete=False)
+        details["fallback_rejection_reason"] = "targeted_recovery_incomplete"
+        details["remaining_speech_active_gap_count"] = targeted[
+            "unresolved_gap_count"
+        ]
+        details["remaining_speech_active_gap_duration"] = targeted[
+            "unresolved_gap_duration"
+        ]
+        details["candidate_audits"]["continuation"] = copy.deepcopy(
+            targeted["final_coverage_audit"]
+        )
+        details["candidate_audits"]["continuation"][
+            "speech_active_gap_count"
+        ] = targeted["target_gap_count"]
+        details["candidate_audits"]["continuation"][
+            "speech_active_gap_duration"
+        ] = targeted["target_gap_duration"]
+        details["candidate_audits"]["continuation"][
+            "speech_active_gap_ranges"
+        ] = [
+            {
+                "start": 1.0,
+                "end": 12.0,
+                "duration": 11.0,
+                "active_seconds": 2.0,
+                "active_blocks": 2,
+            }
+        ]
+        details["targeted_recovery"] = targeted
+
+        class FailingAdapter:
+            def __init__(adapter_self, _root):
+                pass
+
+            def probe(adapter_self):
+                return {}
+
+            def transcribe(adapter_self, *_args, **_kwargs):
+                raise backend.CrisperWhisperRuntimeError(
+                    "CrisperWhisper long-form coverage remained incomplete after targeted short-window recovery.",
+                    diagnostic_details=details,
+                )
+
+        with self.assertRaises(backend.CrisperWhisperRuntimeError):
+            self.run_pipeline_with(FailingAdapter)
+        after = {
+            path.relative_to(project_dir): path.read_bytes()
+            for path in project_dir.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
+        self.assertFalse(any(self.output_dir.rglob(".staging-*")))
+
+    def test_timestamp_overlap_failure_preserves_previous_revision_and_diagnostics(self):
+        response = self.repaired_response()
+        diagnostic_details = make_timestamp_diagnostic()
+
+        class SuccessfulAdapter:
+            def __init__(adapter_self, _root):
+                adapter_self.response = response
+
+            def probe(adapter_self):
+                return {}
+
+            def transcribe(adapter_self, *_args, **_kwargs):
+                return copy.deepcopy(adapter_self.response)
+
+        self.run_pipeline_with(SuccessfulAdapter)
+        project_dir = next(self.output_dir.glob("sample--*"))
+        before = {
+            path.relative_to(project_dir): path.read_bytes()
+            for path in project_dir.rglob("*")
+            if path.is_file()
+        }
+
+        class TimestampFailureAdapter:
+            def __init__(adapter_self, _root):
+                pass
+
+            def probe(adapter_self):
+                return {}
+
+            def transcribe(adapter_self, *_args, **_kwargs):
+                raise backend.CrisperWhisperRuntimeError(
+                    "CrisperWhisper returned overlapping word timestamps that cannot be reconciled safely.",
+                    diagnostic_details=diagnostic_details,
+                )
+
+        with self.assertRaises(backend.CrisperWhisperRuntimeError) as raised:
+            self.run_pipeline_with(TimestampFailureAdapter)
+        self.assertEqual(raised.exception.diagnostic_details, diagnostic_details)
+
+        after = {
+            path.relative_to(project_dir): path.read_bytes()
+            for path in project_dir.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
+        self.assertFalse(any(self.output_dir.rglob(".staging-*")))
+
+    def test_coverage_cancellation_leaves_previous_revision_and_project_unchanged(self):
+        response = self.repaired_response()
+
+        class SuccessfulAdapter:
+            def __init__(adapter_self, _root):
+                adapter_self.response = response
+
+            def probe(adapter_self):
+                return {}
+
+            def transcribe(adapter_self, *_args, **_kwargs):
+                return copy.deepcopy(adapter_self.response)
+
+        self.run_pipeline_with(SuccessfulAdapter)
+        project_dir = next(self.output_dir.glob("sample--*"))
+        before = {
+            path.relative_to(project_dir): path.read_bytes()
+            for path in project_dir.rglob("*")
+            if path.is_file()
+        }
+
+        class CancelledAdapter:
+            def __init__(adapter_self, _root):
+                pass
+
+            def probe(adapter_self):
+                return {}
+
+            def transcribe(adapter_self, *_args, **_kwargs):
+                raise KeyboardInterrupt
+
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_pipeline_with(CancelledAdapter)
+
+        after = {
+            path.relative_to(project_dir): path.read_bytes()
+            for path in project_dir.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
+        self.assertFalse(any(self.output_dir.rglob(".staging-*")))
 
 
 if __name__ == "__main__":
