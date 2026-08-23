@@ -10,6 +10,8 @@ from bisect import bisect_right
 from split_audio import (
     AUDIO_EXTS as _PIPELINE_AUDIO_EXTS,
     PROGRESS_PREFIX as _PIPELINE_PROGRESS_PREFIX,
+    RESULT_PREFIX as _PIPELINE_RESULT_PREFIX,
+    RUN_SUMMARY_PREFIX as _PIPELINE_RUN_SUMMARY_PREFIX,
     VIDEO_EXTS as _PIPELINE_VIDEO_EXTS,
     build_source_identity,
     speaker_name_record_path,
@@ -1288,7 +1290,7 @@ _DEFAULTS = {
     "crisperwhisper_mode": "verbatim",
 }
 _MODEL_CHOICES = ["tiny","base","small","medium","large-v2","large-v3","large-v3-turbo","distil-large-v3"]
-_TRANSCRIPTION_BACKENDS = ("whisperx", "crisperwhisper")
+_TRANSCRIPTION_BACKENDS = ("whisperx", "crisperwhisper", "both")
 _CRISPER_MODEL_CHOICES = tuple(_CRISPER_OFFICIAL_MODEL_IDS)
 _CRISPER_MODE_CHOICES = ("verbatim", "intended")
 _CRISPER_LICENSE_URL = "https://huggingface.co/nyralabs/CrisperWhisper2.0_medium/blob/main/LICENSE.md"
@@ -2207,6 +2209,77 @@ def _preflight_review_result(speakers_json, segments_json):
     return preflight_result_pair(speakers_json, segments_json)
 
 
+@dataclass(frozen=True)
+class ReviewResultDisplay:
+    leading_text: str
+    status_text: str
+    trailing_text: str
+    status_style: str
+
+    @property
+    def text(self):
+        return f"{self.leading_text}{self.status_text}{self.trailing_text}"
+
+
+def _review_result_timestamp(value):
+    if not isinstance(value, datetime.datetime):
+        return None
+    try:
+        local_value = value.astimezone() if value.tzinfo is not None else value
+        hour = local_value.strftime("%I").lstrip("0") or "0"
+        return (
+            f"{local_value.strftime('%b')} {local_value.day}, {local_value.year} "
+            f"{hour}:{local_value.strftime('%M %p')}"
+        )
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def review_result_display(descriptor):
+    """Format only metadata carried by the exact loaded result descriptor."""
+
+    if descriptor is None:
+        return ReviewResultDisplay(
+            "Result metadata unavailable • ",
+            "Status unknown",
+            "",
+            "secondary",
+        )
+    engine = (
+        "CrisperWhisper"
+        if descriptor.engine == "crisperwhisper"
+        else "WhisperX" if descriptor.engine == "whisperx" else "Engine unknown"
+    )
+    model = descriptor.model or "Model unknown"
+    leading_parts = [engine, model]
+    if descriptor.engine == "crisperwhisper" and descriptor.mode:
+        leading_parts.append(str(descriptor.mode).strip().title())
+
+    if descriptor.layout == "legacy":
+        status_text = "Legacy result"
+        status_style = "secondary"
+    elif descriptor.status == "incomplete":
+        status_text = "Incomplete"
+        status_style = "warning"
+    elif descriptor.status == "complete":
+        status_text = "Complete"
+        status_style = "success"
+    else:
+        status_text = "Status unknown"
+        status_style = "secondary"
+
+    timestamp = _review_result_timestamp(
+        descriptor.created_at or descriptor.modified_at
+    )
+    trailing_text = f" • {timestamp}" if timestamp else ""
+    return ReviewResultDisplay(
+        " • ".join(leading_parts) + " • ",
+        status_text,
+        trailing_text,
+        status_style,
+    )
+
+
 class NamingWorkspace(ttk.Frame):
     _LEFT_RATIO_DEFAULT = 0.40
     _LEFT_RATIO_MIN = 0.10
@@ -2313,14 +2386,26 @@ class NamingWorkspace(ttk.Frame):
             isinstance(result_descriptor, ResultDescriptor)
             and result_descriptor.file_identity == self.result_identity
         )
+        loaded_descriptor = result_descriptor if descriptor_matches else None
+        if loaded_descriptor is None:
+            try:
+                candidate_descriptor = descriptor_from_json_pair(
+                    self.speakers_json,
+                    self.segments_json,
+                )
+                if candidate_descriptor.file_identity == self.result_identity:
+                    loaded_descriptor = candidate_descriptor
+            except Exception:
+                loaded_descriptor = None
+        self.result_descriptor = loaded_descriptor
         self._source_path = (
-            result_descriptor.source_path
-            if descriptor_matches and result_descriptor.source_path is not None
+            loaded_descriptor.source_path
+            if loaded_descriptor is not None and loaded_descriptor.source_path is not None
             else self.segments_data.get("source_path")
         )
         self._source_identity = (
-            result_descriptor.source_identity
-            if descriptor_matches and result_descriptor.source_identity is not None
+            loaded_descriptor.source_identity
+            if loaded_descriptor is not None and loaded_descriptor.source_identity is not None
             else self.segments_data.get("source_identity")
         )
         self._subtitle_paths, self._subtitle_choices = self._discover_subtitle_files()
@@ -2341,7 +2426,7 @@ class NamingWorkspace(ttk.Frame):
         )
         main.pack(fill="both", expand=True)
         main.columnconfigure(0, weight=1)
-        main.rowconfigure(2, weight=1)
+        main.rowconfigure(3, weight=1)
         ttk.Label(
             main,
             text="Name Speakers",
@@ -2351,14 +2436,38 @@ class NamingWorkspace(ttk.Frame):
             main,
             text=f"{self.title_name} — assign names and review the transcript",
             style=MIDNIGHTSTUDIO_STYLES["subtitle"],
-        ).grid(row=1, column=0, sticky="w", pady=(2, 10))
+        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        self.result_metadata_frame = ttk.Frame(
+            main,
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
+        self.result_metadata_frame.grid(row=2, column=0, sticky="w", pady=(2, 10))
+        self.lbl_result_metadata_leading = ttk.Label(
+            self.result_metadata_frame,
+            text="",
+            style=MIDNIGHTSTUDIO_STYLES["subtitle"],
+        )
+        self.lbl_result_metadata_leading.pack(side="left")
+        self.lbl_result_metadata_status = tb.Label(
+            self.result_metadata_frame,
+            text="",
+            bootstyle="secondary",
+        )
+        self.lbl_result_metadata_status.pack(side="left")
+        self.lbl_result_metadata_trailing = ttk.Label(
+            self.result_metadata_frame,
+            text="",
+            style=MIDNIGHTSTUDIO_STYLES["subtitle"],
+        )
+        self.lbl_result_metadata_trailing.pack(side="left")
+        self.set_result_descriptor(self.result_descriptor)
         self._workspace_paned = ttk.PanedWindow(
             main,
             orient="horizontal",
             style=MIDNIGHTSTUDIO_STYLES["review_paned"],
             takefocus=True,
         )
-        self._workspace_paned.grid(row=2, column=0, sticky="nsew")
+        self._workspace_paned.grid(row=3, column=0, sticky="nsew")
         left = ttk.Frame(
             self._workspace_paned,
             padding=(0, 0, 6, 0),
@@ -2857,6 +2966,28 @@ class NamingWorkspace(ttk.Frame):
         self._install_dirty_tracking()
         self._capture_clean_baseline()
         self.bind("<Destroy>", self._on_workspace_destroyed, add="+")
+
+    def set_result_descriptor(self, descriptor):
+        """Refresh the header from the exact descriptor owned by this workspace."""
+
+        if (
+            isinstance(descriptor, ResultDescriptor)
+            and descriptor.file_identity == self.result_identity
+        ):
+            self.result_descriptor = descriptor
+        elif descriptor is not None:
+            return False
+        else:
+            self.result_descriptor = None
+        display = review_result_display(self.result_descriptor)
+        if hasattr(self, "lbl_result_metadata_leading"):
+            self.lbl_result_metadata_leading.configure(text=display.leading_text)
+            self.lbl_result_metadata_status.configure(
+                text=display.status_text,
+                bootstyle=display.status_style,
+            )
+            self.lbl_result_metadata_trailing.configure(text=display.trailing_text)
+        return True
 
     def start(self):
         """Start host-dependent services after the workspace has been placed."""
@@ -6504,6 +6635,7 @@ class ReviewNamePage(ttk.Frame):
             and result_identity == self.current_result_identity
         ):
             self.current_result_descriptor = current_descriptor
+            self.workspace.set_result_descriptor(current_descriptor)
             self._set_incomplete_warning(current_descriptor)
             self.on_activated()
             return True
@@ -6576,8 +6708,7 @@ class ReviewNamePage(ttk.Frame):
                 result_preflight=verified_preflight,
                 result_descriptor=(
                     current_descriptor
-                    if requested_descriptor is not None
-                    and current_descriptor.file_identity == verified_preflight.identity
+                    if current_descriptor.file_identity == verified_preflight.identity
                     else None
                 ),
             )
@@ -6675,6 +6806,7 @@ class ReviewNamePage(ttk.Frame):
             except Exception as exc:
                 self._report(f"[review] Could not refresh result status after Apply: {exc}")
             self._set_incomplete_warning(self.current_result_descriptor)
+            self.workspace.set_result_descriptor(self.current_result_descriptor)
             self.workspace.refresh_available_subtitles()
         if self._apply_complete_callback is not None:
             self._apply_complete_callback()
@@ -6734,6 +6866,9 @@ class App(ttk.Frame):
         self.queue = queue.Queue()
         self.input_files = []
         self.pending_review_result = None
+        self._run_review_results = []
+        self._run_summary = None
+        self._active_run_backend = None
         self._application_closing = False
         self._main_window_normal_geometry = None
         self._main_window_tracking_enabled = False
@@ -6965,10 +7100,18 @@ class App(ttk.Frame):
             value="crisperwhisper",
             command=self._on_transcription_engine_changed,
         ).pack(side="left", padx=(12, 0))
+        ttk.Radiobutton(
+            engine_options,
+            text="Both",
+            variable=self.var_transcription_backend,
+            value="both",
+            command=self._on_transcription_engine_changed,
+        ).pack(side="left", padx=(12, 0))
 
         self.whisperx_model_controls = ttk.Frame(transcription_settings)
         self.whisperx_model_controls.grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
-        ttk.Label(self.whisperx_model_controls, text="Model").pack(side="left", padx=(0, 6))
+        self.lbl_whisperx_model = ttk.Label(self.whisperx_model_controls, text="Model")
+        self.lbl_whisperx_model.pack(side="left", padx=(0, 6))
         self.cmb_model = ttk.Combobox(
             self.whisperx_model_controls,
             textvariable=self.var_model,
@@ -6981,7 +7124,8 @@ class App(ttk.Frame):
 
         self.crisper_model_controls = ttk.Frame(transcription_settings)
         self.crisper_model_controls.grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
-        ttk.Label(self.crisper_model_controls, text="Model").pack(side="left", padx=(0, 6))
+        self.lbl_crisper_model = ttk.Label(self.crisper_model_controls, text="Model")
+        self.lbl_crisper_model.pack(side="left", padx=(0, 6))
         self.cmb_crisper_model = ttk.Combobox(
             self.crisper_model_controls,
             textvariable=self.var_crisper_model,
@@ -7406,15 +7550,66 @@ class App(ttk.Frame):
         return backend
 
     def _update_transcription_engine_controls(self, *, show_notice=True):
+        def show(widget, **options):
+            try:
+                widget.grid(**options)
+            except TypeError:
+                # Lightweight test doubles may only model visibility.
+                widget.grid()
+
+        def set_label(widget_name, text):
+            widget = getattr(self, widget_name, None)
+            if widget is not None:
+                widget.configure(text=text)
+
         backend = self._current_transcription_backend()
         if backend == "crisperwhisper":
             self.whisperx_model_controls.grid_remove()
-            self.crisper_model_controls.grid()
+            show(
+                self.crisper_model_controls,
+                row=1,
+                column=0,
+                columnspan=2,
+                sticky="w",
+                padx=0,
+                pady=(10, 0),
+            )
+            set_label("lbl_crisper_model", "Model")
+            if show_notice:
+                self._show_crisper_license_notice_once()
+        elif backend == "both":
+            show(
+                self.whisperx_model_controls,
+                row=1,
+                column=0,
+                columnspan=2,
+                sticky="w",
+                pady=(10, 0),
+            )
+            show(
+                self.crisper_model_controls,
+                row=1,
+                column=2,
+                columnspan=5,
+                sticky="w",
+                padx=(12, 0),
+                pady=(10, 0),
+            )
+            set_label("lbl_whisperx_model", "WhisperX model")
+            set_label("lbl_crisper_model", "CrisperWhisper model")
             if show_notice:
                 self._show_crisper_license_notice_once()
         else:
             self.crisper_model_controls.grid_remove()
-            self.whisperx_model_controls.grid()
+            show(
+                self.whisperx_model_controls,
+                row=1,
+                column=0,
+                columnspan=2,
+                sticky="w",
+                pady=(10, 0),
+            )
+            set_label("lbl_whisperx_model", "Model")
 
     def _on_transcription_engine_changed(self, *_):
         self._update_transcription_engine_controls(show_notice=True)
@@ -7534,6 +7729,7 @@ class App(ttk.Frame):
             "Cancelled": "secondary",
             "Complete": "success",
             "Completed with warnings": "warning",
+            "Partial success": "warning",
             "Failed": "danger",
         }
         self._runtime_status = status
@@ -7550,7 +7746,7 @@ class App(ttk.Frame):
             self.btn_cancel.configure(state="disabled")
             if status == "Ready":
                 self._reset_progress("Ready")
-            elif status in ("Complete", "Completed with warnings"):
+            elif status in ("Complete", "Completed with warnings", "Partial success"):
                 self._last_progress = 100
                 self._set_progress_display(status, 100)
             elif status in ("Failed", "Cancelled"):
@@ -7596,6 +7792,7 @@ class App(ttk.Frame):
             file_percent = payload["file_percent"]
             file_index = payload["file_index"]
             file_total = payload["file_total"]
+            overall_percent = payload.get("overall_percent")
             if not isinstance(phase, str) or not phase.strip():
                 raise ValueError
             if not isinstance(label, str) or not label.strip():
@@ -7608,12 +7805,34 @@ class App(ttk.Frame):
                 raise ValueError
             if not (0 <= file_percent <= 100 and file_total >= 1 and 1 <= file_index <= file_total):
                 raise ValueError
+            if overall_percent is not None:
+                engine = payload.get("engine")
+                engine_index = payload.get("engine_index")
+                engine_total = payload.get("engine_total")
+                if engine not in {"whisperx", "crisperwhisper"}:
+                    raise ValueError
+                if (
+                    isinstance(overall_percent, bool)
+                    or not isinstance(overall_percent, (int, float))
+                    or not 0 <= overall_percent <= 100
+                    or isinstance(engine_index, bool)
+                    or not isinstance(engine_index, int)
+                    or isinstance(engine_total, bool)
+                    or not isinstance(engine_total, int)
+                    or engine_total < 1
+                    or not 1 <= engine_index <= engine_total
+                ):
+                    raise ValueError
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             return False
 
         if self.cancel_requested:
             return True
-        overall = ((file_index - 1) + file_percent / 100) / file_total * 100
+        overall = (
+            overall_percent
+            if overall_percent is not None
+            else ((file_index - 1) + file_percent / 100) / file_total * 100
+        )
         percent = min(99, max(0, int(round(overall))))
         if percent < self._last_progress:
             return True
@@ -7715,7 +7934,7 @@ class App(ttk.Frame):
                 parent=self.winfo_toplevel(),
             )
         if (
-            self._current_transcription_backend() == "crisperwhisper"
+            self._current_transcription_backend() in {"crisperwhisper", "both"}
             and not self._crisper_license_acknowledged
         ):
             self.after_idle(self._show_crisper_license_notice_once)
@@ -8015,6 +8234,9 @@ class App(ttk.Frame):
             self.log(f"[validation] Invalid CrisperWhisper setting: {exc}")
             messagebox.showwarning("Invalid CrisperWhisper settings", str(exc))
             return
+        backend = self._current_transcription_backend()
+        if backend in {"crisperwhisper", "both"} and not self._crisper_license_acknowledged:
+            self._show_crisper_license_notice_once()
         if not self.on_save():
             self._set_runtime_state("Ready")
             return
@@ -8022,24 +8244,30 @@ class App(ttk.Frame):
             return
         self._reset_progress("Starting")
         context = {
-            "backend": self._current_transcription_backend(),
+            "backend": backend,
             "whisperx_model": self.var_model.get().strip(),
             "crisper_model": self.var_crisper_model.get().strip(),
             "crisper_mode": self.var_crisper_mode.get().strip(),
             "workers": self.var_workers.get(),
             "input_files": [str(path) for path in self._effective_input_files()],
         }
-        if context["backend"] == "crisperwhisper":
+        self.pending_review_result = None
+        self._run_review_results = []
+        self._run_summary = None
+        self._active_run_backend = backend
+        if context["backend"] in {"crisperwhisper", "both"}:
             self._begin_crisper_launch(context)
         else:
             self._launch_pipeline_process(context)
 
     def _begin_crisper_launch(self, context):
+        backend = context.get("backend", "crisperwhisper")
         self._crisper_launch_waiting = True
         self._set_runtime_state("Running")
         self._set_progress_display("Checking CrisperWhisper runtime", 0)
+        prefix = "[both]" if backend == "both" else "[crisper]"
         self.log(
-            "[crisper] Checking the separate venv-crisper environment before launch "
+            f"{prefix} Checking the separate venv-crisper environment before launch "
             f"({context['crisper_model']}, {context['crisper_mode']})."
         )
 
@@ -8052,14 +8280,20 @@ class App(ttk.Frame):
                 return
             if response is None:
                 self._set_runtime_state("Failed")
-                self.log(f"[crisper] Runtime check failed: {error}")
+                self.log(f"{prefix} CrisperWhisper runtime check failed: {error}")
+                unavailable_message = self._crisper_unavailable_message(error)
+                if backend == "both":
+                    unavailable_message += (
+                        "\n\nNo WhisperX pass was started. Select WhisperX as the "
+                        "transcription engine to process without CrisperWhisper."
+                    )
                 messagebox.showerror(
                     "CrisperWhisper unavailable",
-                    self._crisper_unavailable_message(error),
+                    unavailable_message,
                     parent=self.winfo_toplevel(),
                 )
                 return
-            self.log("[crisper] Isolated CrisperWhisper runtime is ready.")
+            self.log(f"{prefix} Isolated CrisperWhisper runtime is ready.")
             self._launch_pipeline_process(context, crisper_probe=response)
 
         self._start_crisper_probe(probe_complete, allow_cached=False)
@@ -8072,6 +8306,14 @@ class App(ttk.Frame):
             self.log(
                 f"[run] Launching CrisperWhisper model '{context['crisper_model']}' "
                 f"in {context['crisper_mode']} mode — device {gpu}"
+            )
+        elif backend == "both":
+            runtime = crisper_probe.get("runtime", {}) if isinstance(crisper_probe, dict) else {}
+            gpu = runtime.get("gpu_name") or "RTX GPU"
+            self.log(
+                f"[run] Launching sequential Both job: WhisperX '{context['whisperx_model']}' "
+                f"then CrisperWhisper '{context['crisper_model']}' "
+                f"({context['crisper_mode']}) — device {gpu}"
             )
         else:
             model = context["whisperx_model"]
@@ -8089,7 +8331,7 @@ class App(ttk.Frame):
             cmd.append("--inputs")
             cmd.extend(context["input_files"])
         env = None
-        if backend == "crisperwhisper" and crisper_probe is not None:
+        if backend in {"crisperwhisper", "both"} and crisper_probe is not None:
             env = os.environ.copy()
             env[_CRISPER_PREFLIGHT_ENV_VAR] = json.dumps(
                 crisper_probe,
@@ -8126,6 +8368,26 @@ class App(ttk.Frame):
             if proc and proc.stdout:
                 for line in proc.stdout:
                     msg = line.rstrip()
+                    if msg.startswith(_PIPELINE_RESULT_PREFIX):
+                        try:
+                            payload = json.loads(msg[len(_PIPELINE_RESULT_PREFIX):])
+                            if not isinstance(payload, dict):
+                                raise ValueError("result event is not an object")
+                            self.queue.put(("result", payload))
+                            continue
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            pass
+                    if msg.startswith(_PIPELINE_RUN_SUMMARY_PREFIX):
+                        try:
+                            payload = json.loads(
+                                msg[len(_PIPELINE_RUN_SUMMARY_PREFIX):]
+                            )
+                            if not isinstance(payload, dict):
+                                raise ValueError("run summary is not an object")
+                            self.queue.put(("run_summary", payload))
+                            continue
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            pass
                     self.queue.put(("log", msg))
                     if msg.startswith("[speakers-json]"):
                         try:
@@ -8169,6 +8431,106 @@ class App(ttk.Frame):
                 )
             )
 
+    def _remember_run_review_result(self, descriptor):
+        if not isinstance(descriptor, ResultDescriptor):
+            raise TypeError("Expected a result descriptor.")
+        if not hasattr(self, "_run_review_results"):
+            self._run_review_results = []
+        for index, existing in enumerate(self._run_review_results):
+            if existing.file_identity == descriptor.file_identity:
+                self._run_review_results[index] = descriptor
+                self.pending_review_result = descriptor
+                return
+        self._run_review_results.append(descriptor)
+        self.pending_review_result = descriptor
+
+    def _record_result_event(self, payload):
+        if not isinstance(payload, dict):
+            raise ValueError("Result event must be a JSON object.")
+        engine = payload.get("engine")
+        status = payload.get("status")
+        speakers_json = payload.get("speakers_json")
+        segments_json = payload.get("segments_json")
+        file_index = payload.get("file_index")
+        file_total = payload.get("file_total")
+        if engine not in {"whisperx", "crisperwhisper"}:
+            raise ValueError("Result event has an unsupported engine.")
+        if status not in {"complete", "incomplete"}:
+            raise ValueError("Result event has an unsupported status.")
+        if not isinstance(speakers_json, str) or not speakers_json.strip():
+            raise ValueError("Result event is missing speakers.json.")
+        if not isinstance(segments_json, str) or not segments_json.strip():
+            raise ValueError("Result event is missing segments.json.")
+        if (
+            isinstance(file_index, bool)
+            or not isinstance(file_index, int)
+            or isinstance(file_total, bool)
+            or not isinstance(file_total, int)
+            or file_total < 1
+            or not 1 <= file_index <= file_total
+        ):
+            raise ValueError("Result event has invalid file ordering.")
+        descriptor = ReviewNamePage._validated_result_descriptor(
+            self._resolve_path(speakers_json),
+            self._resolve_path(segments_json),
+            pending=True,
+        )
+        if descriptor.engine != engine:
+            raise ValueError(
+                "Result event engine does not match the committed manifest."
+            )
+        if descriptor.status != status:
+            raise ValueError(
+                "Result event status does not match the committed manifest."
+            )
+        self._remember_run_review_result(descriptor)
+
+    def _record_run_summary(self, payload):
+        if not isinstance(payload, dict) or payload.get("mode") != "both":
+            raise ValueError("Run summary is not a Both-job summary.")
+        status = payload.get("status")
+        if status not in {
+            "success",
+            "success_with_warnings",
+            "partial_success",
+            "failure",
+        }:
+            raise ValueError("Run summary has an unsupported status.")
+        for key in ("complete", "incomplete", "result_count"):
+            value = payload.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError("Run summary contains an invalid result count.")
+        if payload["complete"] + payload["incomplete"] != payload["result_count"]:
+            raise ValueError("Run summary result counts do not agree.")
+        self._run_summary = dict(payload)
+
+    def _select_run_review_result(self):
+        results = list(getattr(self, "_run_review_results", ()))
+        if not results:
+            pending = getattr(self, "pending_review_result", None)
+            return pending if isinstance(pending, ResultDescriptor) else None
+        if getattr(self, "_active_run_backend", None) != "both":
+            return results[-1]
+        complete_whisperx = [
+            descriptor
+            for descriptor in results
+            if descriptor.engine == "whisperx" and descriptor.status == "complete"
+        ]
+        if complete_whisperx:
+            return complete_whisperx[-1]
+        usable_crisper = [
+            descriptor
+            for descriptor in results
+            if descriptor.engine == "crisperwhisper"
+            and descriptor.status in {"complete", "incomplete"}
+        ]
+        if usable_crisper:
+            return usable_crisper[-1]
+        complete_results = [
+            descriptor for descriptor in results if descriptor.status == "complete"
+        ]
+        return complete_results[-1] if complete_results else results[-1]
+
     def _poll_queue(self):
         try:
             while True:
@@ -8180,13 +8542,24 @@ class App(ttk.Frame):
                             self.log(event[1])
                     elif kind == "speakers":
                         try:
-                            self.pending_review_result = ReviewNamePage._validated_result_descriptor(
+                            descriptor = ReviewNamePage._validated_result_descriptor(
                                 event[1],
                                 event[2],
                                 pending=True,
                             )
+                            self._remember_run_review_result(descriptor)
                         except Exception as exc:
                             self.log(f"[review] Ignored an invalid speaker result: {exc}")
+                    elif kind == "result":
+                        try:
+                            self._record_result_event(event[1])
+                        except Exception as exc:
+                            self.log(f"[review] Ignored an invalid result event: {exc}")
+                    elif kind == "run_summary":
+                        try:
+                            self._record_run_summary(event[1])
+                        except Exception as exc:
+                            self.log(f"[both] Ignored an invalid run summary: {exc}")
                     elif kind == "process_finished":
                         finished_process_id = event[2] if len(event) > 2 else None
                         self.proc = None
@@ -8209,18 +8582,24 @@ class App(ttk.Frame):
                         if self.cancel_requested:
                             self._set_runtime_state("Cancelled")
                         elif event[1] == 0:
-                            pending_result = getattr(
-                                self, "pending_review_result", None
-                            )
+                            pending_result = self._select_run_review_result()
+                            self.pending_review_result = pending_result
                             completed_with_warnings = (
                                 isinstance(pending_result, ResultDescriptor)
                                 and pending_result.status == "incomplete"
                             )
-                            self._set_runtime_state(
-                                "Completed with warnings"
-                                if completed_with_warnings
-                                else "Complete"
+                            summary_status = (
+                                getattr(self, "_run_summary", {}).get("status")
+                                if isinstance(getattr(self, "_run_summary", None), dict)
+                                else None
                             )
+                            if summary_status == "partial_success":
+                                runtime_status = "Partial success"
+                            elif summary_status == "success_with_warnings" or completed_with_warnings:
+                                runtime_status = "Completed with warnings"
+                            else:
+                                runtime_status = "Complete"
+                            self._set_runtime_state(runtime_status)
                             self._open_completed_review_result()
                         else:
                             self._set_runtime_state("Failed")
@@ -8400,6 +8779,19 @@ class App(ttk.Frame):
         pending = self._validated_pending_review_result()
         if pending is None:
             self.log("[review] Processing completed, but no valid speaker-review result was reported.")
+            return False
+
+        loaded = self.review_page.current_result_descriptor
+        if (
+            pending.status == "incomplete"
+            and isinstance(loaded, ResultDescriptor)
+            and loaded.status == "complete"
+            and loaded.file_identity != pending.file_identity
+        ):
+            self.log(
+                "[review] The new Incomplete result is ready in Open Result; "
+                "the currently loaded Complete result was not replaced automatically."
+            )
             return False
 
         engine = self._current_ner_engine()

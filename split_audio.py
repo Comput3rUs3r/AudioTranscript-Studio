@@ -10,7 +10,7 @@ Transcript Studio + WhisperX pipeline (v1.6.0)
 """
 from __future__ import annotations
 
-import os, sys, math, time, shlex, yaml, json, subprocess, hashlib, datetime, concurrent.futures, argparse, tempfile, copy
+import os, sys, math, time, shlex, yaml, json, subprocess, hashlib, datetime, concurrent.futures, argparse, tempfile, copy, gc
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -40,6 +40,8 @@ VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
 MEDIA_EXTS = AUDIO_EXTS | VIDEO_EXTS
 SOURCE_IDENTITY_FIELDS = ("path", "size", "mtime_ns", "st_dev", "st_ino")
 PROGRESS_PREFIX = "@@ATS_PROGRESS@@"
+RESULT_PREFIX = "@@ATS_RESULT@@"
+RUN_SUMMARY_PREFIX = "@@ATS_RUN_SUMMARY@@"
 
 
 def emit_progress(
@@ -48,6 +50,11 @@ def emit_progress(
     file_percent: float,
     file_index: int,
     file_total: int,
+    *,
+    engine: Optional[str] = None,
+    engine_index: Optional[int] = None,
+    engine_total: Optional[int] = None,
+    overall_percent: Optional[float] = None,
 ) -> None:
     payload = {
         "phase": phase,
@@ -56,7 +63,49 @@ def emit_progress(
         "file_index": file_index,
         "file_total": file_total,
     }
+    if engine is not None:
+        payload.update(
+            {
+                "engine": engine,
+                "engine_index": engine_index,
+                "engine_total": engine_total,
+                "overall_percent": overall_percent,
+            }
+        )
     print(PROGRESS_PREFIX + json.dumps(payload, separators=(",", ":")), flush=True)
+
+
+def emit_result_event(
+    engine: str,
+    status: str,
+    speakers_json: Path,
+    segments_json: Path,
+    file_index: int,
+    file_total: int,
+) -> None:
+    payload = {
+        "engine": engine,
+        "status": status,
+        "speakers_json": str(speakers_json.resolve()),
+        "segments_json": str(segments_json.resolve()),
+        "file_index": file_index,
+        "file_total": file_total,
+    }
+    print(RESULT_PREFIX + json.dumps(payload, separators=(",", ":")), flush=True)
+
+
+def emit_run_summary(status: str, outcomes: List["PipelineRevisionOutcome"]) -> None:
+    counts = {"complete": 0, "incomplete": 0}
+    for outcome in outcomes:
+        counts[outcome.status] += 1
+    payload = {
+        "mode": "both",
+        "status": status,
+        "complete": counts["complete"],
+        "incomplete": counts["incomplete"],
+        "result_count": len(outcomes),
+    }
+    print(RUN_SUMMARY_PREFIX + json.dumps(payload, separators=(",", ":")), flush=True)
 
 def normalized_source_path(path: Path | str) -> str:
     resolved = Path(path).expanduser().resolve(strict=True)
@@ -319,6 +368,17 @@ class Conf:
     max_speakers: int = 2
     transcription_backend: str = "whisperx"
     crisperwhisper: Dict[str, Any] = field(default_factory=dict)
+    crisperwhisper_license_acknowledged: bool = False
+
+
+@dataclass(frozen=True)
+class PipelineRevisionOutcome:
+    engine: str
+    status: str
+    source: Path
+    result_dir: Path
+    file_index: int
+    file_total: int
 
 def load_conf(path: Path) -> Tuple[Conf, Optional[str]]:
     if not path.exists():
@@ -336,7 +396,8 @@ def load_conf(path: Path) -> Tuple[Conf, Optional[str]]:
         data["compute_type_cuda"] = data["compute_type"]
 
     for bool_key in ("diarize", "slice_audio", "slice_video", "fast_cut_video", 
-                     "merge_all_segments_into_one_folder", "txt_speaker_tags"):
+                     "merge_all_segments_into_one_folder", "txt_speaker_tags",
+                     "crisperwhisper_license_acknowledged"):
         if bool_key in data:
             data[bool_key] = bool(data[bool_key])
 
@@ -590,6 +651,10 @@ def transcribe_configured_backend(
     )
 
     backend_name = normalize_backend_name(cfg.transcription_backend)
+    if backend_name == "both":
+        raise ValueError(
+            "The Both backend must be run through the dual-engine pipeline orchestrator."
+        )
     if backend_name == "whisperx":
         if progress_callback:
             progress_callback("loading_model", "Loading WhisperX model", 12)
@@ -667,6 +732,58 @@ def transcribe_configured_backend(
         progress_callback=progress_callback,
     )
     return result, normalized["transcription"]
+
+
+def preflight_whisperx_runtime() -> None:
+    try:
+        import whisperx
+    except Exception as exc:
+        raise RuntimeError(
+            "The main WhisperX environment is unavailable."
+        ) from exc
+    if not callable(getattr(whisperx, "load_model", None)):
+        raise RuntimeError("The main WhisperX installation is incomplete.")
+
+
+def preflight_pipeline_locations(*paths: Path) -> None:
+    for path in paths:
+        safe_mkdir(path)
+        if not path.is_dir():
+            raise RuntimeError(f"Required pipeline location is not a directory: {path}")
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=path,
+                prefix=".ats-preflight-",
+                suffix=".tmp",
+                delete=False,
+            ) as temporary:
+                temporary_path = Path(temporary.name)
+                temporary.write(b"ok")
+        except OSError as exc:
+            raise RuntimeError(
+                f"Required pipeline location is not writable: {path}"
+            ) from exc
+        finally:
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+
+def release_gpu_resources() -> None:
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            ipc_collect = getattr(torch.cuda, "ipc_collect", None)
+            if callable(ipc_collect):
+                ipc_collect()
+    except Exception:
+        pass
 
 def srt_timestamp(t: float) -> str:
     if t < 0: t = 0.0
@@ -925,6 +1042,237 @@ def write_result_local_names(
             allow_unicode=True,
         )
 
+def _process_source_revision(
+    src: Path,
+    *,
+    file_index: int,
+    file_total: int,
+    backend_name: str,
+    device: str,
+    cfg: Conf,
+    workers: int,
+    progress_callback: Callable[[str, str, float], None],
+    crisper_backend=None,
+    crisper_settings: Optional[Dict[str, Any]] = None,
+) -> PipelineRevisionOutcome:
+    engine_cfg = copy.copy(cfg)
+    engine_cfg.transcription_backend = backend_name
+    print(f"\nProcessing {file_index}/{file_total}: {print_rel_or_abs(src)}")
+    progress_callback("preparing_input", "Preparing input", 0)
+    start_file = time.perf_counter()
+    title = to_safe_title(src) or "untitled"
+    project_layout = project_layout_for_source(OUT_DIR, title, src)
+    legacy_names_path = OUT_DIR / title / "names.yaml"
+    saved_names, saved_names_status = load_speaker_names_with_migration(
+        src,
+        legacy_names_path,
+    )
+    if saved_names_status == "migrated":
+        print("[names] Migrated verified output-local speaker names to persistent storage.")
+    elif saved_names_status == "migration_failed":
+        print("[names] Verified output-local names restored, but persistent migration failed.")
+    elif saved_names_status.endswith("identity_mismatch"):
+        print("[names] Saved names not restored: source identity differs.")
+    elif saved_names_status.endswith("legacy"):
+        print("[names] Ignored legacy names.yaml without source identity.")
+    elif saved_names_status.endswith("malformed"):
+        print("[names] Ignored malformed names.yaml.")
+    elif saved_names_status == "source_unavailable":
+        print("[names] Saved names not restored: current source identity is unavailable.")
+
+    wav_path = src
+    if src.suffix.lower() != ".wav":
+        # The identity-safe cache is deliberately checked on every engine pass.
+        # An unchanged source reuses its WAV without reconversion, while a source
+        # changed during a long job cannot inherit stale in-memory cache state.
+        wav_path = convert_to_wav16k(src, WAV_DIR)
+
+    dur = probe_duration_seconds(wav_path)
+    if dur is not None:
+        print(f"  Media duration: {hhmmss(int(dur))} ({dur:.2f} s)")
+
+    result, transcription_metadata = transcribe_configured_backend(
+        wav_path,
+        device,
+        engine_cfg,
+        progress_callback=progress_callback,
+        crisper_backend=crisper_backend,
+        crisper_settings=crisper_settings,
+    )
+    segments = result.get("segments") or []
+    diar_ok = bool(result.get("__diar_ok__", False)) or any(
+        (segment.get("speaker") or "") for segment in segments
+    )
+    speakers = sorted(
+        {
+            segment.get("speaker") or "SPEAKER_00"
+            for segment in segments
+            if segment.get("speaker") or diar_ok
+        }
+    )
+    restored_names = names_for_current_speakers(saved_names, speakers)
+    if restored_names:
+        print(f"[names] Restored {len(restored_names)} speaker name(s).")
+    elif saved_names:
+        print("[names] No saved names matched the current speaker IDs.")
+
+    writing_json_label = (
+        "Writing CrisperWhisper outputs"
+        if backend_name == "crisperwhisper"
+        else "Writing JSON outputs"
+    )
+    revision_status, revision_coverage = result_manifest_classification(
+        backend_name,
+        transcription_metadata,
+    )
+    progress_callback("writing_json", writing_json_label, 80)
+    with ResultRevision(project_layout, backend_name) as revision:
+        result_dir = revision.output_root
+        seg_json = {
+            "title": title,
+            "segments": segments,
+            "source_path": str(src.resolve()),
+        }
+        if transcription_metadata is not None:
+            seg_json["transcription"] = transcription_metadata
+        spk_json = {
+            "title": title,
+            "diarization": diar_ok,
+            "speakers": speakers,
+        }
+        if restored_names:
+            spk_json["names"] = restored_names
+        (result_dir / "segments.json").write_text(
+            json.dumps(seg_json, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (result_dir / "speakers.json").write_text(
+            json.dumps(spk_json, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        write_result_local_names(
+            result_dir,
+            dict(project_layout.source_identity),
+            restored_names,
+        )
+
+        writing_transcripts_label = (
+            "Writing CrisperWhisper outputs"
+            if backend_name == "crisperwhisper"
+            else "Writing SRT/TXT"
+        )
+        progress_callback("writing_transcripts", writing_transcripts_label, 84)
+        fmt = (engine_cfg.output_format or "both").lower().strip()
+        srt_path = result_dir / f"{title}.srt"
+        txt_path = result_dir / f"{title}.txt"
+        if fmt in ("srt", "both"):
+            write_srt(segments, srt_path)
+        if fmt in ("txt", "both"):
+            write_txt(
+                segments,
+                txt_path,
+                diarized=diar_ok,
+                include_speakers=engine_cfg.txt_speaker_tags,
+            )
+
+        if engine_cfg.slice_audio:
+            progress_callback("cutting_audio", "Cutting audio", 90)
+            cut_segments_to_wavs(
+                wav_path,
+                segments,
+                result_dir,
+                padding=engine_cfg.padding_seconds,
+                merge_all=engine_cfg.merge_all_segments_into_one_folder,
+                workers=workers,
+            )
+
+        if engine_cfg.slice_video and src.suffix.lower() in VIDEO_EXTS:
+            progress_callback("cutting_video", "Cutting video", 95)
+            cut_segments_to_video(
+                src,
+                segments,
+                result_dir,
+                padding=engine_cfg.padding_seconds,
+                merge_all=engine_cfg.merge_all_segments_into_one_folder,
+                fast_cut=engine_cfg.fast_cut_video,
+                workers=workers,
+            )
+
+        model, mode, execution_backend = result_manifest_engine_settings(
+            engine_cfg,
+            backend_name,
+            transcription_metadata,
+        )
+        final_dir = revision.commit(
+            model=model,
+            mode=mode,
+            execution_backend=execution_backend,
+            status=revision_status,
+            coverage=revision_coverage,
+            validate_outputs=lambda path: validate_staged_pipeline_outputs(
+                path,
+                engine_cfg,
+                segments,
+                src,
+                title,
+            ),
+        )
+
+    segments_json = final_dir / "segments.json"
+    speakers_json = final_dir / "speakers.json"
+    print(f"[segments-json] {print_rel_or_abs(segments_json)}")
+    print(f"[speakers-json] {print_rel_or_abs(speakers_json)}")
+    emit_result_event(
+        backend_name,
+        revision_status,
+        speakers_json,
+        segments_json,
+        file_index,
+        file_total,
+    )
+
+    file_time = time.perf_counter() - start_file
+    rtf = (dur / file_time) if (dur and file_time > 0) else None
+    print(
+        f"Finished {src.name} in {hhmmss(file_time)}"
+        + (f"  |  RTF: {rtf:.2f}x" if rtf else "")
+    )
+    progress_callback(
+        "file_complete",
+        "File complete with warnings" if revision_status == "incomplete" else "File complete",
+        100,
+    )
+    return PipelineRevisionOutcome(
+        engine=backend_name,
+        status=revision_status,
+        source=src,
+        result_dir=final_dir,
+        file_index=file_index,
+        file_total=file_total,
+    )
+
+
+def _strict_both_sources(explicit_files: Optional[List[str]]) -> Optional[List[Path]]:
+    if not explicit_files:
+        return None
+    sources = []
+    problems = []
+    for item in explicit_files:
+        path = Path(item).expanduser().resolve(strict=False)
+        if not path.is_file():
+            problems.append(f"missing file: {path}")
+        elif path.suffix.lower() not in MEDIA_EXTS:
+            problems.append(f"unsupported media type: {path}")
+        else:
+            sources.append(path)
+    if problems:
+        raise RuntimeError(
+            "Both-engine input preflight failed; no processing was started:\n- "
+            + "\n- ".join(problems)
+        )
+    return sources
+
+
 def run_pipeline(explicit_files: List[str] = None, explicit_workers: int = None) -> None:
     print("Starting processing...")
     removed_staging = cleanup_abandoned_staging(OUT_DIR)
@@ -945,19 +1293,21 @@ def run_pipeline(explicit_files: List[str] = None, explicit_workers: int = None)
         except ValueError as e:
             print(f"[!] Invalid diarization speaker-count settings: {e}")
             raise SystemExit(2)
-    
-    # CLI override for workers
+
     workers = explicit_workers if explicit_workers else cfg.parallel_workers
-    
     if hf_token:
         os.environ["HF_TOKEN"] = hf_token
         os.environ.setdefault("HUGGINGFACE_TOKEN", hf_token)
         os.environ.setdefault("HUGGING_FACE_HUB_TOKEN", hf_token)
         os.environ.setdefault("HUGGINGFACE_HUB_TOKEN", hf_token)
     device = setup_device(cfg)
-    
-    sources = discover_sources(explicit_files)
-    
+
+    strict_sources = (
+        _strict_both_sources(explicit_files)
+        if backend_name == "both"
+        else None
+    )
+    sources = strict_sources if strict_sources is not None else discover_sources(explicit_files)
     if not sources:
         if explicit_files:
             print("[!] No valid files found from the selection.")
@@ -966,12 +1316,23 @@ def run_pipeline(explicit_files: List[str] = None, explicit_workers: int = None)
         return
 
     print(f"Found {len(sources)} file(s) to process:")
-    for p in sources: print(f" - {print_rel_or_abs(p)}")
+    for path in sources:
+        print(f" - {print_rel_or_abs(path)}")
 
     crisper_backend = None
     crisper_settings = None
-    if backend_name == "crisperwhisper":
-        crisper_settings = resolve_crisperwhisper_settings(cfg.crisperwhisper, cfg.language)
+    if backend_name == "both":
+        if not cfg.crisperwhisper_license_acknowledged:
+            raise RuntimeError(
+                "CrisperWhisper model-license acknowledgement is required before a Both run."
+            )
+        preflight_pipeline_locations(OUT_DIR, WAV_DIR)
+        preflight_whisperx_runtime()
+    if backend_name in {"crisperwhisper", "both"}:
+        crisper_settings = resolve_crisperwhisper_settings(
+            cfg.crisperwhisper,
+            cfg.language,
+        )
         crisper_backend = CrisperWhisperBackend(ROOT)
         handed_off_probe = os.environ.pop(PREFLIGHT_ENV_VAR, None)
         if handed_off_probe:
@@ -986,178 +1347,120 @@ def run_pipeline(explicit_files: List[str] = None, explicit_workers: int = None)
         else:
             crisper_backend.probe()
         print("[crisper] Isolated CrisperWhisper runtime is ready.")
-    
+
     file_total = len(sources)
-    for idx, src in enumerate(sources, 1):
-        def file_progress(phase: str, label: str, file_percent: float) -> None:
-            emit_progress(phase, label, file_percent, idx, file_total)
+    if backend_name != "both":
+        for file_index, src in enumerate(sources, 1):
+            def file_progress(phase: str, label: str, file_percent: float) -> None:
+                emit_progress(phase, label, file_percent, file_index, file_total)
 
-        print(f"\nProcessing {idx}/{file_total}: {print_rel_or_abs(src)}")
-        file_progress("preparing_input", "Preparing input", 0)
-        start_file = time.perf_counter()
-        title = to_safe_title(src) or "untitled"
-        project_layout = project_layout_for_source(OUT_DIR, title, src)
-        legacy_names_path = OUT_DIR / title / "names.yaml"
-        saved_names, saved_names_status = load_speaker_names_with_migration(
-            src,
-            legacy_names_path,
-        )
-        if saved_names_status == "migrated":
-            print("[names] Migrated verified output-local speaker names to persistent storage.")
-        elif saved_names_status == "migration_failed":
-            print("[names] Verified output-local names restored, but persistent migration failed.")
-        elif saved_names_status.endswith("identity_mismatch"):
-            print("[names] Saved names not restored: source identity differs.")
-        elif saved_names_status.endswith("legacy"):
-            print("[names] Ignored legacy names.yaml without source identity.")
-        elif saved_names_status.endswith("malformed"):
-            print("[names] Ignored malformed names.yaml.")
-        elif saved_names_status == "source_unavailable":
-            print("[names] Saved names not restored: current source identity is unavailable.")
-        
-        wav_path = src
-        if src.suffix.lower() != ".wav":
-            wav_path = convert_to_wav16k(src, WAV_DIR)
-            
-        dur = probe_duration_seconds(wav_path)
-        if dur is not None: print(f"  Media duration: {hhmmss(int(dur))} ({dur:.2f} s)")
-        
-        result, transcription_metadata = transcribe_configured_backend(
-            wav_path,
-            device,
-            cfg,
-            progress_callback=file_progress,
-            crisper_backend=crisper_backend,
-            crisper_settings=crisper_settings,
-        )
-        segments = result.get("segments") or []
-        diar_ok = bool(result.get("__diar_ok__", False)) or any((s.get("speaker") or "") for s in segments)
-        speakers = sorted({(s.get("speaker") or "SPEAKER_00") for s in segments if (s.get("speaker") or diar_ok)})
-        restored_names = names_for_current_speakers(saved_names, speakers)
-        if restored_names:
-            print(f"[names] Restored {len(restored_names)} speaker name(s).")
-        elif saved_names:
-            print("[names] No saved names matched the current speaker IDs.")
-        
-        writing_json_label = (
-            "Writing CrisperWhisper outputs"
-            if backend_name == "crisperwhisper"
-            else "Writing JSON outputs"
-        )
-        revision_status, revision_coverage = result_manifest_classification(
-            backend_name,
-            transcription_metadata,
-        )
-        file_progress("writing_json", writing_json_label, 80)
-        with ResultRevision(project_layout, backend_name) as revision:
-            result_dir = revision.output_root
-            seg_json = {
-                "title": title,
-                "segments": segments,
-                "source_path": str(src.resolve()),
-            }
-            if transcription_metadata is not None:
-                seg_json["transcription"] = transcription_metadata
-            spk_json = {
-                "title": title,
-                "diarization": diar_ok,
-                "speakers": speakers,
-            }
-            if restored_names:
-                spk_json["names"] = restored_names
-            (result_dir / "segments.json").write_text(
-                json.dumps(seg_json, ensure_ascii=False, indent=2),
-                encoding="utf-8",
+            _process_source_revision(
+                src,
+                file_index=file_index,
+                file_total=file_total,
+                backend_name=backend_name,
+                device=device,
+                cfg=cfg,
+                workers=workers,
+                progress_callback=file_progress,
+                crisper_backend=crisper_backend,
+                crisper_settings=crisper_settings,
             )
-            (result_dir / "speakers.json").write_text(
-                json.dumps(spk_json, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            write_result_local_names(
-                result_dir,
-                dict(project_layout.source_identity),
-                restored_names,
-            )
+    else:
+        outcomes: List[PipelineRevisionOutcome] = []
+        failures = []
+        engine_passes = (("whisperx", "WhisperX"), ("crisperwhisper", "CrisperWhisper"))
+        for engine_index, (engine, engine_label) in enumerate(engine_passes, 1):
+            print(f"[both] Starting {engine_label} pass {engine_index}/2.")
+            pass_outcomes = []
+            pass_failures = 0
+            try:
+                for file_index, src in enumerate(sources, 1):
+                    def dual_progress(phase: str, label: str, file_percent: float) -> None:
+                        overall_percent = (
+                            (
+                                (engine_index - 1) * file_total
+                                + (file_index - 1)
+                                + file_percent / 100.0
+                            )
+                            / (2 * file_total)
+                            * 100.0
+                        )
+                        emit_progress(
+                            phase,
+                            f"{engine_label}: {label}",
+                            file_percent,
+                            file_index,
+                            file_total,
+                            engine=engine,
+                            engine_index=engine_index,
+                            engine_total=2,
+                            overall_percent=overall_percent,
+                        )
 
-            writing_transcripts_label = (
-                "Writing CrisperWhisper outputs"
-                if backend_name == "crisperwhisper"
-                else "Writing SRT/TXT"
-            )
-            file_progress("writing_transcripts", writing_transcripts_label, 84)
-            fmt = (cfg.output_format or "both").lower().strip()
-            srt_path = result_dir / f"{title}.srt"
-            txt_path = result_dir / f"{title}.txt"
-            if fmt in ("srt", "both"):
-                write_srt(segments, srt_path)
-            if fmt in ("txt", "both"):
-                write_txt(
-                    segments,
-                    txt_path,
-                    diarized=diar_ok,
-                    include_speakers=cfg.txt_speaker_tags,
+                    try:
+                        outcome = _process_source_revision(
+                            src,
+                            file_index=file_index,
+                            file_total=file_total,
+                            backend_name=engine,
+                            device=device,
+                            cfg=cfg,
+                            workers=workers,
+                            progress_callback=dual_progress,
+                            crisper_backend=crisper_backend,
+                            crisper_settings=crisper_settings,
+                        )
+                    except Exception as exc:
+                        pass_failures += 1
+                        failures.append((engine, file_index, exc))
+                        print(
+                            f"[both] {engine_label} failed for file "
+                            f"{file_index}/{file_total}: {type(exc).__name__}: {exc}"
+                        )
+                        continue
+                    outcomes.append(outcome)
+                    pass_outcomes.append(outcome)
+                    if outcome.status == "incomplete":
+                        print(
+                            f"[both] {engine_label} saved an Incomplete revision."
+                        )
+            finally:
+                release_gpu_resources()
+                print(f"[both] Released {engine_label} model and GPU resources.")
+
+            if pass_outcomes and not pass_failures:
+                print(f"[both] {engine_label} completed.")
+            elif pass_outcomes:
+                print(
+                    f"[both] {engine_label} completed with {len(pass_outcomes)} usable "
+                    f"result(s) and {pass_failures} failure(s)."
                 )
+            else:
+                print(f"[both] {engine_label} produced no usable result.")
 
-            if cfg.slice_audio:
-                file_progress("cutting_audio", "Cutting audio", 90)
-                cut_segments_to_wavs(
-                    wav_path,
-                    segments,
-                    result_dir,
-                    padding=cfg.padding_seconds,
-                    merge_all=cfg.merge_all_segments_into_one_folder,
-                    workers=workers,
-                )
-
-            if cfg.slice_video and src.suffix.lower() in VIDEO_EXTS:
-                file_progress("cutting_video", "Cutting video", 95)
-                cut_segments_to_video(
-                    src,
-                    segments,
-                    result_dir,
-                    padding=cfg.padding_seconds,
-                    merge_all=cfg.merge_all_segments_into_one_folder,
-                    fast_cut=cfg.fast_cut_video,
-                    workers=workers,
-                )
-
-            model, mode, execution_backend = result_manifest_engine_settings(
-                cfg,
-                backend_name,
-                transcription_metadata,
-            )
-            final_dir = revision.commit(
-                model=model,
-                mode=mode,
-                execution_backend=execution_backend,
-                status=revision_status,
-                coverage=revision_coverage,
-                validate_outputs=lambda path: validate_staged_pipeline_outputs(
-                    path,
-                    cfg,
-                    segments,
-                    src,
-                    title,
-                ),
-            )
-
-        print(f"[segments-json] {print_rel_or_abs(final_dir / 'segments.json')}")
-        print(f"[speakers-json] {print_rel_or_abs(final_dir / 'speakers.json')}")
-
-        file_time = time.perf_counter() - start_file
-        rtf = (dur / file_time) if (dur and file_time > 0) else None
-        print(f"Finished {src.name} in {hhmmss(file_time)}" + (f"  |  RTF: {rtf:.2f}x" if rtf else ""))
-        file_progress(
-            "file_complete",
-            (
-                "File complete with warnings"
-                if revision_status == "incomplete"
-                else "File complete"
-            ),
-            100,
+        complete_count = sum(outcome.status == "complete" for outcome in outcomes)
+        incomplete_count = sum(outcome.status == "incomplete" for outcome in outcomes)
+        print(
+            f"[both] Finished with {complete_count} Complete and "
+            f"{incomplete_count} Incomplete result"
+            f"{'s' if incomplete_count != 1 else ''}."
         )
+        if not outcomes:
+            emit_run_summary("failure", outcomes)
+            raise RuntimeError("Both transcription engines failed to produce a usable result.")
+        engines_with_results = {outcome.engine for outcome in outcomes}
+        if len(engines_with_results) < 2:
+            summary_status = "partial_success"
+        elif failures or incomplete_count:
+            summary_status = "success_with_warnings"
+        else:
+            summary_status = "success"
+        emit_run_summary(summary_status, outcomes)
+
     total = time.perf_counter() - pipeline_start
-    print("Done."); print(f"Total elapsed: {hhmmss(total)}")
+    print("Done.")
+    print(f"Total elapsed: {hhmmss(total)}")
 
 if __name__ == "__main__":
     if any(a in sys.argv for a in ("--version", "-V")):

@@ -153,9 +153,9 @@ class CrisperWhisperProtocolError(CrisperWhisperBackendError):
 
 def normalize_backend_name(value: Any) -> str:
     backend = str(value or "whisperx").strip().lower()
-    if backend not in {"whisperx", "crisperwhisper"}:
+    if backend not in {"whisperx", "crisperwhisper", "both"}:
         raise CrisperWhisperConfigurationError(
-            "transcription_backend must be 'whisperx' or 'crisperwhisper'; "
+            "transcription_backend must be 'whisperx', 'crisperwhisper', or 'both'; "
             f"received {backend!r}."
         )
     return backend
