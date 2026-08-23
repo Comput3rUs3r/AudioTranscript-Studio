@@ -470,6 +470,7 @@ def _finite_result_number(value: Any, label: str, *, allow_zero: bool = True) ->
 WORD_BOUNDARY_TOLERANCE_SECONDS = 0.25
 WORD_MIN_REPAIR_DURATION_SECONDS = 0.02
 WORD_MAX_INFERRED_DURATION_SECONDS = 1.0
+WORD_CLUSTER_REPAIR_MAX_WORDS = 8
 
 COVERAGE_SUBSTANTIAL_GAP_SECONDS = 5.0
 COVERAGE_SAMPLE_RATE = 16_000
@@ -496,6 +497,22 @@ TIMESTAMP_DIAGNOSTIC_REASONS = {
     "current_start_precedes_previous_end_beyond_tolerance",
     "previous_end_exceeds_current_start_beyond_tolerance",
     "overlap_has_no_positive_repair_interval",
+}
+TIMESTAMP_REPAIR_FAILURE_REASONS = {
+    "overlap_exceeds_tolerance",
+    "words_are_not_adjacent",
+    "strict_token_and_time_duplicate",
+    "timestamp_reset_at_chunk_boundary",
+    "later_word_end_is_missing",
+    "later_word_would_overlap_following_word",
+    "bounded_end_exceeds_media_duration",
+    "bounded_end_would_overlap_following_word",
+    "cluster_contains_missing_timestamp",
+    "cluster_contains_invalid_interval",
+    "cluster_exceeds_maximum_words",
+    "cluster_displacement_exceeds_tolerance",
+    "cluster_insufficient_available_span",
+    "no_positive_repair_interval",
 }
 COVERAGE_REJECTION_REASONS = {
     "candidate_duration_mismatch",
@@ -572,6 +589,40 @@ def _repeated_boundary_sequence_length(
     return 0
 
 
+def _strict_repeated_boundary_range(
+    parsed: list[dict[str, Any]],
+    previous_position: int,
+    current_position: int,
+) -> bool:
+    """Require both repeated tokens and overlapping finite ranges."""
+
+    length = _repeated_boundary_sequence_length(
+        parsed,
+        previous_position,
+        current_position,
+    )
+    if not length:
+        return False
+    left = parsed[previous_position - length + 1 : previous_position + 1]
+    right = parsed[current_position : current_position + length]
+    boundaries = [
+        item.get(boundary)
+        for item in (*left, *right)
+        for boundary in ("start", "end")
+    ]
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        for value in boundaries
+    ):
+        return False
+    return (
+        float(right[0]["start"]) < float(left[-1]["end"])
+        and float(right[-1]["end"]) > float(left[0]["start"])
+    )
+
+
 def _timestamp_overlap_details(
     parsed: list[dict[str, Any]],
     assignments: list[dict[str, Any] | None],
@@ -582,6 +633,8 @@ def _timestamp_overlap_details(
     model_family: str,
     strategy: str,
     reason: str,
+    repair_failure_reason: str,
+    cluster_diagnostic: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     def optional_float(value: Any) -> float | None:
         return None if value is None else float(value)
@@ -621,7 +674,7 @@ def _timestamp_overlap_details(
         set(previous.get("repair_actions", []))
         | set(current.get("repair_actions", []))
     )
-    return {
+    details = {
         "diagnostic_type": "timestamp_overlap",
         "model_family": model_family,
         "effective_strategy": strategy,
@@ -634,6 +687,7 @@ def _timestamp_overlap_details(
         "current_start": current_start,
         "current_end": optional_float(current["end"]),
         "overlap_duration": round(float(overlap_duration), 6),
+        "overlap_milliseconds": float(overlap_duration) * 1000.0,
         "crosses_native_chunk_boundary": crosses_boundary,
         "previous_chunk_window": copy.deepcopy(previous_chunk),
         "current_chunk_window": copy.deepcopy(current_chunk),
@@ -650,8 +704,12 @@ def _timestamp_overlap_details(
         "current_boundary_was_repaired": bool(current.get("repair_actions")),
         "repair_actions_attempted": repair_actions,
         "reason": reason,
+        "repair_failure_reason": repair_failure_reason,
         "tolerance_seconds": WORD_BOUNDARY_TOLERANCE_SECONDS,
     }
+    if cluster_diagnostic is not None:
+        details.update(copy.deepcopy(cluster_diagnostic))
+    return details
 
 
 def _word_boundary(value: Any, label: str) -> float | None:
@@ -680,6 +738,7 @@ def normalize_word_timestamps(
         raise TranscriptionError("CrisperWhisper returned an invalid media duration.")
 
     categories: dict[str, int] = {}
+    cluster_reflows: list[dict[str, Any]] = []
 
     def repaired(category: str, repair_actions: list[str] | None = None) -> None:
         categories[category] = categories.get(category, 0) + 1
@@ -750,6 +809,234 @@ def normalize_word_timestamps(
                 return later_position, float(candidate)
         return None, None
 
+    def cross_chunk_overlap_repair_plan(
+        previous_position: int,
+        current_position: int,
+        previous_end_value: float,
+    ) -> tuple[
+        bool,
+        tuple[float, float, str] | None,
+        str | None,
+    ]:
+        previous_chunk = chunk_assignments[previous_position]
+        current_chunk = chunk_assignments[current_position]
+        crosses_boundary = (
+            previous_chunk is not None
+            and current_chunk is not None
+            and previous_chunk["chunk_index"] != current_chunk["chunk_index"]
+        )
+        if not crosses_boundary:
+            return False, None, None
+        if current_position != previous_position + 1:
+            return True, None, "words_are_not_adjacent"
+        if _strict_repeated_boundary_range(
+            parsed,
+            previous_position,
+            current_position,
+        ):
+            return True, None, "strict_token_and_time_duplicate"
+
+        later = parsed[current_position]
+        later_start = later.get("start")
+        later_end = later.get("end")
+        if later_start is None or later_end is None:
+            return True, None, "later_word_end_is_missing"
+        if float(later_start) < (
+            float(current_chunk["start"]) - WORD_BOUNDARY_TOLERANCE_SECONDS
+        ):
+            return True, None, "timestamp_reset_at_chunk_boundary"
+
+        _next_position, next_start = next_valid_start(current_position)
+        target_start = float(previous_end_value)
+        target_end = float(later_end)
+        if target_end - target_start >= WORD_MIN_REPAIR_DURATION_SECONDS:
+            if next_start is not None and target_end > next_start:
+                return True, None, "later_word_would_overlap_following_word"
+            return (
+                True,
+                (
+                    target_start,
+                    target_end,
+                    "cross_chunk_overlap_start_shift",
+                ),
+                None,
+            )
+
+        bounded_end = target_start + WORD_MIN_REPAIR_DURATION_SECONDS
+        if bounded_end > duration:
+            return True, None, "bounded_end_exceeds_media_duration"
+        if next_start is not None and bounded_end > next_start:
+            return True, None, "bounded_end_would_overlap_following_word"
+        if bounded_end <= target_start:
+            return True, None, "no_positive_repair_interval"
+        return (
+            True,
+            (
+                target_start,
+                bounded_end,
+                "cross_chunk_overlap_bounded_end_adjustment",
+            ),
+            None,
+        )
+
+    def cross_chunk_overlap_cluster_plan(
+        previous_position: int,
+        current_position: int,
+        previous_end_value: float,
+    ) -> tuple[
+        list[tuple[int, float, float]] | None,
+        str | None,
+        dict[str, Any],
+    ]:
+        """Reflow the smallest tightly packed cluster after a chunk boundary."""
+
+        anchor = float(previous_end_value)
+        cursor = anchor
+        updates: list[tuple[int, float, float]] = []
+        maximum_displacement = 0.0
+
+        def diagnostic(
+            words_examined: int,
+            required_end: float,
+            available_end: float,
+        ) -> dict[str, Any]:
+            return {
+                "cluster_words_examined": int(words_examined),
+                "cluster_required_span_milliseconds": (
+                    max(0.0, float(required_end) - anchor) * 1000.0
+                ),
+                "cluster_available_span_milliseconds": (
+                    max(0.0, float(available_end) - anchor) * 1000.0
+                ),
+            }
+
+        position = current_position
+        while position < len(parsed):
+            words_examined = len(updates) + 1
+            if words_examined > WORD_CLUSTER_REPAIR_MAX_WORDS:
+                item = parsed[position]
+                item_start = item.get("start")
+                required_start = (
+                    max(cursor, float(item_start))
+                    if item_start is not None
+                    else cursor
+                )
+                return (
+                    None,
+                    "cluster_exceeds_maximum_words",
+                    diagnostic(
+                        words_examined,
+                        required_start + WORD_MIN_REPAIR_DURATION_SECONDS,
+                        duration,
+                    ),
+                )
+
+            item = parsed[position]
+            original_start = item.get("start")
+            original_end = item.get("end")
+            if original_start is None or original_end is None:
+                return (
+                    None,
+                    "cluster_contains_missing_timestamp",
+                    diagnostic(words_examined, cursor, duration),
+                )
+            original_start = float(original_start)
+            original_end = float(original_end)
+            if original_end < original_start:
+                return (
+                    None,
+                    "cluster_contains_invalid_interval",
+                    diagnostic(
+                        words_examined,
+                        cursor + WORD_MIN_REPAIR_DURATION_SECONDS,
+                        duration,
+                    ),
+                )
+            if _strict_repeated_boundary_range(parsed, position - 1, position):
+                return (
+                    None,
+                    "strict_token_and_time_duplicate",
+                    diagnostic(
+                        words_examined,
+                        max(cursor, original_start)
+                        + WORD_MIN_REPAIR_DURATION_SECONDS,
+                        duration,
+                    ),
+                )
+            assignment = chunk_assignments[position]
+            if (
+                assignment is not None
+                and original_start
+                < float(assignment["start"]) - WORD_BOUNDARY_TOLERANCE_SECONDS
+            ):
+                return (
+                    None,
+                    "timestamp_reset_at_chunk_boundary",
+                    diagnostic(
+                        words_examined,
+                        max(cursor, original_start)
+                        + WORD_MIN_REPAIR_DURATION_SECONDS,
+                        duration,
+                    ),
+                )
+
+            repaired_start = max(cursor, original_start)
+            repaired_end = original_end
+            if repaired_end - repaired_start < WORD_MIN_REPAIR_DURATION_SECONDS:
+                repaired_end = repaired_start + WORD_MIN_REPAIR_DURATION_SECONDS
+            displacement = max(
+                abs(repaired_start - original_start),
+                abs(repaired_end - original_end),
+            )
+            maximum_displacement = max(maximum_displacement, displacement)
+            if displacement > WORD_BOUNDARY_TOLERANCE_SECONDS:
+                return (
+                    None,
+                    "cluster_displacement_exceeds_tolerance",
+                    diagnostic(words_examined, repaired_end, duration),
+                )
+            if repaired_end > duration:
+                return (
+                    None,
+                    "cluster_insufficient_available_span",
+                    diagnostic(words_examined, repaired_end, duration),
+                )
+
+            updates.append((position, repaired_start, repaired_end))
+            next_position = position + 1
+            if next_position >= len(parsed):
+                return (
+                    updates,
+                    None,
+                    {
+                        "word_count": len(updates),
+                        "max_displacement_milliseconds": (
+                            maximum_displacement * 1000.0
+                        ),
+                    },
+                )
+            next_start = parsed[next_position].get("start")
+            if next_start is None:
+                return (
+                    None,
+                    "cluster_contains_missing_timestamp",
+                    diagnostic(words_examined + 1, repaired_end, duration),
+                )
+            next_start = float(next_start)
+            if repaired_end <= next_start:
+                return (
+                    updates,
+                    None,
+                    {
+                        "word_count": len(updates),
+                        "max_displacement_milliseconds": (
+                            maximum_displacement * 1000.0
+                        ),
+                    },
+                )
+            cursor = repaired_end
+            position = next_position
+
     serialized = []
     previous_end = 0.0
     previous_timed_position: int | None = None
@@ -804,6 +1091,7 @@ def normalize_word_timestamps(
                         model_family=model_family,
                         strategy=strategy,
                         reason="current_start_precedes_previous_end_beyond_tolerance",
+                        repair_failure_reason="overlap_exceeds_tolerance",
                     )
                 else:
                     details = None
@@ -905,6 +1193,75 @@ def normalize_word_timestamps(
 
         if following_start is not None and end > following_start:
             overlap = end - following_start
+            cross_boundary = False
+            repair_plan = None
+            repair_failure_reason = None
+            cluster_diagnostic = None
+            repair_succeeded = False
+            if overlap <= WORD_BOUNDARY_TOLERANCE_SECONDS:
+                (
+                    cross_boundary,
+                    repair_plan,
+                    repair_failure_reason,
+                ) = cross_chunk_overlap_repair_plan(
+                    position,
+                    following_position,
+                    end,
+                )
+                if repair_plan is not None:
+                    repaired_start, repaired_end, category = repair_plan
+                    following = parsed[following_position]
+                    following["start"] = repaired_start
+                    following["end"] = repaired_end
+                    repaired(category, following["repair_actions"])
+                    following_start = repaired_start
+                    repair_succeeded = True
+                elif cross_boundary and repair_failure_reason in {
+                    "later_word_would_overlap_following_word",
+                    "bounded_end_would_overlap_following_word",
+                }:
+                    (
+                        cluster_plan,
+                        repair_failure_reason,
+                        cluster_diagnostic,
+                    ) = cross_chunk_overlap_cluster_plan(
+                        position,
+                        following_position,
+                        end,
+                    )
+                    if cluster_plan is not None:
+                        for repaired_position, repaired_start, repaired_end in cluster_plan:
+                            repaired_item = parsed[repaired_position]
+                            repaired_item["start"] = repaired_start
+                            repaired_item["end"] = repaired_end
+                        repaired(
+                            "cross_chunk_overlap_cluster_reflow",
+                            parsed[following_position]["repair_actions"],
+                        )
+                        cluster_reflows.append(cluster_diagnostic)
+                        following_start = float(parsed[following_position]["start"])
+                        repair_succeeded = True
+            if cross_boundary and not repair_succeeded:
+                item["start"] = start
+                item["end"] = end
+                details = _timestamp_overlap_details(
+                    parsed,
+                    chunk_assignments,
+                    position,
+                    following_position,
+                    overlap,
+                    model_family=model_family,
+                    strategy=strategy,
+                    reason="overlap_has_no_positive_repair_interval",
+                    repair_failure_reason=(
+                        repair_failure_reason or "no_positive_repair_interval"
+                    ),
+                    cluster_diagnostic=cluster_diagnostic,
+                )
+                raise TranscriptionError(
+                    "CrisperWhisper returned overlapping word timestamps that cannot be reconciled safely.",
+                    details=details,
+                )
             if overlap > WORD_BOUNDARY_TOLERANCE_SECONDS or following_start <= start:
                 item["start"] = start
                 item["end"] = end
@@ -921,13 +1278,19 @@ def normalize_word_timestamps(
                         if overlap > WORD_BOUNDARY_TOLERANCE_SECONDS
                         else "overlap_has_no_positive_repair_interval"
                     ),
+                    repair_failure_reason=(
+                        "overlap_exceeds_tolerance"
+                        if overlap > WORD_BOUNDARY_TOLERANCE_SECONDS
+                        else "no_positive_repair_interval"
+                    ),
                 )
                 raise TranscriptionError(
                     "CrisperWhisper returned overlapping word timestamps that cannot be reconciled safely.",
                     details=details,
                 )
-            end = following_start
-            repaired("adjacent_overlap", item["repair_actions"])
+            if not repair_succeeded:
+                end = following_start
+                repaired("adjacent_overlap", item["repair_actions"])
 
         if not (0.0 <= start < end <= duration):
             raise TranscriptionError(
@@ -959,6 +1322,7 @@ def normalize_word_timestamps(
     metadata = {
         "repair_count": repair_count,
         "categories": dict(sorted(categories.items())),
+        "cluster_reflows": cluster_reflows,
         "words_remained_untimed": bool(untimed_word_count),
         "untimed_word_count": untimed_word_count,
         "warnings": warnings,
@@ -1212,7 +1576,12 @@ def _emit_remaining_gap_ranges(audit: dict[str, Any]) -> None:
 def _emit_timestamp_overlap_status(details: dict[str, Any] | None) -> None:
     if not isinstance(details, dict) or details.get("diagnostic_type") != "timestamp_overlap":
         return
-    overlap = float(details["overlap_duration"])
+    overlap_milliseconds = float(
+        details.get(
+            "overlap_milliseconds",
+            float(details["overlap_duration"]) * 1000.0,
+        )
+    )
     strategy = str(details["effective_strategy"])
     previous_chunk = details.get("previous_native_chunk_index")
     current_chunk = details.get("current_native_chunk_index")
@@ -1222,14 +1591,67 @@ def _emit_timestamp_overlap_status(details: dict[str, Any] | None) -> None:
         location = f"{strategy} chunk {previous_chunk}"
     else:
         location = f"the {strategy} word timeline"
+    failure_messages = {
+        "overlap_exceeds_tolerance": "the overlap exceeds the 250 ms tolerance",
+        "words_are_not_adjacent": "the timed words are not adjacent in decoded order",
+        "strict_token_and_time_duplicate": (
+            "the existing strict token-and-time test identified a duplicated range"
+        ),
+        "timestamp_reset_at_chunk_boundary": (
+            "the later timestamp is a chunk-relative reset"
+        ),
+        "later_word_end_is_missing": "the later word has no finite end boundary",
+        "later_word_would_overlap_following_word": (
+            "the adjusted word would overlap the following word"
+        ),
+        "bounded_end_exceeds_media_duration": (
+            "the minimum-duration end would exceed the media duration"
+        ),
+        "bounded_end_would_overlap_following_word": (
+            "the minimum-duration end would overlap the following word"
+        ),
+        "cluster_contains_missing_timestamp": (
+            "the cluster contains a missing timestamp boundary"
+        ),
+        "cluster_contains_invalid_interval": (
+            "the cluster contains an invalid word interval"
+        ),
+        "cluster_exceeds_maximum_words": (
+            "the cluster exceeds the eight-word safety limit"
+        ),
+        "cluster_displacement_exceeds_tolerance": (
+            "a required cluster displacement exceeds 250 ms"
+        ),
+        "cluster_insufficient_available_span": (
+            "the cluster has insufficient downstream time"
+        ),
+        "no_positive_repair_interval": "no positive repair interval is available",
+    }
+    failure_reason = failure_messages.get(details.get("repair_failure_reason"))
+    message = (
+        f"Timestamp validation rejected a {overlap_milliseconds:.12g} ms overlap "
+        f"at {location}."
+    )
+    if failure_reason:
+        message += f" Repair was not applied because {failure_reason}."
+    cluster_words = details.get("cluster_words_examined")
+    required_span = details.get("cluster_required_span_milliseconds")
+    available_span = details.get("cluster_available_span_milliseconds")
+    if (
+        isinstance(cluster_words, int)
+        and isinstance(required_span, (int, float))
+        and isinstance(available_span, (int, float))
+    ):
+        message += (
+            f" Cluster repair examined {cluster_words} words and required "
+            f"{float(required_span):.12g} ms within "
+            f"{float(available_span):.12g} ms available."
+        )
     emit_event(
         "status",
         "transcribe",
         stage="timestamp_rejected",
-        message=(
-            f"Timestamp validation rejected a {overlap:.2f}-second overlap "
-            f"at {location}."
-        ),
+        message=message,
     )
     if details.get("repeated_token_sequence"):
         emit_event(
@@ -1504,6 +1926,7 @@ def _safe_error_details(details: Any) -> dict[str, Any] | None:
             "current_start",
             "current_end",
             "overlap_duration",
+            "overlap_milliseconds",
             "crosses_native_chunk_boundary",
             "previous_chunk_window",
             "current_chunk_window",
@@ -1515,6 +1938,10 @@ def _safe_error_details(details: Any) -> dict[str, Any] | None:
             "current_boundary_was_repaired",
             "repair_actions_attempted",
             "reason",
+            "repair_failure_reason",
+            "cluster_words_examined",
+            "cluster_required_span_milliseconds",
+            "cluster_available_span_milliseconds",
             "tolerance_seconds",
         }
         if details.get("reason") not in TIMESTAMP_DIAGNOSTIC_REASONS:
@@ -2045,16 +2472,21 @@ def _merge_repair_metadata(
     categories = dict(base.get("categories") or {})
     warnings = list(base.get("warnings") or [])
     untimed_count = int(base.get("untimed_word_count") or 0)
+    cluster_reflows = copy.deepcopy(base.get("cluster_reflows") or [])
     for metadata in additions:
         for category, count in (metadata.get("categories") or {}).items():
             categories[category] = categories.get(category, 0) + int(count)
         untimed_count += int(metadata.get("untimed_word_count") or 0)
+        cluster_reflows.extend(
+            copy.deepcopy(metadata.get("cluster_reflows") or [])
+        )
         for warning in metadata.get("warnings") or []:
             if warning not in warnings:
                 warnings.append(warning)
     return {
         "repair_count": sum(categories.values()),
         "categories": dict(sorted(categories.items())),
+        "cluster_reflows": cluster_reflows,
         "words_remained_untimed": bool(untimed_count),
         "untimed_word_count": untimed_count,
         "warnings": warnings,
@@ -2252,7 +2684,7 @@ def _run_targeted_recovery(
             message=(
                 f"Targeted recovery left {unresolved_count} speech-active "
                 f"gap{'s' if unresolved_count != 1 else ''} totaling "
-                f"{unresolved_duration:.2f} seconds; no result was committed."
+                f"{unresolved_duration:.2f} seconds."
             ),
         )
     else:
@@ -2311,6 +2743,8 @@ def _coverage_metadata(
     if targeted_recovery is not None:
         warnings.append(
             "Targeted context-free short windows passed the final speech-active coverage audit."
+            if int(final_audit["speech_active_gap_count"]) == 0
+            else "Targeted context-free short windows completed but speech-active gaps remain."
         )
     return {
         "requested_strategy": "continuation",
@@ -2327,7 +2761,7 @@ def _coverage_metadata(
             primary_audit["speech_active_gap_ranges"]
         ),
         "recovered_gap_count": recovered_count,
-        "recovered_duration": recovered_duration,
+        "recovered_duration": round(recovered_duration, 3),
         "remaining_speech_active_gap_count": final_audit["speech_active_gap_count"],
         "remaining_speech_active_gap_duration": final_audit["speech_active_gap_duration"],
         "remaining_speech_active_gap_ranges": copy.deepcopy(
@@ -2593,15 +3027,13 @@ def transcribe_job(
                             f"{base_strategy}_plus_targeted_recovery"
                         )
                         if final_audit["speech_active_gap_count"]:
-                            raise CoverageError(
-                                "CrisperWhisper long-form coverage remained incomplete "
-                                "after targeted short-window recovery.",
-                                details=_coverage_failure_details(
-                                    primary_audit,
-                                    fallback_audit,
-                                    model_family=model_settings["family"],
-                                    rejection_reason="targeted_recovery_incomplete",
-                                    targeted_recovery=targeted_recovery,
+                            emit_event(
+                                "status",
+                                "transcribe",
+                                stage="coverage_incomplete",
+                                message=(
+                                    "Saving the best available transcript as an "
+                                    "Incomplete revision."
                                 ),
                             )
                 except (KeyboardInterrupt, WorkerCancelled):
@@ -2663,10 +3095,34 @@ def transcribe_job(
                 }
             )
 
+        coverage_complete = bool(
+            coverage is None
+            or coverage["remaining_speech_active_gap_count"] == 0
+        )
+        remaining_gap_count = (
+            int(coverage["remaining_speech_active_gap_count"])
+            if coverage is not None
+            else 0
+        )
+        remaining_gap_duration = (
+            float(coverage["remaining_speech_active_gap_duration"])
+            if coverage is not None
+            else 0.0
+        )
+        remaining_gap_ranges = (
+            copy.deepcopy(coverage["remaining_speech_active_gap_ranges"])
+            if coverage is not None
+            else []
+        )
         response = {
             "protocol_version": PROTOCOL_VERSION,
             "operation": "transcribe",
-            "status": "success",
+            "status": "complete" if coverage_complete else "incomplete",
+            "coverage_complete": coverage_complete,
+            "remaining_speech_active_gap_count": remaining_gap_count,
+            "remaining_speech_active_gap_duration": remaining_gap_duration,
+            "remaining_speech_active_gap_ranges": remaining_gap_ranges,
+            "selected_strategy": selected_strategy,
             "engine": "crisperwhisper",
             "runtime": _public_runtime_metadata(runtime),
             "settings": {
@@ -2836,6 +3292,8 @@ def main(argv: list[str] | None = None) -> int:
         emit_event(
             "success",
             operation,
+            status=response["status"],
+            coverage_complete=response["coverage_complete"],
             model=response["settings"]["effective"]["model"]["model_id"],
             mode=response["transcription"]["mode"],
             word_count=len(response["transcription"]["words"]),

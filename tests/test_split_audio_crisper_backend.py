@@ -15,6 +15,7 @@ import crisperwhisper_worker as worker
 import split_audio
 
 from test_crisperwhisper_backend import (
+    classify_response,
     make_coverage_failure_diagnostic,
     make_coverage_metadata,
     make_response,
@@ -522,6 +523,96 @@ class TimestampRepairStorageTests(unittest.TestCase):
         response["transcription"]["word_timestamp_repairs"] = repairs
         return backend.validate_transcribe_response(response, self.settings)
 
+    def cross_chunk_overlap_response(self):
+        native = SimpleNamespace(
+            text="private-alpha private-beta",
+            language="en",
+            mode="verbatim",
+            duration=4.5,
+            processing_time=0.1,
+            chunks=[
+                SimpleNamespace(
+                    chunk_idx=8,
+                    start_sec=0.0,
+                    end_sec=2.0,
+                    text="private-alpha",
+                    context=None,
+                    is_last=False,
+                    stitch_lcs_length=None,
+                    stitch_lcs_words=None,
+                ),
+                SimpleNamespace(
+                    chunk_idx=9,
+                    start_sec=0.8,
+                    end_sec=4.5,
+                    text="private-beta",
+                    context="private-alpha",
+                    is_last=True,
+                    stitch_lcs_length=None,
+                    stitch_lcs_words=None,
+                ),
+            ],
+            words=[
+                SimpleNamespace(word="private-alpha", start=0.98, end=1.00),
+                SimpleNamespace(word="private-beta", start=0.98, end=1.40),
+            ],
+        )
+        candidate = worker._normalize_transcription_candidate(
+            native,
+            "verbatim",
+            model_family="medium",
+            strategy="continuation",
+        )
+        response = make_response(self.settings)
+        response["transcription"] = candidate
+        return backend.validate_transcribe_response(response, self.settings)
+
+    def cross_chunk_cluster_response(self):
+        native = SimpleNamespace(
+            text="private-alpha private-beta private-gamma private-delta",
+            language="en",
+            mode="verbatim",
+            duration=4.5,
+            processing_time=0.1,
+            chunks=[
+                SimpleNamespace(
+                    chunk_idx=8,
+                    start_sec=0.0,
+                    end_sec=1.0,
+                    text="private-alpha",
+                    context=None,
+                    is_last=False,
+                    stitch_lcs_length=None,
+                    stitch_lcs_words=None,
+                ),
+                SimpleNamespace(
+                    chunk_idx=9,
+                    start_sec=0.8,
+                    end_sec=4.5,
+                    text="private-beta private-gamma private-delta",
+                    context="private-alpha",
+                    is_last=True,
+                    stitch_lcs_length=None,
+                    stitch_lcs_words=None,
+                ),
+            ],
+            words=[
+                SimpleNamespace(word="private-alpha", start=0.98, end=1.00),
+                SimpleNamespace(word="private-beta", start=0.98, end=1.005),
+                SimpleNamespace(word="private-gamma", start=1.015, end=1.40),
+                SimpleNamespace(word="private-delta", start=1.45, end=1.80),
+            ],
+        )
+        candidate = worker._normalize_transcription_candidate(
+            native,
+            "verbatim",
+            model_family="medium",
+            strategy="continuation",
+        )
+        response = make_response(self.settings)
+        response["transcription"] = candidate
+        return backend.validate_transcribe_response(response, self.settings)
+
     def test_safe_repairs_commit_revision_with_metadata_and_one_summary_log(self):
         response = self.repaired_response()
 
@@ -548,6 +639,162 @@ class TimestampRepairStorageTests(unittest.TestCase):
         self.assertGreater(repairs["repair_count"], 0)
         self.assertEqual(stdout.getvalue().count("[crisper] Repaired "), 1)
         self.assertNotIn("First repeated repeated.", stdout.getvalue())
+        self.assertFalse(any(self.output_dir.rglob(".staging-*")))
+
+    def test_twenty_millisecond_cross_chunk_repair_commits_valid_revision(self):
+        response = self.cross_chunk_overlap_response()
+
+        class SuccessfulAdapter:
+            def __init__(adapter_self, _root):
+                adapter_self.response = response
+
+            def probe(adapter_self):
+                return {}
+
+            def transcribe(adapter_self, *_args, **_kwargs):
+                return copy.deepcopy(adapter_self.response)
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            self.run_pipeline_with(SuccessfulAdapter)
+
+        result_dir = next(self.output_dir.glob("sample--*/crisperwhisper/*"))
+        committed = json.loads(
+            (result_dir / "segments.json").read_text(encoding="utf-8")
+        )
+        words = [
+            word
+            for segment in committed["segments"]
+            for word in segment["words"]
+        ]
+        self.assertEqual(
+            [word["word"] for word in words],
+            ["private-alpha", "private-beta"],
+        )
+        self.assertEqual(words[0]["end"], words[1]["start"])
+        metadata = committed["transcription"]
+        self.assertEqual(
+            metadata["word_timestamp_repairs"]["categories"],
+            {"cross_chunk_overlap_start_shift": 1},
+        )
+        self.assertEqual(
+            [chunk["chunk_index"] for chunk in metadata["native_chunks"]],
+            [8, 9],
+        )
+        self.assertEqual(stdout.getvalue().count("[crisper] Repaired 1 minor"), 1)
+        self.assertTrue((result_dir / "sample.srt").is_file())
+        self.assertTrue((result_dir / "sample.txt").is_file())
+        self.assertFalse(any(self.output_dir.rglob(".staging-*")))
+
+    def test_cross_chunk_cluster_repair_commits_valid_revision(self):
+        response = self.cross_chunk_cluster_response()
+
+        class SuccessfulAdapter:
+            def __init__(adapter_self, _root):
+                adapter_self.response = response
+
+            def probe(adapter_self):
+                return {}
+
+            def transcribe(adapter_self, *_args, **_kwargs):
+                return copy.deepcopy(adapter_self.response)
+
+        self.run_pipeline_with(SuccessfulAdapter)
+
+        result_dir = next(self.output_dir.glob("sample--*/crisperwhisper/*"))
+        committed = json.loads(
+            (result_dir / "segments.json").read_text(encoding="utf-8")
+        )
+        words = [
+            word
+            for segment in committed["segments"]
+            for word in segment["words"]
+        ]
+        self.assertEqual(
+            [word["word"] for word in words],
+            ["private-alpha", "private-beta", "private-gamma", "private-delta"],
+        )
+        self.assertEqual(words[0]["end"], words[1]["start"])
+        self.assertEqual(words[1]["end"], words[2]["start"])
+        self.assertEqual((words[3]["start"], words[3]["end"]), (1.45, 1.80))
+        repairs = committed["transcription"]["word_timestamp_repairs"]
+        self.assertEqual(
+            repairs["categories"],
+            {"cross_chunk_overlap_cluster_reflow": 1},
+        )
+        self.assertEqual(repairs["cluster_reflows"][0]["word_count"], 2)
+        self.assertFalse(any(self.output_dir.rglob(".staging-*")))
+
+    def test_unsafe_cluster_preserves_previous_revision_and_project_metadata(self):
+        response = self.cross_chunk_overlap_response()
+
+        class SuccessfulAdapter:
+            def __init__(adapter_self, _root):
+                adapter_self.response = response
+
+            def probe(adapter_self):
+                return {}
+
+            def transcribe(adapter_self, *_args, **_kwargs):
+                return copy.deepcopy(adapter_self.response)
+
+        self.run_pipeline_with(SuccessfulAdapter)
+        project_dir = next(self.output_dir.glob("sample--*"))
+        before = {
+            path.relative_to(project_dir): path.read_bytes()
+            for path in project_dir.rglob("*")
+            if path.is_file()
+        }
+
+        class FailingAdapter:
+            def __init__(adapter_self, _root):
+                pass
+
+            def probe(adapter_self):
+                return {}
+
+            def transcribe(adapter_self, *_args, **_kwargs):
+                worker.normalize_word_timestamps(
+                    [
+                        {"word": "private-alpha", "start": 0.98, "end": 1.00},
+                        {"word": "private-beta", "start": 0.98, "end": 1.005},
+                        {"word": "private-gamma", "start": 1.015, "end": 1.025},
+                    ],
+                    "private-alpha private-beta private-gamma",
+                    1.03,
+                    diagnostic_context={
+                        "model_family": "medium",
+                        "strategy": "continuation",
+                        "chunks": [
+                            {
+                                "chunk_index": 8,
+                                "start": 0.0,
+                                "end": 1.0,
+                                "text": "private-alpha",
+                            },
+                            {
+                                "chunk_index": 9,
+                                "start": 0.8,
+                                "end": 1.03,
+                                "text": "private-beta private-gamma",
+                            },
+                        ],
+                    },
+                )
+
+        with self.assertRaises(worker.TranscriptionError) as raised:
+            self.run_pipeline_with(FailingAdapter)
+        self.assertEqual(
+            raised.exception.details["repair_failure_reason"],
+            "cluster_insufficient_available_span",
+        )
+        after = {
+            path.relative_to(project_dir): path.read_bytes()
+            for path in project_dir.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
+        self.assertEqual(len(list(project_dir.glob("crisperwhisper/*/result.json"))), 1)
         self.assertFalse(any(self.output_dir.rglob(".staging-*")))
 
     def test_unrecoverable_timing_failure_preserves_previous_revision_and_project(self):
@@ -707,6 +954,98 @@ class TimestampRepairStorageTests(unittest.TestCase):
             coverage["targeted_recovery"]["unresolved_gap_count"],
             0,
         )
+        self.assertFalse(any(self.output_dir.rglob(".staging-*")))
+
+    def test_incomplete_coverage_commits_best_candidate_and_preserves_complete_revision(self):
+        complete_response = backend.validate_transcribe_response(
+            make_response(self.settings),
+            self.settings,
+        )
+        incomplete_coverage = make_targeted_coverage_metadata(complete=False)
+        incomplete_response = backend.validate_transcribe_response(
+            classify_response(
+                make_response(self.settings),
+                complete=False,
+                coverage=incomplete_coverage,
+            ),
+            self.settings,
+        )
+        responses = [complete_response, incomplete_response]
+
+        class SequentialAdapter:
+            def __init__(adapter_self, _root):
+                adapter_self.response = responses.pop(0)
+
+            def probe(adapter_self):
+                return {}
+
+            def transcribe(adapter_self, *_args, **_kwargs):
+                return copy.deepcopy(adapter_self.response)
+
+        self.run_pipeline_with(SequentialAdapter)
+        project_dir = next(self.output_dir.glob("sample--*"))
+        first_result = next((project_dir / "crisperwhisper").iterdir())
+        first_snapshot = {
+            path.relative_to(first_result): path.read_bytes()
+            for path in first_result.rglob("*")
+            if path.is_file()
+        }
+
+        self.run_pipeline_with(SequentialAdapter)
+        results = sorted((project_dir / "crisperwhisper").iterdir())
+        self.assertEqual(len(results), 2)
+        incomplete_result = next(
+            result
+            for result in results
+            if json.loads((result / "result.json").read_text(encoding="utf-8"))[
+                "status"
+            ]
+            == "incomplete"
+        )
+        self.assertEqual(
+            {
+                path.relative_to(first_result): path.read_bytes()
+                for path in first_result.rglob("*")
+                if path.is_file()
+            },
+            first_snapshot,
+        )
+        result_manifest = json.loads(
+            (incomplete_result / "result.json").read_text(encoding="utf-8")
+        )
+        segments_data = json.loads(
+            (incomplete_result / "segments.json").read_text(encoding="utf-8")
+        )
+        project_data = json.loads(
+            (project_dir / "project.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(result_manifest["status"], "incomplete")
+        self.assertEqual(
+            result_manifest["coverage"]["remaining_speech_active_gap_ranges"],
+            incomplete_coverage["remaining_speech_active_gap_ranges"],
+        )
+        transcription = segments_data["transcription"]
+        self.assertEqual(transcription["result_status"], "incomplete")
+        self.assertEqual(
+            transcription["remaining_speech_active_gap_ranges"],
+            incomplete_coverage["remaining_speech_active_gap_ranges"],
+        )
+        self.assertEqual(
+            " ".join(segment["text"] for segment in segments_data["segments"]),
+            incomplete_response["transcription"]["text"],
+        )
+        self.assertEqual(
+            project_data["active_results"]["crisperwhisper"],
+            incomplete_result.name,
+        )
+        indexed = {
+            record["result_id"]: record["status"]
+            for record in project_data["results"]
+        }
+        self.assertEqual(indexed[first_result.name], "complete")
+        self.assertEqual(indexed[incomplete_result.name], "incomplete")
+        self.assertTrue((incomplete_result / "sample.srt").is_file())
+        self.assertTrue((incomplete_result / "sample.txt").is_file())
         self.assertFalse(any(self.output_dir.rglob(".staging-*")))
 
     def test_coverage_failure_leaves_previous_revision_and_project_unchanged(self):

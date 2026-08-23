@@ -10,7 +10,7 @@ Transcript Studio + WhisperX pipeline (v1.6.0)
 """
 from __future__ import annotations
 
-import os, sys, math, time, shlex, yaml, json, subprocess, hashlib, datetime, concurrent.futures, argparse, tempfile
+import os, sys, math, time, shlex, yaml, json, subprocess, hashlib, datetime, concurrent.futures, argparse, tempfile, copy
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -804,6 +804,63 @@ def result_manifest_engine_settings(
     return values
 
 
+def result_manifest_classification(
+    backend_name: str,
+    transcription_metadata: Optional[Dict[str, Any]],
+) -> Tuple[str, Optional[Dict[str, Any]]]:
+    """Return the immutable revision status and validated coverage summary."""
+
+    if backend_name != "crisperwhisper":
+        return "complete", None
+    metadata = transcription_metadata or {}
+    status = str(metadata.get("result_status") or "complete").strip().lower()
+    if status not in {"complete", "incomplete"}:
+        raise RuntimeError("CrisperWhisper result metadata has an invalid status.")
+    coverage_complete = metadata.get("coverage_complete", status == "complete")
+    if not isinstance(coverage_complete, bool) or coverage_complete != (status == "complete"):
+        raise RuntimeError(
+            "CrisperWhisper result status and coverage metadata are inconsistent."
+        )
+    longform_coverage = metadata.get("longform_coverage")
+    if not isinstance(longform_coverage, dict):
+        if status == "incomplete":
+            raise RuntimeError(
+                "Incomplete CrisperWhisper result metadata is missing its coverage audit."
+            )
+        return status, None
+    coverage = {
+        "coverage_complete": coverage_complete,
+        "remaining_speech_active_gap_count": metadata.get(
+            "remaining_speech_active_gap_count"
+        ),
+        "remaining_speech_active_gap_duration": metadata.get(
+            "remaining_speech_active_gap_duration"
+        ),
+        "remaining_speech_active_gap_ranges": copy.deepcopy(
+            metadata.get("remaining_speech_active_gap_ranges")
+        ),
+        "selected_strategy": metadata.get("selected_strategy"),
+    }
+    expected = {
+        "remaining_speech_active_gap_count": longform_coverage.get(
+            "remaining_speech_active_gap_count"
+        ),
+        "remaining_speech_active_gap_duration": longform_coverage.get(
+            "remaining_speech_active_gap_duration"
+        ),
+        "remaining_speech_active_gap_ranges": longform_coverage.get(
+            "remaining_speech_active_gap_ranges"
+        ),
+        "selected_strategy": longform_coverage.get("selected_strategy"),
+    }
+    for key, expected_value in expected.items():
+        if coverage[key] != expected_value:
+            raise RuntimeError(
+                "CrisperWhisper result classification differs from its coverage audit."
+            )
+    return status, coverage
+
+
 def validate_staged_pipeline_outputs(
     result_dir: Path,
     cfg: Conf,
@@ -987,6 +1044,10 @@ def run_pipeline(explicit_files: List[str] = None, explicit_workers: int = None)
             if backend_name == "crisperwhisper"
             else "Writing JSON outputs"
         )
+        revision_status, revision_coverage = result_manifest_classification(
+            backend_name,
+            transcription_metadata,
+        )
         file_progress("writing_json", writing_json_label, 80)
         with ResultRevision(project_layout, backend_name) as revision:
             result_dir = revision.output_root
@@ -1069,6 +1130,8 @@ def run_pipeline(explicit_files: List[str] = None, explicit_workers: int = None)
                 model=model,
                 mode=mode,
                 execution_backend=execution_backend,
+                status=revision_status,
+                coverage=revision_coverage,
                 validate_outputs=lambda path: validate_staged_pipeline_outputs(
                     path,
                     cfg,
@@ -1084,7 +1147,15 @@ def run_pipeline(explicit_files: List[str] = None, explicit_workers: int = None)
         file_time = time.perf_counter() - start_file
         rtf = (dur / file_time) if (dur and file_time > 0) else None
         print(f"Finished {src.name} in {hhmmss(file_time)}" + (f"  |  RTF: {rtf:.2f}x" if rtf else ""))
-        file_progress("file_complete", "File complete", 100)
+        file_progress(
+            "file_complete",
+            (
+                "File complete with warnings"
+                if revision_status == "incomplete"
+                else "File complete"
+            ),
+            100,
+        )
     total = time.perf_counter() - pipeline_start
     print("Done."); print(f"Total elapsed: {hhmmss(total)}")
 

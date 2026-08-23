@@ -5856,7 +5856,11 @@ class _ResultBrowserModel:
 
     @staticmethod
     def display_status(descriptor):
-        return "pending" if descriptor.pending else descriptor.status
+        return (
+            f"Pending — {descriptor.status.title()}"
+            if descriptor.pending
+            else descriptor.status.title()
+        )
 
     @staticmethod
     def _sort_value(descriptor, column):
@@ -5877,7 +5881,7 @@ class _ResultBrowserModel:
         if column == "source":
             return descriptor.source_state.casefold()
         if column == "status":
-            return _ResultBrowserModel.display_status(descriptor).casefold()
+            return descriptor.status.casefold()
         raise ValueError(f"Unknown result-browser sort column: {column}")
 
     def set_sort(self, column):
@@ -5902,9 +5906,12 @@ class _ResultBrowserModel:
                 continue
             if source_filter != "all" and descriptor.source_state.casefold() != source_filter:
                 continue
-            display_status = self.display_status(descriptor).casefold()
-            if status_filter != "all" and display_status != status_filter:
-                continue
+            if status_filter != "all":
+                if status_filter == "pending":
+                    if not descriptor.pending:
+                        continue
+                elif descriptor.pending or descriptor.status.casefold() != status_filter:
+                    continue
             matched.append(descriptor)
 
         pending = [descriptor for descriptor in matched if descriptor.pending]
@@ -6031,6 +6038,10 @@ class _OpenResultDialog(tk.Toplevel):
             style=MIDNIGHTSTUDIO_STYLES["dialog_hscrollbar"],
         )
         self.tree.configure(yscrollcommand=ybar.set, xscrollcommand=xbar.set)
+        self.tree.tag_configure(
+            "incomplete",
+            foreground=MIDNIGHTSTUDIO_THEME_COLORS["warning"],
+        )
         ybar.grid(row=0, column=1, sticky="ns")
         xbar.grid(row=1, column=0, sticky="ew")
 
@@ -6145,7 +6156,13 @@ class _OpenResultDialog(tk.Toplevel):
                 descriptor.source_state.title(),
                 self.model.display_status(descriptor).title(),
             )
-            self.tree.insert("", "end", iid=item, values=values)
+            self.tree.insert(
+                "",
+                "end",
+                iid=item,
+                values=values,
+                tags=(("incomplete",) if descriptor.status == "incomplete" else ()),
+            )
             self._row_descriptors[item] = descriptor
             if selected_key == self._descriptor_key(descriptor):
                 selected_item = item
@@ -6232,8 +6249,9 @@ class ReviewNamePage(ttk.Frame):
         self.workspace = None
         self.current_result_paths = None
         self.current_result_identity = None
+        self.current_result_descriptor = None
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(1, weight=1)
+        self.rowconfigure(2, weight=1)
 
         toolbar = ttk.Frame(
             self,
@@ -6250,12 +6268,33 @@ class ReviewNamePage(ttk.Frame):
             padding=(14, 5),
         ).grid(row=0, column=1, sticky="e")
 
+        self.incomplete_banner = ttk.Frame(
+            self,
+            padding=(16, 8),
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
+        self.incomplete_banner.columnconfigure(0, weight=1)
+        self.lbl_incomplete_warning = ttk.Label(
+            self.incomplete_banner,
+            text="",
+            style=MIDNIGHTSTUDIO_STYLES["dialog_warning"],
+            justify="left",
+        )
+        self.lbl_incomplete_warning.grid(row=0, column=0, sticky="ew")
+        tb.Button(
+            self.incomplete_banner,
+            text="Show missing ranges",
+            command=self._show_incomplete_ranges,
+            bootstyle="warning-outline",
+            padding=(12, 4),
+        ).grid(row=0, column=1, sticky="e", padx=(10, 0))
+
         self.empty_state = ttk.Frame(
             self,
             padding=16,
             style=MIDNIGHTSTUDIO_STYLES["page"],
         )
-        self.empty_state.grid(row=1, column=0, sticky="nsew")
+        self.empty_state.grid(row=2, column=0, sticky="nsew")
         self.empty_state.columnconfigure(0, weight=1)
         self.empty_state.rowconfigure(2, weight=1)
         ttk.Label(
@@ -6292,6 +6331,59 @@ class ReviewNamePage(ttk.Frame):
             padding=(16, 6),
         ).pack(side="left", padx=(8, 0))
         apply_midnightstudio_card_style(empty_card)
+
+    def _set_incomplete_warning(self, descriptor):
+        if not hasattr(self, "incomplete_banner"):
+            return
+        coverage = (
+            descriptor.coverage
+            if isinstance(descriptor, ResultDescriptor)
+            and descriptor.status == "incomplete"
+            else None
+        )
+        if coverage is None:
+            self.incomplete_banner.grid_remove()
+            return
+        count = coverage.remaining_speech_active_gap_count
+        duration = coverage.remaining_speech_active_gap_duration
+        self.lbl_incomplete_warning.configure(
+            text=(
+                "Incomplete CrisperWhisper coverage\n"
+                f"{count} speech-active gap{'s' if count != 1 else ''} totaling "
+                f"{duration:.2f} seconds may be missing."
+            )
+        )
+        self.incomplete_banner.grid(row=1, column=0, sticky="ew")
+
+    def _show_incomplete_ranges(self):
+        descriptor = self.current_result_descriptor
+        coverage = descriptor.coverage if isinstance(descriptor, ResultDescriptor) else None
+        if coverage is None:
+            return
+        def format_time(seconds):
+            value = max(0.0, float(seconds))
+            hours = int(value // 3600)
+            minutes = int((value % 3600) // 60)
+            remainder = value % 60
+            return (
+                f"{hours:02d}:{minutes:02d}:{remainder:05.2f}"
+                if hours
+                else f"{minutes:02d}:{remainder:05.2f}"
+            )
+
+        lines = [
+            f"{index}. {format_time(float(item['start']))}–"
+            f"{format_time(float(item['end']))}"
+            for index, item in enumerate(
+                coverage.remaining_speech_active_gap_ranges,
+                start=1,
+            )
+        ]
+        messagebox.showinfo(
+            "Incomplete coverage ranges",
+            "Speech-active ranges that may be missing:\n\n" + "\n".join(lines),
+            parent=self.winfo_toplevel(),
+        )
 
     @staticmethod
     def _validated_result_paths(speakers_json, segments_json):
@@ -6373,6 +6465,7 @@ class ReviewNamePage(ttk.Frame):
         elif requested_descriptor is not None:
             requested_identity = requested_descriptor.file_identity
         supplied_identity = requested_identity
+        current_descriptor = None
         requested_paths = (
             requested_identity.paths
             if requested_identity is not None
@@ -6388,6 +6481,8 @@ class ReviewNamePage(ttk.Frame):
                         "[review] The pending result changed before loading; using the latest validated revision."
                     )
             result_preflight = _preflight_review_result(*requested_paths)
+            if current_descriptor is None:
+                current_descriptor = descriptor_from_json_pair(*requested_paths)
         except Exception as exc:
             self._report(f"[review] Result validation failed: {exc}")
             messagebox.showerror(
@@ -6408,6 +6503,8 @@ class ReviewNamePage(ttk.Frame):
             and self.current_result_identity is not None
             and result_identity == self.current_result_identity
         ):
+            self.current_result_descriptor = current_descriptor
+            self._set_incomplete_warning(current_descriptor)
             self.on_activated()
             return True
 
@@ -6465,6 +6562,7 @@ class ReviewNamePage(ttk.Frame):
         old_workspace = self.workspace
         old_result_paths = self.current_result_paths
         old_result_identity = self.current_result_identity
+        old_result_descriptor = getattr(self, "current_result_descriptor", None)
         existing_children = set(self.winfo_children())
         new_workspace = None
         try:
@@ -6511,7 +6609,7 @@ class ReviewNamePage(ttk.Frame):
         try:
             if old_workspace is not None:
                 old_player_snapshot = old_workspace._suspend_embedded_player_for_replacement()
-            new_workspace.grid(row=1, column=0, sticky="nsew")
+            new_workspace.grid(row=2, column=0, sticky="nsew")
             new_workspace.start()
         except Exception as exc:
             self._dispose_workspace(
@@ -6528,6 +6626,7 @@ class ReviewNamePage(ttk.Frame):
             self.workspace = old_workspace
             self.current_result_paths = old_result_paths
             self.current_result_identity = old_result_identity
+            self.current_result_descriptor = old_result_descriptor
             if old_workspace is None:
                 self.empty_state.grid()
 
@@ -6557,12 +6656,25 @@ class ReviewNamePage(ttk.Frame):
         self.workspace = new_workspace
         self.current_result_paths = result_paths
         self.current_result_identity = verified_preflight.identity
+        self.current_result_descriptor = current_descriptor
+        self._set_incomplete_warning(current_descriptor)
+        if current_descriptor.status == "incomplete":
+            self._report(
+                "[review] Loaded an Incomplete result. Some speech may be missing."
+            )
         return True
 
     def _on_workspace_applied(self):
         if self.workspace is not None:
             self.current_result_identity = self.workspace.result_identity
             self.current_result_paths = self.current_result_identity.paths
+            try:
+                self.current_result_descriptor = descriptor_from_json_pair(
+                    *self.current_result_paths
+                )
+            except Exception as exc:
+                self._report(f"[review] Could not refresh result status after Apply: {exc}")
+            self._set_incomplete_warning(self.current_result_descriptor)
             self.workspace.refresh_available_subtitles()
         if self._apply_complete_callback is not None:
             self._apply_complete_callback()
@@ -6572,6 +6684,9 @@ class ReviewNamePage(ttk.Frame):
         self.workspace = None
         self.current_result_paths = None
         self.current_result_identity = None
+        self.current_result_descriptor = None
+        if hasattr(self, "incomplete_banner"):
+            self.incomplete_banner.grid_remove()
         if workspace is None:
             return
         workspace.shutdown()
@@ -7418,6 +7533,7 @@ class App(ttk.Frame):
             "Cancelling": "warning",
             "Cancelled": "secondary",
             "Complete": "success",
+            "Completed with warnings": "warning",
             "Failed": "danger",
         }
         self._runtime_status = status
@@ -7434,9 +7550,9 @@ class App(ttk.Frame):
             self.btn_cancel.configure(state="disabled")
             if status == "Ready":
                 self._reset_progress("Ready")
-            elif status == "Complete":
+            elif status in ("Complete", "Completed with warnings"):
                 self._last_progress = 100
-                self._set_progress_display("Complete", 100)
+                self._set_progress_display(status, 100)
             elif status in ("Failed", "Cancelled"):
                 self._set_progress_display(status, self._last_progress)
 
@@ -8093,7 +8209,18 @@ class App(ttk.Frame):
                         if self.cancel_requested:
                             self._set_runtime_state("Cancelled")
                         elif event[1] == 0:
-                            self._set_runtime_state("Complete")
+                            pending_result = getattr(
+                                self, "pending_review_result", None
+                            )
+                            completed_with_warnings = (
+                                isinstance(pending_result, ResultDescriptor)
+                                and pending_result.status == "incomplete"
+                            )
+                            self._set_runtime_state(
+                                "Completed with warnings"
+                                if completed_with_warnings
+                                else "Complete"
+                            )
                             self._open_completed_review_result()
                         else:
                             self._set_runtime_state("Failed")
@@ -8285,7 +8412,8 @@ class App(ttk.Frame):
 
         self.pending_review_result = None
         self.show_page("review")
-        self.log("[review] Loaded the final completed result.")
+        if pending.status != "incomplete":
+            self.log("[review] Loaded the final completed result.")
         return True
 
     def _latest_review_result(self):
@@ -8303,7 +8431,7 @@ class App(ttk.Frame):
         candidates = [
             descriptor
             for descriptor in catalog.results
-            if descriptor.status == "complete"
+            if descriptor.status in {"complete", "incomplete"}
         ]
         if not candidates:
             if catalog.issues:

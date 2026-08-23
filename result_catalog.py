@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -58,6 +59,25 @@ class ResultPreflight:
 
 
 @dataclass(frozen=True)
+class ResultCoverage:
+    coverage_complete: bool
+    remaining_speech_active_gap_count: int
+    remaining_speech_active_gap_duration: float
+    remaining_speech_active_gap_ranges: tuple[Mapping[str, Any], ...]
+    selected_strategy: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "remaining_speech_active_gap_ranges",
+            tuple(
+                MappingProxyType(dict(item))
+                for item in self.remaining_speech_active_gap_ranges
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class ResultDescriptor:
     project_id: Optional[str]
     result_id: str
@@ -78,6 +98,7 @@ class ResultDescriptor:
     created_at: Optional[datetime]
     modified_at: Optional[datetime]
     comparison_job_id: Optional[str]
+    coverage: Optional[ResultCoverage] = None
     pending: bool = False
 
     def __post_init__(self) -> None:
@@ -179,6 +200,7 @@ class ResultManifest:
     mode: Optional[str]
     execution_backend: Optional[str]
     status: str
+    coverage: Optional[ResultCoverage]
     source_identity: Mapping[str, Any]
     source_path: Path
     created_at: Optional[datetime]
@@ -448,6 +470,92 @@ def _manifest_fingerprints(data: Any, label: str) -> tuple[str, str]:
     return speakers_hash, segments_hash
 
 
+def _validate_result_coverage(value: Any, status: str, label: str) -> Optional[ResultCoverage]:
+    if value is None:
+        if status == "incomplete":
+            raise ManifestValidationError(f"{label} is required for an incomplete result.")
+        return None
+    if status not in {"complete", "incomplete"} or not isinstance(value, dict):
+        raise ManifestValidationError(f"{label} is invalid for result status {status!r}.")
+    required = {
+        "coverage_complete",
+        "remaining_speech_active_gap_count",
+        "remaining_speech_active_gap_duration",
+        "remaining_speech_active_gap_ranges",
+        "selected_strategy",
+    }
+    if set(value) != required:
+        raise ManifestValidationError(f"{label} fields are invalid.")
+    complete = value["coverage_complete"]
+    count = value["remaining_speech_active_gap_count"]
+    duration = value["remaining_speech_active_gap_duration"]
+    ranges = value["remaining_speech_active_gap_ranges"]
+    strategy = value["selected_strategy"]
+    if (
+        not isinstance(complete, bool)
+        or complete != (status == "complete")
+        or isinstance(count, bool)
+        or not isinstance(count, int)
+        or count < 0
+        or isinstance(duration, bool)
+        or not isinstance(duration, (int, float))
+        or not math.isfinite(float(duration))
+        or float(duration) < 0
+        or not isinstance(strategy, str)
+        or not strategy.strip()
+        or not isinstance(ranges, list)
+        or len(ranges) != count
+    ):
+        raise ManifestValidationError(f"{label} summary is invalid.")
+    if complete and (count != 0 or float(duration) != 0.0):
+        raise ManifestValidationError(f"{label} reports gaps for a complete result.")
+    if not complete and (count <= 0 or float(duration) <= 0.0):
+        raise ManifestValidationError(f"{label} does not report gaps for an incomplete result.")
+    validated_ranges = []
+    for item in ranges:
+        if not isinstance(item, dict) or set(item) != {
+            "start",
+            "end",
+            "duration",
+            "active_seconds",
+            "active_blocks",
+        }:
+            raise ManifestValidationError(f"{label} ranges are invalid.")
+        numeric = (item["start"], item["end"], item["duration"], item["active_seconds"])
+        if any(
+            isinstance(current, bool)
+            or not isinstance(current, (int, float))
+            or not math.isfinite(float(current))
+            or float(current) < 0
+            for current in numeric
+        ) or (
+            isinstance(item["active_blocks"], bool)
+            or not isinstance(item["active_blocks"], int)
+            or item["active_blocks"] < 0
+            or float(item["end"]) <= float(item["start"])
+            or not math.isclose(
+                float(item["duration"]),
+                float(item["end"]) - float(item["start"]),
+                abs_tol=0.002,
+            )
+        ):
+            raise ManifestValidationError(f"{label} ranges are invalid.")
+        validated_ranges.append(dict(item))
+    if not math.isclose(
+        sum(float(item["duration"]) for item in validated_ranges),
+        float(duration),
+        abs_tol=max(0.002, 0.002 * max(1, count)),
+    ):
+        raise ManifestValidationError(f"{label} range duration is inconsistent.")
+    return ResultCoverage(
+        coverage_complete=complete,
+        remaining_speech_active_gap_count=count,
+        remaining_speech_active_gap_duration=float(duration),
+        remaining_speech_active_gap_ranges=tuple(validated_ranges),
+        selected_strategy=strategy.strip(),
+    )
+
+
 def validate_project_manifest(path: Path | str) -> ProjectManifest:
     manifest_path = Path(path)
     if manifest_path.is_dir():
@@ -623,6 +731,11 @@ def validate_result_manifest(
             "result.json engine does not match its containing engine directory."
         )
     status = _validate_status(data.get("status"), "result.json status")
+    coverage = _validate_result_coverage(
+        data.get("coverage"),
+        status,
+        "result.json coverage",
+    )
     source_identity, source_path = _manifest_source(data.get("source"), "result.json source")
     paths = data.get("paths")
     if not isinstance(paths, dict):
@@ -664,6 +777,7 @@ def validate_result_manifest(
             data.get("execution_backend"), "result.json execution_backend"
         ),
         status=status,
+        coverage=coverage,
         source_identity=source_identity,
         source_path=source_path,
         created_at=_parse_timestamp(data.get("created_at"), "result.json created_at"),
@@ -771,6 +885,7 @@ def _legacy_descriptor(preflight: ResultPreflight, pending: bool) -> ResultDescr
         created_at=created_at,
         modified_at=modified_at,
         comparison_job_id=None,
+        coverage=None,
         pending=pending,
     )
 
@@ -845,6 +960,7 @@ def _project_descriptor(
         mode=result_manifest.mode,
         execution_backend=result_manifest.execution_backend,
         status=result_manifest.status,
+        coverage=result_manifest.coverage,
         source_identity=result_manifest.source_identity,
         source_path=result_manifest.source_path,
         source_state=determine_source_state(
@@ -1042,6 +1158,7 @@ __all__ = [
     "ManifestValidationError",
     "ProjectManifest",
     "ResultCatalogError",
+    "ResultCoverage",
     "ResultDescriptor",
     "ResultFileIdentity",
     "ResultManifest",

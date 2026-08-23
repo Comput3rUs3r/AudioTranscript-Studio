@@ -13,6 +13,31 @@ import result_catalog as catalog
 import split_audio_gui as gui
 
 
+def incomplete_coverage():
+    return {
+        "coverage_complete": False,
+        "remaining_speech_active_gap_count": 2,
+        "remaining_speech_active_gap_duration": 9.5,
+        "remaining_speech_active_gap_ranges": [
+            {
+                "start": 10.0,
+                "end": 14.0,
+                "duration": 4.0,
+                "active_seconds": 2.0,
+                "active_blocks": 2,
+            },
+            {
+                "start": 20.0,
+                "end": 25.5,
+                "duration": 5.5,
+                "active_seconds": 3.0,
+                "active_blocks": 3,
+            },
+        ],
+        "selected_strategy": "continuation_plus_targeted_recovery",
+    }
+
+
 class ResultFixture:
     def __init__(self, root: Path):
         self.root = root
@@ -58,6 +83,8 @@ class ResultFixture:
         model="medium",
         mode="verbatim",
         execution_backend="transformers",
+        status="complete",
+        coverage=None,
     ):
         project_root = self.root / "output" / project_name
         result_root = project_root / engine / revision
@@ -100,7 +127,7 @@ class ResultFixture:
             "model": model,
             "mode": mode,
             "execution_backend": execution_backend,
-            "status": "complete",
+            "status": status,
             "source": {
                 "identity": source_identity,
                 "last_known_path": str(self.source.resolve()),
@@ -117,6 +144,8 @@ class ResultFixture:
             },
             "comparison_job_id": None,
         }
+        if coverage is not None:
+            result_manifest["coverage"] = coverage
         result_manifest_path = result_root / "result.json"
         self._write_json(result_manifest_path, result_manifest)
         relative_root = result_root.relative_to(project_root).as_posix()
@@ -137,7 +166,7 @@ class ResultFixture:
                     "model": model,
                     "mode": mode,
                     "execution_backend": execution_backend,
-                    "status": "complete",
+                    "status": status,
                     **timestamps,
                     "paths": {
                         "root": relative_root,
@@ -246,6 +275,41 @@ class ResultCatalogTests(unittest.TestCase):
         self.assertEqual(descriptor.model, "medium")
         self.assertEqual(descriptor.source_state, "available")
         self.assertFalse(discovery.issues)
+
+    def test_incomplete_project_coverage_survives_validation_and_discovery(self):
+        coverage = incomplete_coverage()
+        paths = self.fixture.project_result(
+            status="incomplete",
+            coverage=coverage,
+        )
+        manifest = catalog.validate_result_manifest(paths["result_manifest"])
+        descriptor = catalog.descriptor_from_json_pair(
+            paths["speakers"], paths["segments"]
+        )
+        discovered = catalog.discover_results(self.root / "output").results
+
+        self.assertEqual(manifest.status, "incomplete")
+        self.assertFalse(manifest.coverage.coverage_complete)
+        self.assertEqual(descriptor.status, "incomplete")
+        self.assertEqual(
+            descriptor.coverage.remaining_speech_active_gap_duration,
+            coverage["remaining_speech_active_gap_duration"],
+        )
+        self.assertEqual(discovered, (descriptor,))
+
+    def test_incomplete_project_requires_valid_coverage_metadata(self):
+        paths = self.fixture.project_result(
+            status="incomplete",
+            coverage=incomplete_coverage(),
+        )
+        data = json.loads(paths["result_manifest"].read_text(encoding="utf-8"))
+        data["coverage"]["remaining_speech_active_gap_ranges"] = []
+        self.fixture._write_json(paths["result_manifest"], data)
+        with self.assertRaises(catalog.ManifestValidationError):
+            catalog.validate_result_manifest(paths["result_manifest"])
+        discovery = catalog.discover_results(self.root / "output")
+        self.assertFalse(discovery.results)
+        self.assertTrue(discovery.issues)
 
     def test_malformed_project_index_does_not_hide_valid_result_sidecar(self):
         paths = self.fixture.project_result()
@@ -387,6 +451,67 @@ class ResultCatalogGuiIntegrationTests(unittest.TestCase):
         self.assertIsInstance(app.pending_review_result, catalog.ResultDescriptor)
         self.assertTrue(app.pending_review_result.pending)
         self.assertEqual(app.pending_review_result.paths, (speakers.resolve(), segments.resolve()))
+        app.after.assert_called_once_with(200, app._poll_queue)
+
+    def test_incomplete_review_warning_persists_across_activation_and_revert(self):
+        paths = self.fixture.project_result(
+            status="incomplete",
+            coverage=incomplete_coverage(),
+        )
+        descriptor = catalog.descriptor_from_json_pair(
+            paths["speakers"], paths["segments"]
+        )
+        page = object.__new__(gui.ReviewNamePage)
+        page.incomplete_banner = mock.Mock()
+        page.lbl_incomplete_warning = mock.Mock()
+        page.current_result_descriptor = descriptor
+        page.workspace = mock.Mock()
+
+        page._set_incomplete_warning(descriptor)
+        warning_text = page.lbl_incomplete_warning.configure.call_args.kwargs["text"]
+        self.assertIn("Incomplete CrisperWhisper coverage", warning_text)
+        self.assertIn("2 speech-active gaps totaling 9.50 seconds", warning_text)
+        page.workspace.revert_unsaved_changes.return_value = True
+        self.assertTrue(page.workspace.revert_unsaved_changes())
+        page.on_activated()
+        page.incomplete_banner.grid_remove.assert_not_called()
+        page.workspace.on_host_activated.assert_called_once_with()
+
+    def test_complete_review_has_no_incomplete_warning(self):
+        paths = self.fixture.project_result()
+        descriptor = catalog.descriptor_from_json_pair(
+            paths["speakers"], paths["segments"]
+        )
+        page = object.__new__(gui.ReviewNamePage)
+        page.incomplete_banner = mock.Mock()
+        page.lbl_incomplete_warning = mock.Mock()
+        page._set_incomplete_warning(descriptor)
+        page.incomplete_banner.grid_remove.assert_called_once_with()
+        page.lbl_incomplete_warning.configure.assert_not_called()
+
+    def test_incomplete_process_completion_uses_warning_runtime_state(self):
+        paths = self.fixture.project_result(
+            status="incomplete",
+            coverage=incomplete_coverage(),
+        )
+        descriptor = catalog.descriptor_from_json_pair(
+            paths["speakers"], paths["segments"], pending=True
+        )
+        app = object.__new__(gui.App)
+        app.queue = queue.Queue()
+        app.queue.put(("process_finished", 0))
+        app.proc = mock.Mock()
+        app.cancel_requested = False
+        app.pending_review_result = descriptor
+        app.log = mock.Mock()
+        app._set_runtime_state = mock.Mock()
+        app._open_completed_review_result = mock.Mock()
+        app.after = mock.Mock()
+
+        app._poll_queue()
+
+        app._set_runtime_state.assert_called_once_with("Completed with warnings")
+        app._open_completed_review_result.assert_called_once_with()
         app.after.assert_called_once_with(200, app._poll_queue)
 
 

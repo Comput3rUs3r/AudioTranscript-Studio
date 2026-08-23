@@ -158,6 +158,7 @@ def make_coverage_metadata(*, fallback=False):
         "recovered_duration": initial_active_duration if fallback else 0.0,
         "remaining_speech_active_gap_count": 0,
         "remaining_speech_active_gap_duration": 0.0,
+        "remaining_speech_active_gap_ranges": [],
         "configuration": configuration,
         "candidate_audits": candidate_audits,
         "warnings": (
@@ -182,6 +183,7 @@ def make_timestamp_diagnostic():
         "current_start": 182.58,
         "current_end": 183.1,
         "overlap_duration": 1.42,
+        "overlap_milliseconds": 1420.0,
         "crosses_native_chunk_boundary": True,
         "previous_chunk_window": {"chunk_index": 11, "start": 156.0, "end": 186.0},
         "current_chunk_window": {"chunk_index": 12, "start": 182.0, "end": 212.0},
@@ -193,6 +195,7 @@ def make_timestamp_diagnostic():
         "current_boundary_was_repaired": False,
         "repair_actions_attempted": [],
         "reason": "previous_end_exceeds_current_start_beyond_tolerance",
+        "repair_failure_reason": "overlap_exceeds_tolerance",
         "tolerance_seconds": 0.25,
     }
 
@@ -309,10 +312,11 @@ def make_targeted_recovery_metadata(*, complete=True):
     }
 
 
-def make_targeted_coverage_metadata():
-    targeted = make_targeted_recovery_metadata()
+def make_targeted_coverage_metadata(*, complete=True):
+    targeted = make_targeted_recovery_metadata(complete=complete)
     primary = make_error_coverage_audit([(1.0, 12.0)])
     fallback = copy.deepcopy(primary)
+    final = targeted["final_coverage_audit"]
     return {
         "requested_strategy": "continuation",
         "attempted_strategies": ["continuation", "chunked_lcs"],
@@ -325,11 +329,13 @@ def make_targeted_coverage_metadata():
         "silence_gap_count": primary["silence_gap_count"],
         "silence_gap_duration": primary["silence_gap_duration"],
         "speech_active_gap_ranges": copy.deepcopy(primary["speech_active_gap_ranges"]),
-        "recovered_gap_count": primary["speech_active_gap_count"],
-        "recovered_duration": primary["speech_active_gap_duration"],
-        "remaining_speech_active_gap_count": 0,
-        "remaining_speech_active_gap_duration": 0.0,
-        "remaining_speech_active_gap_ranges": [],
+        "recovered_gap_count": targeted["recovered_gap_count"],
+        "recovered_duration": targeted["recovered_duration"],
+        "remaining_speech_active_gap_count": final["speech_active_gap_count"],
+        "remaining_speech_active_gap_duration": final["speech_active_gap_duration"],
+        "remaining_speech_active_gap_ranges": copy.deepcopy(
+            final["speech_active_gap_ranges"]
+        ),
         "known_diagnostic_interval": copy.deepcopy(
             targeted["final_coverage_audit"]["known_diagnostic_interval"]
         ),
@@ -343,6 +349,28 @@ def make_targeted_coverage_metadata():
             "Targeted context-free short windows passed the final speech-active coverage audit."
         ],
     }
+
+
+def classify_response(response, *, complete, coverage=None):
+    response = copy.deepcopy(response)
+    coverage = coverage or make_targeted_coverage_metadata(complete=complete)
+    response["status"] = "complete" if complete else "incomplete"
+    response["coverage_complete"] = complete
+    response["remaining_speech_active_gap_count"] = coverage[
+        "remaining_speech_active_gap_count"
+    ]
+    response["remaining_speech_active_gap_duration"] = coverage[
+        "remaining_speech_active_gap_duration"
+    ]
+    response["remaining_speech_active_gap_ranges"] = copy.deepcopy(
+        coverage["remaining_speech_active_gap_ranges"]
+    )
+    response["selected_strategy"] = coverage["selected_strategy"]
+    response["settings"]["effective"]["longform"]["strategy"] = coverage[
+        "selected_strategy"
+    ]
+    response["transcription"]["longform_coverage"] = coverage
+    return response
 
 
 def event(payload):
@@ -501,6 +529,34 @@ class ProtocolTests(AdapterTestCase):
         with self.assertRaisesRegex(backend.CrisperWhisperProtocolError, "counts"):
             backend.validate_transcribe_response(malformed, settings)
 
+        clustered = make_response(settings)
+        clustered["transcription"]["word_timestamp_repairs"] = {
+            "repair_count": 1,
+            "categories": {"cross_chunk_overlap_cluster_reflow": 1},
+            "cluster_reflows": [
+                {"word_count": 2, "max_displacement_milliseconds": 20.0}
+            ],
+            "words_remained_untimed": False,
+            "untimed_word_count": 0,
+            "warnings": ["Minor word timestamp anomalies were normalized conservatively."],
+        }
+        validated = backend.validate_transcribe_response(clustered, settings)
+        self.assertEqual(
+            validated["transcription"]["word_timestamp_repairs"]["cluster_reflows"],
+            [{"word_count": 2, "max_displacement_milliseconds": 20.0}],
+        )
+        for mutate in (
+            lambda metadata: metadata.pop("cluster_reflows"),
+            lambda metadata: metadata["cluster_reflows"][0].update(word_count=9),
+            lambda metadata: metadata["cluster_reflows"][0].update(
+                max_displacement_milliseconds=250.01
+            ),
+        ):
+            malformed = copy.deepcopy(clustered)
+            mutate(malformed["transcription"]["word_timestamp_repairs"])
+            with self.assertRaises(backend.CrisperWhisperProtocolError):
+                backend.validate_transcribe_response(malformed, settings)
+
     def test_optional_coverage_metadata_accepts_valid_fallback_and_rejects_inconsistency(self):
         settings = make_settings()
         legacy_response = make_response(settings)
@@ -604,6 +660,54 @@ class ProtocolTests(AdapterTestCase):
                 with self.assertRaises(backend.CrisperWhisperProtocolError):
                     backend.validate_transcribe_response(malformed, settings)
 
+    def test_complete_and_incomplete_protocol_one_classification_is_strict(self):
+        settings = make_settings()
+        complete = classify_response(
+            make_response(settings),
+            complete=True,
+        )
+        validated_complete = backend.validate_transcribe_response(complete, settings)
+        self.assertEqual(validated_complete["status"], "complete")
+        self.assertTrue(validated_complete["coverage_complete"])
+
+        incomplete = classify_response(
+            make_response(settings),
+            complete=False,
+        )
+        validated_incomplete = backend.validate_transcribe_response(incomplete, settings)
+        normalized = backend.normalize_worker_result(validated_incomplete)
+        self.assertEqual(normalized["transcription"]["result_status"], "incomplete")
+        self.assertFalse(normalized["transcription"]["coverage_complete"])
+        self.assertEqual(
+            normalized["transcription"]["remaining_speech_active_gap_count"],
+            1,
+        )
+        self.assertEqual(
+            normalized["transcription"]["remaining_speech_active_gap_ranges"],
+            incomplete["remaining_speech_active_gap_ranges"],
+        )
+
+        malformed_cases = []
+        malformed = copy.deepcopy(incomplete)
+        malformed["coverage_complete"] = True
+        malformed_cases.append(malformed)
+        malformed = copy.deepcopy(incomplete)
+        malformed["remaining_speech_active_gap_count"] = 0
+        malformed_cases.append(malformed)
+        malformed = copy.deepcopy(incomplete)
+        malformed["remaining_speech_active_gap_ranges"] = []
+        malformed_cases.append(malformed)
+        malformed = copy.deepcopy(incomplete)
+        malformed["selected_strategy"] = "chunked_lcs"
+        malformed_cases.append(malformed)
+        malformed = copy.deepcopy(incomplete)
+        del malformed["coverage_complete"]
+        malformed_cases.append(malformed)
+        for malformed in malformed_cases:
+            with self.subTest(malformed=malformed):
+                with self.assertRaises(backend.CrisperWhisperProtocolError):
+                    backend.validate_transcribe_response(malformed, settings)
+
     def test_incomplete_targeted_recovery_error_details_are_strictly_validated(self):
         details = make_coverage_failure_diagnostic()
         targeted = make_targeted_recovery_metadata(complete=False)
@@ -646,10 +750,53 @@ class ProtocolTests(AdapterTestCase):
         malformed = copy.deepcopy(details)
         malformed["repair_actions_attempted"] = ["discarded_duplicate_text"]
         malformed_cases.append(malformed)
+        malformed = copy.deepcopy(details)
+        malformed["overlap_milliseconds"] = 20.0
+        malformed_cases.append(malformed)
+        malformed = copy.deepcopy(details)
+        malformed["repair_failure_reason"] = "contains transcript text"
+        malformed_cases.append(malformed)
+        malformed = copy.deepcopy(details)
+        del malformed["overlap_milliseconds"]
+        malformed_cases.append(malformed)
         for malformed in malformed_cases:
             with self.subTest(malformed=malformed):
                 with self.assertRaises(backend.CrisperWhisperProtocolError):
                     backend.validate_worker_error_details(malformed)
+
+        cluster = make_timestamp_diagnostic()
+        cluster.update(
+            {
+                "previous_end": 183.0,
+                "current_start": 182.98,
+                "overlap_duration": 0.02,
+                "overlap_milliseconds": 20.0,
+                "reason": "overlap_has_no_positive_repair_interval",
+                "repair_failure_reason": "cluster_insufficient_available_span",
+                "cluster_words_examined": 2,
+                "cluster_required_span_milliseconds": 40.0,
+                "cluster_available_span_milliseconds": 30.0,
+            }
+        )
+        self.assertEqual(backend.validate_worker_error_details(cluster), cluster)
+        for key in (
+            "cluster_words_examined",
+            "cluster_required_span_milliseconds",
+            "cluster_available_span_milliseconds",
+        ):
+            malformed = copy.deepcopy(cluster)
+            del malformed[key]
+            with self.assertRaises(backend.CrisperWhisperProtocolError):
+                backend.validate_worker_error_details(malformed)
+        malformed = copy.deepcopy(cluster)
+        malformed["cluster_words_examined"] = 10
+        with self.assertRaises(backend.CrisperWhisperProtocolError):
+            backend.validate_worker_error_details(malformed)
+        malformed = copy.deepcopy(cluster)
+        del malformed["overlap_milliseconds"]
+        del malformed["repair_failure_reason"]
+        with self.assertRaises(backend.CrisperWhisperProtocolError):
+            backend.validate_worker_error_details(malformed)
 
     def test_coverage_failure_diagnostic_retains_both_audits_and_rejects_unsafe_data(self):
         details = make_coverage_failure_diagnostic()

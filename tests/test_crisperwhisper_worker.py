@@ -445,7 +445,10 @@ class TranscriptionTests(WorkerTestCase):
                 "device_index": 0,
             },
         )
-        self.assertEqual(response["status"], "success")
+        self.assertEqual(response["status"], "complete")
+        self.assertTrue(response["coverage_complete"])
+        self.assertEqual(response["remaining_speech_active_gap_count"], 0)
+        self.assertEqual(response["remaining_speech_active_gap_ranges"], [])
         self.assertEqual(response["transcription"]["text"], "Hello world.")
         self.assertEqual(response["transcription"]["mode"], "verbatim")
         self.assertEqual(len(response["transcription"]["words"]), 2)
@@ -752,8 +755,8 @@ class WordTimestampNormalizationTests(WorkerTestCase):
 
 
 class TimestampDiagnosticTests(WorkerTestCase):
-    def rejected_details(self, words, chunks):
-        result = native_result(words, duration=60.0, chunks=chunks)
+    def rejected_details(self, words, chunks, *, duration=60.0):
+        result = native_result(words, duration=duration, chunks=chunks)
         with self.assertRaises(worker.TranscriptionError) as raised:
             worker._normalize_transcription_candidate(
                 result,
@@ -790,8 +793,236 @@ class TimestampDiagnosticTests(WorkerTestCase):
             (11, 12),
         )
         self.assertAlmostEqual(details["overlap_duration"], 1.42)
+        self.assertAlmostEqual(details["overlap_milliseconds"], 1420.0)
+        self.assertEqual(
+            details["repair_failure_reason"],
+            "overlap_exceeds_tolerance",
+        )
         self.assertFalse(details["repeated_token_sequence"])
         self.assertFalse(details["timestamp_reset_relative_to_chunk_start"])
+
+    def test_twenty_millisecond_cross_chunk_overlap_moves_later_start(self):
+        chunks = [
+            native_chunk(8, 0.0, 30.0, "private-alpha"),
+            native_chunk(9, 26.0, 56.0, "private-beta", is_last=True),
+        ]
+        candidate = worker._normalize_transcription_candidate(
+            native_result(
+                [
+                    ("private-alpha", 26.98, 27.00),
+                    ("private-beta", 26.98, 27.40),
+                ],
+                duration=60.0,
+                chunks=chunks,
+            ),
+            "verbatim",
+            model_family="large",
+            strategy="continuation",
+        )
+
+        self.assertEqual(
+            [word["word"] for word in candidate["words"]],
+            ["private-alpha", "private-beta"],
+        )
+        self.assertEqual(candidate["words"][0]["start"], 26.98)
+        self.assertEqual(candidate["words"][0]["end"], 27.00)
+        self.assertEqual(candidate["words"][1]["start"], 27.00)
+        self.assertEqual(candidate["words"][1]["end"], 27.40)
+        self.assertEqual(
+            candidate["word_timestamp_repairs"]["categories"],
+            {"cross_chunk_overlap_start_shift": 1},
+        )
+        self.assertEqual(candidate["word_timestamp_repairs"]["repair_count"], 1)
+        self.assertEqual([chunk["chunk_index"] for chunk in candidate["chunks"]], [8, 9])
+
+    def test_cross_chunk_overlap_can_use_bounded_minimum_end(self):
+        candidate = worker._normalize_transcription_candidate(
+            native_result(
+                [
+                    ("private-alpha", 26.98, 27.00),
+                    ("private-beta", 26.99, 27.01),
+                    ("private-gamma", 27.05, 27.40),
+                ],
+                duration=60.0,
+                chunks=[
+                    native_chunk(8, 0.0, 30.0, "private-alpha"),
+                    native_chunk(
+                        9,
+                        26.0,
+                        56.0,
+                        "private-beta private-gamma",
+                        is_last=True,
+                    ),
+                ],
+            ),
+            "verbatim",
+            model_family="large",
+            strategy="continuation",
+        )
+
+        repaired = candidate["words"][1]
+        self.assertEqual(repaired["start"], 27.00)
+        self.assertAlmostEqual(
+            repaired["end"] - repaired["start"],
+            worker.WORD_MIN_REPAIR_DURATION_SECONDS,
+        )
+        self.assertEqual(
+            candidate["word_timestamp_repairs"]["categories"],
+            {"cross_chunk_overlap_bounded_end_adjustment": 1},
+        )
+
+    def test_real_twenty_millisecond_boundary_uses_smallest_cluster_reflow(self):
+        candidate = worker._normalize_transcription_candidate(
+            native_result(
+                [
+                    ("private-alpha", 26.98, 27.00),
+                    ("private-beta", 26.98, 27.005),
+                    ("private-gamma", 27.015, 27.40),
+                    ("private-delta", 27.45, 27.80),
+                ],
+                duration=60.0,
+                chunks=[
+                    native_chunk(8, 0.0, 30.0, "private-alpha"),
+                    native_chunk(
+                        9,
+                        26.0,
+                        56.0,
+                        "private-beta private-gamma private-delta",
+                        is_last=True,
+                    ),
+                ],
+            ),
+            "verbatim",
+            model_family="large",
+            strategy="continuation",
+        )
+
+        words = candidate["words"]
+        self.assertEqual(
+            [word["word"] for word in words],
+            ["private-alpha", "private-beta", "private-gamma", "private-delta"],
+        )
+        self.assertEqual(len(words), 4)
+        self.assertEqual((words[0]["start"], words[0]["end"]), (26.98, 27.00))
+        self.assertEqual((words[1]["start"], words[1]["end"]), (27.00, 27.02))
+        self.assertEqual((words[2]["start"], words[2]["end"]), (27.02, 27.40))
+        self.assertEqual((words[3]["start"], words[3]["end"]), (27.45, 27.80))
+        repairs = candidate["word_timestamp_repairs"]
+        self.assertEqual(
+            repairs["categories"],
+            {"cross_chunk_overlap_cluster_reflow": 1},
+        )
+        self.assertEqual(repairs["cluster_reflows"][0]["word_count"], 2)
+        self.assertAlmostEqual(
+            repairs["cluster_reflows"][0]["max_displacement_milliseconds"],
+            20.0,
+        )
+        self.assertEqual([chunk["chunk_index"] for chunk in candidate["chunks"]], [8, 9])
+
+    def test_cluster_with_insufficient_downstream_space_remains_fatal(self):
+        details = self.rejected_details(
+            [
+                ("private-alpha", 0.98, 1.00),
+                ("private-beta", 0.98, 1.005),
+                ("private-gamma", 1.015, 1.025),
+            ],
+            [
+                native_chunk(8, 0.0, 1.0, "private-alpha"),
+                native_chunk(
+                    9,
+                    0.8,
+                    1.03,
+                    "private-beta private-gamma",
+                    is_last=True,
+                ),
+            ],
+            duration=1.03,
+        )
+        self.assertAlmostEqual(details["overlap_milliseconds"], 20.0)
+        self.assertEqual(
+            details["repair_failure_reason"],
+            "cluster_insufficient_available_span",
+        )
+        self.assertEqual(details["cluster_words_examined"], 2)
+        self.assertAlmostEqual(details["cluster_required_span_milliseconds"], 40.0)
+        self.assertAlmostEqual(details["cluster_available_span_milliseconds"], 30.0)
+        self.assertNotIn("private", json.dumps(details))
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            worker._emit_timestamp_overlap_status(details)
+        status = stdout.getvalue()
+        self.assertIn("20 ms overlap", status)
+        self.assertIn("insufficient downstream time", status)
+        self.assertIn("examined 2 words", status)
+        self.assertIn("required 40 ms within 30 ms available", status)
+        self.assertNotIn("private", status)
+
+    def test_cluster_larger_than_eight_words_remains_fatal(self):
+        following = [
+            (f"private-{index}", 0.99 + index * 0.005, 0.995 + index * 0.005)
+            for index in range(9)
+        ]
+        details = self.rejected_details(
+            [("private-anchor", 0.98, 1.00), *following],
+            [
+                native_chunk(8, 0.0, 1.0, "private-anchor"),
+                native_chunk(
+                    9,
+                    0.8,
+                    3.0,
+                    " ".join(word for word, _start, _end in following),
+                    is_last=True,
+                ),
+            ],
+            duration=3.0,
+        )
+        self.assertEqual(
+            details["repair_failure_reason"],
+            "cluster_exceeds_maximum_words",
+        )
+        self.assertEqual(details["cluster_words_examined"], 9)
+
+    def test_cluster_displacement_over_250_milliseconds_remains_fatal(self):
+        details = self.rejected_details(
+            [
+                ("private-anchor", 0.98, 1.00),
+                ("private-beta", 0.75, 0.77),
+                ("private-gamma", 0.775, 0.78),
+                ("private-stable", 1.20, 1.40),
+            ],
+            [
+                native_chunk(8, 0.0, 1.0, "private-anchor"),
+                native_chunk(
+                    9,
+                    0.5,
+                    3.0,
+                    "private-beta private-gamma private-stable",
+                    is_last=True,
+                ),
+            ],
+            duration=3.0,
+        )
+        self.assertAlmostEqual(details["overlap_milliseconds"], 250.0)
+        self.assertEqual(
+            details["repair_failure_reason"],
+            "cluster_displacement_exceeds_tolerance",
+        )
+        self.assertEqual(details["cluster_words_examined"], 2)
+
+    def test_strict_duplicate_range_is_not_repaired_as_distinct_speech(self):
+        details = self.rejected_details(
+            [("Repeat", 26.98, 27.00), ("repeat!", 26.98, 27.40)],
+            [
+                native_chunk(8, 0.0, 30.0, "Repeat"),
+                native_chunk(9, 26.0, 56.0, "repeat!", is_last=True),
+            ],
+        )
+        self.assertTrue(details["normalized_tokens_identical"])
+        self.assertTrue(details["repeated_token_sequence"])
+        self.assertEqual(
+            details["repair_failure_reason"],
+            "strict_token_and_time_duplicate",
+        )
 
     def test_duplicate_word_and_multiword_sequences_are_detected_only_at_boundary(self):
         single = self.rejected_details(
@@ -902,12 +1133,60 @@ class TimestampDiagnosticTests(WorkerTestCase):
         self.assertEqual(return_code, worker.TranscriptionError.exit_code)
         self.assertEqual(error["details"]["effective_strategy"], "continuation")
         self.assertIn(
-            "Timestamp validation rejected a 1.42-second overlap at continuation chunk boundary 11->12.",
+            "Timestamp validation rejected a 1420 ms overlap at continuation chunk boundary 11->12. "
+            "Repair was not applied because the overlap exceeds the 250 ms tolerance.",
             [event.get("message") for event in events],
         )
         self.assertNotIn("sensitive", serialized)
         self.assertNotIn(str(self.audio), serialized)
         self.assertFalse(output_path.exists())
+
+    def test_cli_unsafe_cluster_writes_no_worker_result(self):
+        request_path = self.root / "request.json"
+        output_path = self.root / "result.json"
+        request_path.write_text(
+            json.dumps(make_request(self.audio, family="large")),
+            encoding="utf-8",
+        )
+        malformed = native_result(
+            [
+                ("sensitive-anchor", 0.98, 1.00),
+                ("sensitive-beta", 0.98, 1.005),
+                ("sensitive-gamma", 1.015, 1.025),
+            ],
+            duration=1.03,
+            chunks=[
+                native_chunk(8, 0.0, 1.0, "sensitive-anchor"),
+                native_chunk(
+                    9,
+                    0.8,
+                    1.03,
+                    "sensitive-beta sensitive-gamma",
+                    is_last=True,
+                ),
+            ],
+        )
+        stdout = io.StringIO()
+        with mock.patch.object(FakeModel, "transcribe", return_value=malformed), mock.patch.object(
+            worker, "load_runtime", side_effect=fake_runtime
+        ), redirect_stdout(stdout):
+            return_code = worker.main(
+                ["transcribe", "--request", str(request_path), "--output", str(output_path)]
+            )
+
+        events = [
+            json.loads(line[len(worker.EVENT_PREFIX) :])
+            for line in stdout.getvalue().splitlines()
+            if line.startswith(worker.EVENT_PREFIX)
+        ]
+        self.assertEqual(return_code, worker.TranscriptionError.exit_code)
+        self.assertEqual(
+            events[-1]["details"]["repair_failure_reason"],
+            "cluster_insufficient_available_span",
+        )
+        self.assertFalse(output_path.exists())
+        self.assertEqual(list(self.root.glob(".result.json.*.tmp")), [])
+        self.assertNotIn("sensitive", json.dumps(events[-1]))
 
 
 class TargetedRecoveryTests(WorkerTestCase):
@@ -1511,30 +1790,27 @@ class LongformCoverageTests(WorkerTestCase):
         primary_result.duration = 783.74
         fallback_result.duration = 783.74
         with redirect_stdout(stdout):
-            with self.assertRaises(worker.CoverageError) as raised:
-                self.run_candidates(
-                    primary_result,
-                    fallback_result,
-                    audio=None,
-                    auditor=auditor,
-                )
+            response, _strategies = self.run_candidates(
+                primary_result,
+                fallback_result,
+                audio=None,
+                auditor=auditor,
+            )
 
-        details = raised.exception.details
-        continuation = details["candidate_audits"]["continuation"]
-        fallback = details["candidate_audits"]["chunked_lcs"]
+        self.assertEqual(response["status"], "incomplete")
+        self.assertFalse(response["coverage_complete"])
+        coverage = response["transcription"]["longform_coverage"]
+        continuation = coverage["candidate_audits"]["continuation"]
+        fallback = coverage["candidate_audits"]["chunked_lcs"]
         self.assertEqual(continuation["speech_active_gap_count"], 13)
         self.assertEqual(continuation["speech_active_gap_duration"], 198.4)
         self.assertEqual(fallback["speech_active_gap_count"], 4)
         self.assertEqual(fallback["speech_active_gap_duration"], 31.2)
-        self.assertEqual(details["recovered_gap_count"], 9)
-        self.assertEqual(details["recovered_duration"], 167.2)
-        self.assertEqual(details["remaining_speech_active_gap_count"], 4)
+        self.assertEqual(coverage["recovered_gap_count"], 9)
+        self.assertEqual(coverage["recovered_duration"], 167.2)
+        self.assertEqual(coverage["remaining_speech_active_gap_count"], 4)
         self.assertEqual(
-            details["fallback_rejection_reason"],
-            "targeted_recovery_incomplete",
-        )
-        self.assertEqual(
-            details["targeted_recovery"]["base_selection_reason"],
+            coverage["targeted_recovery"]["base_selection_reason"],
             "chunked_lcs_improved_but_incomplete",
         )
         self.assertFalse(
@@ -1558,15 +1834,19 @@ class LongformCoverageTests(WorkerTestCase):
             activity,
         )
         self.assertIn("Remaining gap ranges:", activity)
+        self.assertIn(
+            "Saving the best available transcript as an Incomplete revision.",
+            activity,
+        )
 
         audits[0]["speech_active_gap_ranges"].clear()
         audits[1]["speech_active_gap_ranges"].clear()
         self.assertEqual(
-            len(details["candidate_audits"]["continuation"]["speech_active_gap_ranges"]),
+            len(coverage["candidate_audits"]["continuation"]["speech_active_gap_ranges"]),
             13,
         )
         self.assertEqual(
-            len(details["candidate_audits"]["chunked_lcs"]["speech_active_gap_ranges"]),
+            len(coverage["candidate_audits"]["chunked_lcs"]["speech_active_gap_ranges"]),
             4,
         )
 
@@ -1607,7 +1887,7 @@ class LongformCoverageTests(WorkerTestCase):
                         ),
                     )
 
-    def test_improved_but_incomplete_fallback_fails_closed(self):
+    def test_improved_but_incomplete_fallback_is_saved_as_incomplete(self):
         fallback = native_result(
             self.points(
                 ["competent."] + [f"fill{index}" for index in range(13)],
@@ -1617,17 +1897,24 @@ class LongformCoverageTests(WorkerTestCase):
             + [("structure", 208.20, 208.70)],
             duration=220.0,
         )
-        with self.assertRaises(worker.CoverageError):
-            self.run_candidates(
-                self.observed_primary(),
-                fallback,
-                audio=synthetic_activity_audio(
-                    220.0,
-                    intervals=((160.0, 181.0), (186.0, 207.0)),
-                ),
-            )
+        response, _strategies = self.run_candidates(
+            self.observed_primary(),
+            fallback,
+            audio=synthetic_activity_audio(
+                220.0,
+                intervals=((160.0, 181.0), (186.0, 207.0)),
+            ),
+        )
+        self.assertEqual(response["status"], "incomplete")
+        self.assertFalse(response["coverage_complete"])
+        self.assertEqual(
+            response["transcription"]["longform_coverage"]["targeted_recovery"][
+                "base_strategy"
+            ],
+            "chunked_lcs",
+        )
 
-    def test_equally_incomplete_or_worse_fallback_fails_closed(self):
+    def test_equally_incomplete_or_worse_fallback_keeps_continuation_base(self):
         worse = native_result(
             [
                 ("competent.", 158.66, 159.06),
@@ -1636,17 +1923,16 @@ class LongformCoverageTests(WorkerTestCase):
             ],
             duration=220.0,
         )
-        with self.assertRaises(worker.CoverageError) as raised:
-            self.run_candidates(
-                self.observed_primary(),
-                worse,
-                audio=synthetic_activity_audio(
-                    220.0,
-                    intervals=((160.0, 189.0), (191.0, 213.0)),
-                ),
-            )
-        details = raised.exception.details
-        self.assertEqual(details["fallback_rejection_reason"], "targeted_recovery_incomplete")
+        response, _strategies = self.run_candidates(
+            self.observed_primary(),
+            worse,
+            audio=synthetic_activity_audio(
+                220.0,
+                intervals=((160.0, 189.0), (191.0, 213.0)),
+            ),
+        )
+        self.assertEqual(response["status"], "incomplete")
+        details = response["transcription"]["longform_coverage"]
         self.assertEqual(
             details["targeted_recovery"]["base_selection_reason"],
             "chunked_lcs_not_improved",
@@ -1865,7 +2151,7 @@ class LongformCoverageTests(WorkerTestCase):
         self.assertEqual(list(self.root.glob("ats-crisper-recovery-*")), [])
         self.assertEqual(list(self.root.glob(".result.json.*.tmp")), [])
 
-    def test_cli_both_strategies_incomplete_emits_coverage_error_without_output(self):
+    def test_cli_both_strategies_incomplete_writes_valid_incomplete_result(self):
         request_path = self.root / "request.json"
         output_path = self.root / "result.json"
         request_path.write_text(json.dumps(make_request(self.audio)), encoding="utf-8")
@@ -1886,11 +2172,10 @@ class LongformCoverageTests(WorkerTestCase):
                 ["transcribe", "--request", str(request_path), "--output", str(output_path)]
             )
 
-        self.assertEqual(return_code, worker.CoverageError.exit_code)
-        self.assertFalse(output_path.exists())
-        self.assertIn('"code":"coverage_incomplete"', stdout.getvalue())
+        self.assertEqual(return_code, 0)
+        self.assertTrue(output_path.exists())
         self.assertIn(
-            "Coverage recovery failed; no incomplete result was committed.",
+            "Saving the best available transcript as an Incomplete revision.",
             stdout.getvalue(),
         )
         events = [
@@ -1898,21 +2183,17 @@ class LongformCoverageTests(WorkerTestCase):
             for line in stdout.getvalue().splitlines()
             if line.startswith(worker.EVENT_PREFIX)
         ]
-        error = events[-1]
-        self.assertEqual(error["event"], "error")
-        self.assertEqual(error["details"]["diagnostic_type"], "coverage_failure")
-        self.assertEqual(
-            error["details"]["fallback_rejection_reason"],
-            "targeted_recovery_incomplete",
-        )
-        self.assertIn("targeted_recovery", error["details"])
-        self.assertEqual(
-            set(error["details"]["candidate_audits"]),
-            {"continuation", "chunked_lcs"},
-        )
-        serialized = json.dumps(error)
+        success = events[-1]
+        self.assertEqual(success["event"], "success")
+        self.assertEqual(success["status"], "incomplete")
+        self.assertFalse(success["coverage_complete"])
+        saved = json.loads(output_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["status"], "incomplete")
+        self.assertGreater(saved["remaining_speech_active_gap_count"], 0)
+        self.assertTrue(saved["remaining_speech_active_gap_ranges"])
+        serialized = json.dumps(saved)
         self.assertNotIn(str(self.audio), serialized)
-        self.assertNotIn("competent", serialized)
+        self.assertIn("competent", serialized)
         self.assertEqual(list(self.root.glob(".result.json.*.tmp")), [])
 
 
@@ -1955,11 +2236,13 @@ class AtomicOutputTests(WorkerTestCase):
                 ["transcribe", "--request", str(request_path), "--output", str(output_path)]
             )
         self.assertEqual(return_code, 0)
-        self.assertEqual(json.loads(output_path.read_text(encoding="utf-8"))["status"], "success")
+        self.assertEqual(json.loads(output_path.read_text(encoding="utf-8"))["status"], "complete")
         events = [line for line in stdout.getvalue().splitlines() if line.startswith(worker.EVENT_PREFIX)]
         self.assertGreaterEqual(len(events), 4)
         final = json.loads(events[-1][len(worker.EVENT_PREFIX) :])
         self.assertEqual(final["event"], "success")
+        self.assertEqual(final["status"], "complete")
+        self.assertTrue(final["coverage_complete"])
         self.assertEqual(final["word_count"], 2)
 
 

@@ -76,6 +76,8 @@ class ResultStorageFixture:
         model,
         mode=None,
         execution_backend=None,
+        status="complete",
+        coverage=None,
     ):
         with result_storage.ResultRevision(
             layout,
@@ -87,11 +89,38 @@ class ResultStorageFixture:
                 model=model,
                 mode=mode,
                 execution_backend=execution_backend,
+                status=status,
+                coverage=coverage,
                 validate_outputs=lambda output: result_catalog.preflight_result_pair(
                     output / "speakers.json",
                     output / "segments.json",
                 ),
             )
+
+
+def incomplete_coverage():
+    return {
+        "coverage_complete": False,
+        "remaining_speech_active_gap_count": 2,
+        "remaining_speech_active_gap_duration": 9.5,
+        "remaining_speech_active_gap_ranges": [
+            {
+                "start": 10.0,
+                "end": 14.0,
+                "duration": 4.0,
+                "active_seconds": 2.0,
+                "active_blocks": 2,
+            },
+            {
+                "start": 20.0,
+                "end": 25.5,
+                "duration": 5.5,
+                "active_seconds": 3.0,
+                "active_blocks": 3,
+            },
+        ],
+        "selected_strategy": "continuation_plus_targeted_recovery",
+    }
 
 
 class ProjectIdentityAndRevisionTests(unittest.TestCase):
@@ -207,6 +236,120 @@ class ProjectIdentityAndRevisionTests(unittest.TestCase):
         }
         self.assertIn(("whisperx", "large-v3", None), metadata)
         self.assertIn(("crisperwhisper", "medium", "verbatim"), metadata)
+        self.assertFalse(list(layout.project_root.glob(".staging-*")))
+
+    def test_incomplete_revision_is_immutable_indexed_and_discoverable(self):
+        source = self.fixture.source()
+        layout = result_storage.project_layout_for_source(
+            self.fixture.output, "Coverage", source
+        )
+        complete = self.fixture.commit(
+            layout,
+            "crisperwhisper",
+            "20260814T120000000000Z-00000001",
+            model="medium",
+            mode="verbatim",
+            execution_backend="transformers",
+        )
+        complete_snapshot = {
+            path.relative_to(complete): path.read_bytes()
+            for path in complete.rglob("*")
+            if path.is_file()
+        }
+        coverage = incomplete_coverage()
+        incomplete = self.fixture.commit(
+            layout,
+            "crisperwhisper",
+            "20260814T120100000000Z-00000002",
+            model="medium",
+            mode="verbatim",
+            execution_backend="transformers",
+            status="incomplete",
+            coverage=coverage,
+        )
+
+        self.assertEqual(
+            {
+                path.relative_to(complete): path.read_bytes()
+                for path in complete.rglob("*")
+                if path.is_file()
+            },
+            complete_snapshot,
+        )
+        result_data = json.loads(
+            (incomplete / "result.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(result_data["status"], "incomplete")
+        self.assertEqual(result_data["coverage"], coverage)
+        project_data = json.loads(
+            (layout.project_root / "project.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            project_data["active_results"]["crisperwhisper"], incomplete.name
+        )
+        self.assertEqual(
+            [record["status"] for record in project_data["results"]],
+            ["complete", "incomplete"],
+        )
+        descriptor = result_catalog.descriptor_from_json_pair(
+            incomplete / "speakers.json",
+            incomplete / "segments.json",
+        )
+        self.assertEqual(descriptor.status, "incomplete")
+        self.assertFalse(descriptor.coverage.coverage_complete)
+        self.assertEqual(
+            descriptor.coverage.remaining_speech_active_gap_ranges,
+            tuple(coverage["remaining_speech_active_gap_ranges"]),
+        )
+        self.assertFalse(list(layout.project_root.glob(".staging-*")))
+
+    def test_malformed_incomplete_coverage_rolls_back_without_new_revision(self):
+        source = self.fixture.source()
+        layout = result_storage.project_layout_for_source(
+            self.fixture.output, "Invalid coverage", source
+        )
+        complete = self.fixture.commit(
+            layout,
+            "crisperwhisper",
+            "20260814T120000000000Z-00000001",
+            model="medium",
+            mode="verbatim",
+            execution_backend="transformers",
+        )
+        project_before = (layout.project_root / "project.json").read_bytes()
+        complete_before = {
+            path.relative_to(complete): path.read_bytes()
+            for path in complete.rglob("*")
+            if path.is_file()
+        }
+        malformed = incomplete_coverage()
+        malformed["remaining_speech_active_gap_ranges"] = []
+        failed_id = "20260814T120100000000Z-00000002"
+        with self.assertRaises(result_catalog.ManifestValidationError):
+            self.fixture.commit(
+                layout,
+                "crisperwhisper",
+                failed_id,
+                model="medium",
+                mode="verbatim",
+                execution_backend="transformers",
+                status="incomplete",
+                coverage=malformed,
+            )
+        self.assertEqual(
+            (layout.project_root / "project.json").read_bytes(), project_before
+        )
+        self.assertEqual(
+            {
+                path.relative_to(complete): path.read_bytes()
+                for path in complete.rglob("*")
+                if path.is_file()
+            },
+            complete_before,
+        )
+        self.assertFalse(
+            (layout.project_root / "crisperwhisper" / failed_id).exists()
+        )
         self.assertFalse(list(layout.project_root.glob(".staging-*")))
 
     def test_failed_validation_and_project_update_roll_back_without_artifacts(self):
@@ -505,6 +648,62 @@ class ApplyManifestUpdateTests(unittest.TestCase):
             reopened.speakers_json.read_text(encoding="utf-8")
         )["names"]
         self.assertEqual(saved, {"SPEAKER_00": "Saved Name"})
+
+    def test_review_apply_preserves_incomplete_status_and_coverage(self):
+        source = self.fixture.source()
+        layout = result_storage.project_layout_for_source(
+            self.fixture.output, "Incomplete Apply", source
+        )
+        coverage = incomplete_coverage()
+        result_root = self.fixture.commit(
+            layout,
+            "crisperwhisper",
+            "20260814T124000000000Z-00000001",
+            model="medium",
+            mode="verbatim",
+            execution_backend="transformers",
+            status="incomplete",
+            coverage=coverage,
+        )
+        staged_speakers = self.root / "staged-incomplete-speakers.json"
+        staged_segments = self.root / "staged-incomplete-segments.json"
+        staged_speakers.write_text(
+            json.dumps(
+                {
+                    "title": "Incomplete Apply",
+                    "speakers": ["SPEAKER_00"],
+                    "names": {"SPEAKER_00": "Saved Name"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        staged_segments.write_bytes((result_root / "segments.json").read_bytes())
+
+        updates = dict(
+            result_storage.build_apply_manifest_updates(
+                result_root,
+                staged_speakers,
+                staged_segments,
+            )
+        )
+        result_update = updates[result_root / "result.json"]
+        project_update = updates[layout.project_root / "project.json"]
+        self.assertEqual(result_update["status"], "incomplete")
+        self.assertEqual(result_update["coverage"], coverage)
+        self.assertEqual(project_update["results"][0]["status"], "incomplete")
+
+        (result_root / "speakers.json").write_bytes(staged_speakers.read_bytes())
+        for target, data in updates.items():
+            target.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        reopened = result_catalog.descriptor_from_json_pair(
+            result_root / "speakers.json",
+            result_root / "segments.json",
+        )
+        self.assertEqual(reopened.status, "incomplete")
+        self.assertEqual(
+            reopened.coverage.remaining_speech_active_gap_count,
+            coverage["remaining_speech_active_gap_count"],
+        )
 
 
 class PipelineStorageIntegrationTests(unittest.TestCase):

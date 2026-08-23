@@ -11,7 +11,7 @@ from unittest import mock
 
 import result_catalog as catalog
 import split_audio_gui as gui
-from tests.test_result_catalog import ResultFixture
+from tests.test_result_catalog import ResultFixture, incomplete_coverage
 
 
 class _FakeDialog:
@@ -160,6 +160,34 @@ class OpenResultBrowserTests(unittest.TestCase):
         self.assertTrue(discovery.results[0].pending)
         self.assertEqual(discovery.results[0].paths, tuple(path.resolve() for path in first))
         self.assertEqual(gui._ResultBrowserModel(discovery.results).visible()[0], discovery.results[0])
+
+    def test_incomplete_status_filter_sort_and_display(self):
+        self.fixture.project_result(
+            project_name="Incomplete--0123456789ab",
+            revision="20260813T120100Z-abcdef12",
+            title="Incomplete interview",
+            status="incomplete",
+            coverage=incomplete_coverage(),
+        )
+        self.fixture.project_result(
+            project_name="Complete--0123456789ab",
+            revision="20260813T120000Z-abcdef12",
+            title="Complete interview",
+        )
+        descriptors = catalog.discover_results(self.root / "output").results
+        model = gui._ResultBrowserModel(descriptors)
+        incomplete = model.visible(status="incomplete")
+        complete = model.visible(status="complete")
+
+        self.assertEqual(len(incomplete), 1)
+        self.assertEqual(incomplete[0].status, "incomplete")
+        self.assertEqual(model.display_status(incomplete[0]), "Incomplete")
+        self.assertEqual(len(complete), 1)
+        model.set_sort("status")
+        self.assertEqual(
+            [item.status for item in model.visible()],
+            ["complete", "incomplete"],
+        )
 
     def test_browser_opens_video_audio_and_missing_source_results(self):
         for folder, suffix, exists in (

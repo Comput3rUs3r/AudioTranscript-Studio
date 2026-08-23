@@ -33,6 +33,22 @@ _TIMESTAMP_DIAGNOSTIC_REASONS = {
     "previous_end_exceeds_current_start_beyond_tolerance",
     "overlap_has_no_positive_repair_interval",
 }
+_TIMESTAMP_REPAIR_FAILURE_REASONS = {
+    "overlap_exceeds_tolerance",
+    "words_are_not_adjacent",
+    "strict_token_and_time_duplicate",
+    "timestamp_reset_at_chunk_boundary",
+    "later_word_end_is_missing",
+    "later_word_would_overlap_following_word",
+    "bounded_end_exceeds_media_duration",
+    "bounded_end_would_overlap_following_word",
+    "cluster_contains_missing_timestamp",
+    "cluster_contains_invalid_interval",
+    "cluster_exceeds_maximum_words",
+    "cluster_displacement_exceeds_tolerance",
+    "cluster_insufficient_available_span",
+    "no_positive_repair_interval",
+}
 _COVERAGE_REJECTION_REASONS = {
     "candidate_duration_mismatch",
     "speech_active_gaps_remain",
@@ -47,6 +63,9 @@ _TIMESTAMP_REPAIR_ACTIONS = {
     "inferred_missing_end",
     "retained_untimed_text",
     "adjacent_overlap",
+    "cross_chunk_overlap_start_shift",
+    "cross_chunk_overlap_bounded_end_adjustment",
+    "cross_chunk_overlap_cluster_reflow",
     "tiny_end_before_start",
     "neighbor_reconciled_reversal",
     "zero_duration",
@@ -261,6 +280,46 @@ def _validate_word_timestamp_repairs(value: Any) -> Optional[dict[str, Any]]:
         raise CrisperWhisperProtocolError(
             "Worker result untimed-word repair summary is inconsistent."
         )
+    cluster_reflows = metadata.get("cluster_reflows")
+    cluster_category_count = categories.get(
+        "cross_chunk_overlap_cluster_reflow",
+        0,
+    )
+    if cluster_reflows is None:
+        if cluster_category_count:
+            raise CrisperWhisperProtocolError(
+                "Worker result cluster-reflow repair metadata is missing."
+            )
+    elif (
+        not isinstance(cluster_reflows, list)
+        or len(cluster_reflows) != cluster_category_count
+    ):
+        raise CrisperWhisperProtocolError(
+            "Worker result cluster-reflow repair metadata is inconsistent."
+        )
+    else:
+        for cluster in cluster_reflows:
+            if not isinstance(cluster, dict) or set(cluster) != {
+                "word_count",
+                "max_displacement_milliseconds",
+            }:
+                raise CrisperWhisperProtocolError(
+                    "Worker result cluster-reflow repair metadata is invalid."
+                )
+            word_count = cluster["word_count"]
+            displacement = cluster["max_displacement_milliseconds"]
+            if (
+                isinstance(word_count, bool)
+                or not isinstance(word_count, int)
+                or not 2 <= word_count <= 8
+                or isinstance(displacement, bool)
+                or not isinstance(displacement, (int, float))
+                or not math.isfinite(float(displacement))
+                or not 0 < float(displacement) <= 250.0
+            ):
+                raise CrisperWhisperProtocolError(
+                    "Worker result cluster-reflow repair metadata is invalid."
+                )
     warnings = metadata.get("warnings")
     if not isinstance(warnings, list) or any(
         not isinstance(warning, str)
@@ -272,6 +331,62 @@ def _validate_word_timestamp_repairs(value: Any) -> Optional[dict[str, Any]]:
             "Worker result word timestamp repair warnings are invalid."
         )
     return copy.deepcopy(metadata)
+
+
+def _validate_coverage_gap_ranges(
+    value: Any,
+    *,
+    expected_count: int,
+    expected_duration: float,
+    label: str,
+) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or len(value) != expected_count:
+        raise CrisperWhisperProtocolError(
+            f"Worker result {label} are invalid."
+        )
+    validated = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {
+            "start",
+            "end",
+            "duration",
+            "active_seconds",
+            "active_blocks",
+        }:
+            raise CrisperWhisperProtocolError(
+                f"Worker result {label} are invalid."
+            )
+        numeric = (item["start"], item["end"], item["duration"], item["active_seconds"])
+        if any(
+            isinstance(current, bool)
+            or not isinstance(current, (int, float))
+            or not math.isfinite(float(current))
+            or float(current) < 0
+            for current in numeric
+        ) or (
+            isinstance(item["active_blocks"], bool)
+            or not isinstance(item["active_blocks"], int)
+            or item["active_blocks"] < 0
+            or float(item["end"]) <= float(item["start"])
+            or not math.isclose(
+                float(item["duration"]),
+                float(item["end"]) - float(item["start"]),
+                abs_tol=0.002,
+            )
+        ):
+            raise CrisperWhisperProtocolError(
+                f"Worker result {label} are invalid."
+            )
+        validated.append(copy.deepcopy(item))
+    if not math.isclose(
+        sum(float(item["duration"]) for item in validated),
+        float(expected_duration),
+        abs_tol=max(0.002, 0.002 * max(1, expected_count)),
+    ):
+        raise CrisperWhisperProtocolError(
+            f"Worker result {label} duration is inconsistent."
+        )
+    return validated
 
 
 def _validate_coverage_audit(value: Any, label: str) -> dict[str, Any]:
@@ -322,42 +437,12 @@ def _validate_coverage_audit(value: Any, label: str) -> dict[str, Any]:
             )
     ranges = audit.get("speech_active_gap_ranges")
     if ranges is not None:
-        if not isinstance(ranges, list) or len(ranges) != audit["speech_active_gap_count"]:
-            raise CrisperWhisperProtocolError(
-                "Worker result long-form coverage gap ranges are invalid."
-            )
-        for item in ranges:
-            if not isinstance(item, dict) or set(item) != {
-                "start",
-                "end",
-                "duration",
-                "active_seconds",
-                "active_blocks",
-            }:
-                raise CrisperWhisperProtocolError(
-                    "Worker result long-form coverage gap ranges are invalid."
-                )
-            numeric = (item["start"], item["end"], item["duration"], item["active_seconds"])
-            if any(
-                isinstance(current, bool)
-                or not isinstance(current, (int, float))
-                or not math.isfinite(float(current))
-                or float(current) < 0
-                for current in numeric
-            ) or (
-                isinstance(item["active_blocks"], bool)
-                or not isinstance(item["active_blocks"], int)
-                or item["active_blocks"] < 0
-                or float(item["end"]) <= float(item["start"])
-                or not math.isclose(
-                    float(item["duration"]),
-                    float(item["end"]) - float(item["start"]),
-                    abs_tol=0.002,
-                )
-            ):
-                raise CrisperWhisperProtocolError(
-                    "Worker result long-form coverage gap ranges are invalid."
-                )
+        _validate_coverage_gap_ranges(
+            ranges,
+            expected_count=audit["speech_active_gap_count"],
+            expected_duration=float(audit["speech_active_gap_duration"]),
+            label="long-form coverage gap ranges",
+        )
     known = audit.get("known_diagnostic_interval")
     if known is not None:
         if not isinstance(known, dict) or set(known) != {"start", "end", "covered"}:
@@ -624,6 +709,8 @@ def _validate_targeted_recovery_metadata(
 def _validate_longform_coverage(
     value: Any,
     effective_settings: dict[str, Any],
+    *,
+    require_complete: bool,
 ) -> Optional[dict[str, Any]]:
     if value is None:
         effective_longform = _expect_object(
@@ -651,7 +738,7 @@ def _validate_longform_coverage(
     if selected in _TARGETED_SELECTED_STRATEGIES:
         targeted = _validate_targeted_recovery_metadata(
             targeted_value,
-            require_complete=True,
+            require_complete=require_complete,
         )
         base_strategy = _TARGETED_SELECTED_STRATEGIES[selected]
         if targeted["base_strategy"] != base_strategy:
@@ -719,19 +806,40 @@ def _validate_longform_coverage(
             raise CrisperWhisperProtocolError(
                 "Worker result long-form coverage summary is invalid."
             )
-    if coverage["remaining_speech_active_gap_count"] != 0 or float(
-        coverage["remaining_speech_active_gap_duration"]
-    ) != 0.0:
+    remaining_count = coverage["remaining_speech_active_gap_count"]
+    remaining_duration = float(coverage["remaining_speech_active_gap_duration"])
+    if require_complete and (remaining_count != 0 or remaining_duration != 0.0):
         raise CrisperWhisperProtocolError(
             "Worker result still contains unrecovered speech-active coverage gaps."
         )
+    if not require_complete and (remaining_count <= 0 or remaining_duration <= 0.0):
+        raise CrisperWhisperProtocolError(
+            "Worker incomplete result does not report remaining speech-active coverage gaps."
+        )
+    remaining_ranges = _validate_coverage_gap_ranges(
+        coverage.get("remaining_speech_active_gap_ranges"),
+        expected_count=remaining_count,
+        expected_duration=remaining_duration,
+        label="remaining speech-active gap ranges",
+    )
     targeted_used = targeted is not None
     if fallback_used or targeted_used:
+        expected_recovered_count = max(
+            0,
+            coverage["speech_active_gap_count"] - remaining_count,
+        )
+        expected_recovered_duration = max(
+            0.0,
+            float(coverage["speech_active_gap_duration"]) - remaining_duration,
+        )
         if (
             coverage["speech_active_gap_count"] <= 0
-            or coverage["recovered_gap_count"] != coverage["speech_active_gap_count"]
-            or float(coverage["recovered_duration"])
-            != float(coverage["speech_active_gap_duration"])
+            or coverage["recovered_gap_count"] != expected_recovered_count
+            or not math.isclose(
+                float(coverage["recovered_duration"]),
+                expected_recovered_duration,
+                abs_tol=0.002,
+            )
         ):
             raise CrisperWhisperProtocolError(
                 "Worker result long-form coverage recovery summary is inconsistent."
@@ -786,6 +894,10 @@ def _validate_longform_coverage(
         ):
             raise CrisperWhisperProtocolError(
                 "Worker result targeted recovery coverage is inconsistent."
+            )
+        if targeted["final_coverage_audit"].get("speech_active_gap_ranges") != remaining_ranges:
+            raise CrisperWhisperProtocolError(
+                "Worker result targeted recovery gap ranges are inconsistent."
             )
     warnings = coverage.get("warnings")
     if not isinstance(warnings, list) or any(
@@ -852,8 +964,33 @@ def _validate_timestamp_overlap_diagnostic(value: Any) -> dict[str, Any]:
         "reason",
         "tolerance_seconds",
     }
-    if set(details) != required:
+    optional = {
+        "overlap_milliseconds",
+        "repair_failure_reason",
+        "cluster_words_examined",
+        "cluster_required_span_milliseconds",
+        "cluster_available_span_milliseconds",
+    }
+    if not required.issubset(details) or not set(details).issubset(required | optional):
         raise CrisperWhisperProtocolError("Worker timestamp diagnostic fields are invalid.")
+    has_precise_overlap = "overlap_milliseconds" in details
+    has_failure_reason = "repair_failure_reason" in details
+    if has_precise_overlap != has_failure_reason:
+        raise CrisperWhisperProtocolError("Worker timestamp diagnostic details are incomplete.")
+    cluster_fields = {
+        "cluster_words_examined",
+        "cluster_required_span_milliseconds",
+        "cluster_available_span_milliseconds",
+    }
+    present_cluster_fields = cluster_fields.intersection(details)
+    if present_cluster_fields and present_cluster_fields != cluster_fields:
+        raise CrisperWhisperProtocolError(
+            "Worker timestamp cluster diagnostic details are incomplete."
+        )
+    if present_cluster_fields and not has_precise_overlap:
+        raise CrisperWhisperProtocolError(
+            "Worker timestamp cluster diagnostic overlap is missing."
+        )
     if (
         details["diagnostic_type"] != "timestamp_overlap"
         or details["model_family"] not in OFFICIAL_MODEL_IDS
@@ -888,6 +1025,54 @@ def _validate_timestamp_overlap_diagnostic(value: Any) -> dict[str, Any]:
             raise CrisperWhisperProtocolError("Worker timestamp diagnostic times are invalid.")
     if float(details["overlap_duration"]) <= 0 or float(details["tolerance_seconds"]) != 0.25:
         raise CrisperWhisperProtocolError("Worker timestamp diagnostic overlap is invalid.")
+    if has_precise_overlap:
+        milliseconds = details["overlap_milliseconds"]
+        if (
+            isinstance(milliseconds, bool)
+            or not isinstance(milliseconds, (int, float))
+            or not math.isfinite(float(milliseconds))
+            or float(milliseconds) <= 0
+            or not math.isclose(
+                float(milliseconds),
+                float(details["overlap_duration"]) * 1000.0,
+                abs_tol=0.001,
+            )
+            or details["repair_failure_reason"]
+            not in _TIMESTAMP_REPAIR_FAILURE_REASONS
+        ):
+            raise CrisperWhisperProtocolError(
+                "Worker timestamp diagnostic repair failure is invalid."
+            )
+    if present_cluster_fields:
+        words_examined = details["cluster_words_examined"]
+        required_span = details["cluster_required_span_milliseconds"]
+        available_span = details["cluster_available_span_milliseconds"]
+        if (
+            isinstance(words_examined, bool)
+            or not isinstance(words_examined, int)
+            or not 1 <= words_examined <= 9
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) < 0
+                for value in (required_span, available_span)
+            )
+            or float(details["overlap_milliseconds"]) > 250.0
+            or details.get("repair_failure_reason")
+            not in {
+                "strict_token_and_time_duplicate",
+                "timestamp_reset_at_chunk_boundary",
+                "cluster_contains_missing_timestamp",
+                "cluster_contains_invalid_interval",
+                "cluster_exceeds_maximum_words",
+                "cluster_displacement_exceeds_tolerance",
+                "cluster_insufficient_available_span",
+            }
+        ):
+            raise CrisperWhisperProtocolError(
+                "Worker timestamp cluster diagnostic is invalid."
+            )
     for key in (
         "crosses_native_chunk_boundary",
         "normalized_tokens_identical",
@@ -1118,12 +1303,36 @@ def validate_transcribe_response(
         raise CrisperWhisperProtocolError(
             f"CrisperWhisper worker protocol mismatch; expected version {PROTOCOL_VERSION}."
         )
+    response_status = root.get("status")
     if (
         root.get("operation") != "transcribe"
-        or root.get("status") != "success"
+        or response_status not in {"success", "complete", "incomplete"}
         or root.get("engine") != "crisperwhisper"
     ):
         raise CrisperWhisperProtocolError("CrisperWhisper worker returned an invalid success response.")
+
+    classification_fields = {
+        "coverage_complete",
+        "remaining_speech_active_gap_count",
+        "remaining_speech_active_gap_duration",
+        "remaining_speech_active_gap_ranges",
+        "selected_strategy",
+    }
+    present_classification_fields = classification_fields.intersection(root)
+    legacy_complete = response_status == "success" and not present_classification_fields
+    if response_status == "success" and present_classification_fields:
+        raise CrisperWhisperProtocolError(
+            "Legacy worker success responses must not contain partial result classification metadata."
+        )
+    if response_status in {"complete", "incomplete"} and present_classification_fields != classification_fields:
+        raise CrisperWhisperProtocolError(
+            "Worker result classification metadata is incomplete."
+        )
+    coverage_complete = True if legacy_complete else root.get("coverage_complete")
+    if not legacy_complete and coverage_complete is not (response_status == "complete"):
+        raise CrisperWhisperProtocolError(
+            "Worker result status and coverage-complete state are inconsistent."
+        )
 
     runtime = _expect_object(root.get("runtime"), "runtime")
     versions = _expect_object(runtime.get("versions"), "runtime.versions")
@@ -1164,10 +1373,82 @@ def validate_transcribe_response(
     _validate_word_timestamp_repairs(
         transcription.get("word_timestamp_repairs")
     )
-    _validate_longform_coverage(
+    validated_coverage = _validate_longform_coverage(
         transcription.get("longform_coverage"),
         effective,
+        require_complete=bool(coverage_complete),
     )
+
+    if legacy_complete:
+        if validated_coverage is not None and validated_coverage[
+            "remaining_speech_active_gap_count"
+        ] != 0:
+            raise CrisperWhisperProtocolError(
+                "Legacy worker success response contains incomplete coverage."
+            )
+    else:
+        remaining_count = root["remaining_speech_active_gap_count"]
+        remaining_duration = root["remaining_speech_active_gap_duration"]
+        if (
+            isinstance(remaining_count, bool)
+            or not isinstance(remaining_count, int)
+            or remaining_count < 0
+            or isinstance(remaining_duration, bool)
+            or not isinstance(remaining_duration, (int, float))
+            or not math.isfinite(float(remaining_duration))
+            or float(remaining_duration) < 0
+            or not isinstance(root["selected_strategy"], str)
+            or not root["selected_strategy"]
+        ):
+            raise CrisperWhisperProtocolError(
+                "Worker result coverage classification is invalid."
+            )
+        ranges = _validate_coverage_gap_ranges(
+            root["remaining_speech_active_gap_ranges"],
+            expected_count=remaining_count,
+            expected_duration=float(remaining_duration),
+            label="result-classification gap ranges",
+        )
+        if coverage_complete and (remaining_count != 0 or float(remaining_duration) != 0.0):
+            raise CrisperWhisperProtocolError(
+                "Complete worker result reports remaining speech-active gaps."
+            )
+        if not coverage_complete and (remaining_count <= 0 or float(remaining_duration) <= 0.0):
+            raise CrisperWhisperProtocolError(
+                "Incomplete worker result does not report missing speech coverage."
+            )
+        expected_strategy = (
+            validated_coverage["selected_strategy"]
+            if validated_coverage is not None
+            else "continuation"
+        )
+        if root["selected_strategy"] != expected_strategy:
+            raise CrisperWhisperProtocolError(
+                "Worker result selected strategy is inconsistent."
+            )
+        expected_count = (
+            validated_coverage["remaining_speech_active_gap_count"]
+            if validated_coverage is not None
+            else 0
+        )
+        expected_duration = (
+            float(validated_coverage["remaining_speech_active_gap_duration"])
+            if validated_coverage is not None
+            else 0.0
+        )
+        expected_ranges = (
+            validated_coverage["remaining_speech_active_gap_ranges"]
+            if validated_coverage is not None
+            else []
+        )
+        if (
+            remaining_count != expected_count
+            or not math.isclose(float(remaining_duration), expected_duration, abs_tol=0.002)
+            or ranges != expected_ranges
+        ):
+            raise CrisperWhisperProtocolError(
+                "Worker result classification differs from its coverage audit."
+            )
 
     words = transcription.get("words")
     if not isinstance(words, list):
@@ -1323,6 +1604,13 @@ def normalize_worker_result(response: dict[str, Any]) -> dict[str, Any]:
     runtime = response["runtime"]
     requested = response["settings"]["requested"]
     effective = response["settings"]["effective"]
+    response_status = response.get("status")
+    result_status = (
+        response_status
+        if response_status in {"complete", "incomplete"}
+        else "complete"
+    )
+    coverage_complete = result_status == "complete"
     metadata = {
         "schema_version": 1,
         "engine": "crisperwhisper",
@@ -1341,6 +1629,21 @@ def normalize_worker_result(response: dict[str, Any]) -> dict[str, Any]:
         "native_chunks": copy.deepcopy(chunks),
         "duration": float(transcription["duration"]),
         "processing_time": float(transcription["processing_time"]),
+        "result_status": result_status,
+        "coverage_complete": coverage_complete,
+        "remaining_speech_active_gap_count": int(
+            response.get("remaining_speech_active_gap_count", 0)
+        ),
+        "remaining_speech_active_gap_duration": float(
+            response.get("remaining_speech_active_gap_duration", 0.0)
+        ),
+        "remaining_speech_active_gap_ranges": copy.deepcopy(
+            response.get("remaining_speech_active_gap_ranges", [])
+        ),
+        "selected_strategy": response.get(
+            "selected_strategy",
+            effective.get("longform", {}).get("strategy", "continuation"),
+        ),
         "word_timestamp_repairs": copy.deepcopy(
             transcription.get("word_timestamp_repairs")
             or {

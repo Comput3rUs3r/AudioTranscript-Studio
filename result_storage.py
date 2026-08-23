@@ -527,10 +527,17 @@ class ResultRevision:
         model: Optional[str],
         mode: Optional[str],
         execution_backend: Optional[str],
+        status: str,
+        coverage: Optional[Mapping[str, Any]],
     ) -> dict[str, Any]:
         speakers_path = self.output_root / "speakers.json"
         segments_path = self.output_root / "segments.json"
-        return {
+        normalized_status = str(status or "").strip().lower()
+        if normalized_status not in {"complete", "incomplete"}:
+            raise ValueError("Result revision status must be complete or incomplete.")
+        if normalized_status == "incomplete" and self.engine != "crisperwhisper":
+            raise ValueError("Only CrisperWhisper revisions may be incomplete.")
+        manifest = {
             "schema_version": RESULT_SCHEMA_VERSION,
             "project_id": self.layout.project_id,
             "result_id": self.result_id,
@@ -539,7 +546,7 @@ class ResultRevision:
             "model": model,
             "mode": mode,
             "execution_backend": execution_backend,
-            "status": "complete",
+            "status": normalized_status,
             "source": {
                 "identity": dict(self.layout.source_identity),
                 "last_known_path": str(self.layout.source_path),
@@ -557,6 +564,9 @@ class ResultRevision:
             },
             "comparison_job_id": None,
         }
+        if coverage is not None:
+            manifest["coverage"] = dict(coverage)
+        return manifest
 
     def commit(
         self,
@@ -564,6 +574,8 @@ class ResultRevision:
         model: Optional[str],
         mode: Optional[str],
         execution_backend: Optional[str],
+        status: str = "complete",
+        coverage: Optional[Mapping[str, Any]] = None,
         validate_outputs: Optional[Callable[[Path], None]] = None,
     ) -> Path:
         if self.committed:
@@ -582,6 +594,8 @@ class ResultRevision:
             model=model,
             mode=mode,
             execution_backend=execution_backend,
+            status=status,
+            coverage=coverage,
         )
         result_path = self.output_root / "result.json"
         _atomic_write_json(result_path, manifest_data)
