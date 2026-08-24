@@ -10,7 +10,7 @@ Transcript Studio + WhisperX pipeline (v1.6.0)
 """
 from __future__ import annotations
 
-import os, sys, math, time, shlex, yaml, json, subprocess, hashlib, datetime, concurrent.futures, argparse, tempfile, copy, gc
+import os, sys, math, time, shlex, yaml, json, subprocess, hashlib, datetime, concurrent.futures, argparse, tempfile, copy, gc, uuid
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -1054,6 +1054,7 @@ def _process_source_revision(
     progress_callback: Callable[[str, str, float], None],
     crisper_backend=None,
     crisper_settings: Optional[Dict[str, Any]] = None,
+    comparison_job_id: Optional[str] = None,
 ) -> PipelineRevisionOutcome:
     engine_cfg = copy.copy(cfg)
     engine_cfg.transcription_backend = backend_name
@@ -1209,6 +1210,7 @@ def _process_source_revision(
             execution_backend=execution_backend,
             status=revision_status,
             coverage=revision_coverage,
+            comparison_job_id=comparison_job_id,
             validate_outputs=lambda path: validate_staged_pipeline_outputs(
                 path,
                 engine_cfg,
@@ -1369,6 +1371,7 @@ def run_pipeline(explicit_files: List[str] = None, explicit_workers: int = None)
     else:
         outcomes: List[PipelineRevisionOutcome] = []
         failures = []
+        comparison_job_id = f"both:{uuid.uuid4().hex}"
         engine_passes = (("whisperx", "WhisperX"), ("crisperwhisper", "CrisperWhisper"))
         for engine_index, (engine, engine_label) in enumerate(engine_passes, 1):
             print(f"[both] Starting {engine_label} pass {engine_index}/2.")
@@ -1410,6 +1413,7 @@ def run_pipeline(explicit_files: List[str] = None, explicit_workers: int = None)
                             progress_callback=dual_progress,
                             crisper_backend=crisper_backend,
                             crisper_settings=crisper_settings,
+                            comparison_job_id=comparison_job_id,
                         )
                     except Exception as exc:
                         pass_failures += 1

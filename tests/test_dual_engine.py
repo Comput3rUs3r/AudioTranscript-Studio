@@ -766,6 +766,19 @@ class DualEngineStorageTests(unittest.TestCase):
             self.assertTrue(all(item.mode is None for item in whisper_results))
             self.assertTrue(all(item.model == "medium" for item in crisper_results))
             self.assertTrue(all(item.mode == "verbatim" for item in crisper_results))
+            comparison_groups = {}
+            for descriptor in catalog.results:
+                self.assertIsNotNone(descriptor.comparison_job_id)
+                comparison_groups.setdefault(descriptor.comparison_job_id, set()).add(
+                    descriptor.engine
+                )
+            self.assertEqual(len(comparison_groups), 2)
+            self.assertTrue(
+                all(
+                    engines == {"whisperx", "crisperwhisper"}
+                    for engines in comparison_groups.values()
+                )
+            )
             result_events = [
                 json.loads(line[len(split_audio.RESULT_PREFIX):])
                 for line in output_log.getvalue().splitlines()

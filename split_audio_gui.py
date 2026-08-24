@@ -35,6 +35,21 @@ from result_catalog import (
     discover_results,
     preflight_result_pair,
     revalidate_descriptor,
+    source_identities_match,
+)
+from result_comparison import (
+    AGREEMENT as _COMPARISON_AGREEMENT,
+    CRISPERWHISPER_ONLY as _COMPARISON_CRISPER_ONLY,
+    POSSIBLE_DUPLICATE as _COMPARISON_POSSIBLE_DUPLICATE,
+    TEXT_CONFLICT as _COMPARISON_TEXT_CONFLICT,
+    TIMING_CONFLICT as _COMPARISON_TIMING_CONFLICT,
+    UNRESOLVED as _COMPARISON_UNRESOLVED,
+    WHISPERX_ONLY as _COMPARISON_WHISPER_ONLY,
+    ResultComparisonError,
+    choose_default_pair,
+    compare_results,
+    compatible_counterparts,
+    strict_same_source,
 )
 from result_storage import build_apply_manifest_updates, cleanup_process_staging
 
@@ -99,6 +114,7 @@ MIDNIGHTSTUDIO_STYLES = {
     "srt_tree": "MidnightStudio.SrtMatches.Treeview",
     "segment_tree": "MidnightStudio.SegmentCorrection.Treeview",
     "result_tree": "MidnightStudio.ResultBrowser.Treeview",
+    "comparison_tree": "MidnightStudio.ResultComparison.Treeview",
     "media_tree": "MidnightStudio.SelectedMedia.Treeview",
 }
 
@@ -289,6 +305,7 @@ def _configure_midnightstudio_styles(style):
         styles["srt_tree"],
         styles["segment_tree"],
         styles["result_tree"],
+        styles["comparison_tree"],
         styles["media_tree"],
     ):
         style.configure(
@@ -3256,6 +3273,32 @@ class NamingWorkspace(ttk.Frame):
         if media_kind is None:
             return None, None, "The original source is not a supported audio or video file."
         return source, media_kind, None
+
+    def comparison_preview_status(self):
+        media_path, _media_kind, reason = self._source_media_for_playback()
+        if media_path is None:
+            return False, reason
+        if self._vlc_player is None or self._vlc_instance is None:
+            return (
+                False,
+                self._vlc_status.get("reason")
+                or "Embedded VLC playback is unavailable.",
+            )
+        return True, None
+
+    def preview_comparison_time(self, seconds):
+        available, reason = self.comparison_preview_status()
+        if not available:
+            return False, reason
+        media_path, _media_kind, reason = self._source_media_for_playback()
+        if media_path is None:
+            return False, reason
+        try:
+            self._enable_transcript_following()
+            self._load_embedded_media(media_path, max(0.0, float(seconds)))
+        except Exception as exc:
+            return False, f"Could not preview the selected comparison region: {exc}"
+        return True, None
 
     def _on_media_surface_configure(self, event=None):
         try:
@@ -6358,6 +6401,635 @@ class _OpenResultDialog(tk.Toplevel):
         return "break"
 
 
+_COMPARISON_FILTERS = (
+    "All",
+    "Engine-only",
+    "Text conflicts",
+    "Timing conflicts",
+    "Possible duplicates",
+    "Unresolved",
+)
+
+
+class _ComparisonDialogModel:
+    """Pure filtering model for one immutable comparison."""
+
+    def __init__(self, comparison):
+        self.comparison = comparison
+
+    def visible(self, filter_name="All"):
+        normalized = str(filter_name or "All").strip().casefold()
+        if normalized == "all":
+            return self.comparison.regions
+        classifications = {
+            "engine-only": {
+                _COMPARISON_WHISPER_ONLY,
+                _COMPARISON_CRISPER_ONLY,
+            },
+            "text conflicts": {_COMPARISON_TEXT_CONFLICT},
+            "timing conflicts": {_COMPARISON_TIMING_CONFLICT},
+            "possible duplicates": {_COMPARISON_POSSIBLE_DUPLICATE},
+            "unresolved": {_COMPARISON_UNRESOLVED},
+        }.get(normalized)
+        if classifications is None:
+            raise ValueError(f"Unknown comparison filter: {filter_name}")
+        return tuple(
+            region
+            for region in self.comparison.regions
+            if region.classification in classifications
+        )
+
+
+class _ResultComparisonDialog(tk.Toplevel):
+    """Read-only Midnight Studio comparison of two exact result revisions."""
+
+    def __init__(
+        self,
+        parent,
+        loaded_descriptor,
+        descriptors,
+        *,
+        preview_callback=None,
+        preview_available=False,
+        preview_unavailable_reason=None,
+        report_callback=None,
+    ):
+        super().__init__(parent)
+        style_midnightstudio_toplevel(self)
+        self.title("Compare Results")
+        self.geometry("1320x820")
+        self.minsize(980, 620)
+        self.resizable(True, True)
+        self.transient(parent)
+        self.result_action = None
+        self._preview_callback = preview_callback
+        self._preview_available = bool(preview_available)
+        self._preview_unavailable_reason = preview_unavailable_reason
+        self._report_callback = report_callback
+        self._comparison = None
+        self._model = None
+        self._row_regions = {}
+
+        compatible = compatible_counterparts(loaded_descriptor, descriptors)
+        if not compatible:
+            raise ResultComparisonError(
+                "No compatible opposite-engine revision has the same verified source identity."
+            )
+        same_source = tuple(
+            descriptor
+            for descriptor in descriptors
+            if descriptor.file_identity == loaded_descriptor.file_identity
+            or (
+                source_identities_match(
+                    loaded_descriptor.source_identity,
+                    descriptor.source_identity,
+                )
+                and (
+                    loaded_descriptor.project_id is None
+                    or descriptor.project_id is None
+                    or loaded_descriptor.project_id == descriptor.project_id
+                )
+            )
+        )
+        if loaded_descriptor not in same_source:
+            same_source += (loaded_descriptor,)
+        self._whisper_descriptors = tuple(
+            sorted(
+                (item for item in same_source if item.engine == "whisperx"),
+                key=self._revision_sort_key,
+            )
+        )
+        self._crisper_descriptors = tuple(
+            sorted(
+                (item for item in same_source if item.engine == "crisperwhisper"),
+                key=self._revision_sort_key,
+            )
+        )
+        default_whisper, default_crisper = choose_default_pair(
+            loaded_descriptor,
+            same_source,
+        )
+        self._whisper_labels = self._descriptor_labels(self._whisper_descriptors)
+        self._crisper_labels = self._descriptor_labels(self._crisper_descriptors)
+
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        main = ttk.Frame(
+            self,
+            padding=12,
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
+        main.grid(row=0, column=0, sticky="nsew")
+        main.columnconfigure(0, weight=1)
+        main.rowconfigure(3, weight=3)
+        main.rowconfigure(4, weight=2)
+
+        ttk.Label(
+            main,
+            text="Compare Results",
+            style=MIDNIGHTSTUDIO_STYLES["review_title"],
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            main,
+            text=(
+                "Complete means processing and result validation completed. "
+                "It does not guarantee that every spoken word was recognized."
+            ),
+            style=MIDNIGHTSTUDIO_STYLES["subtitle"],
+            wraplength=1100,
+            justify="left",
+        ).grid(row=1, column=0, sticky="ew", pady=(3, 10))
+
+        selectors = ttk.LabelFrame(main, text="Exact revision pair", padding=8)
+        selectors.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        selectors.columnconfigure(1, weight=1)
+        selectors.columnconfigure(3, weight=1)
+        self.var_whisper = tk.StringVar(
+            value=self._label_for_descriptor(default_whisper, self._whisper_labels)
+        )
+        self.var_crisper = tk.StringVar(
+            value=self._label_for_descriptor(default_crisper, self._crisper_labels)
+        )
+        ttk.Label(selectors, text="WhisperX").grid(
+            row=0, column=0, sticky="w", padx=(0, 6)
+        )
+        self.cmb_whisper = ttk.Combobox(
+            selectors,
+            textvariable=self.var_whisper,
+            values=tuple(self._whisper_labels),
+            state="readonly",
+            width=48,
+        )
+        self.cmb_whisper.grid(row=0, column=1, sticky="ew", padx=(0, 14))
+        ttk.Label(selectors, text="CrisperWhisper").grid(
+            row=0, column=2, sticky="w", padx=(0, 6)
+        )
+        self.cmb_crisper = ttk.Combobox(
+            selectors,
+            textvariable=self.var_crisper,
+            values=tuple(self._crisper_labels),
+            state="readonly",
+            width=52,
+        )
+        self.cmb_crisper.grid(row=0, column=3, sticky="ew")
+        self.lbl_summary = ttk.Label(
+            selectors,
+            text="",
+            style=MIDNIGHTSTUDIO_STYLES["card_secondary"],
+            justify="left",
+        )
+        self.lbl_summary.grid(
+            row=1, column=0, columnspan=4, sticky="ew", pady=(8, 0)
+        )
+        apply_midnightstudio_card_style(selectors)
+
+        table_card = ttk.LabelFrame(main, text="Ordered comparison regions", padding=8)
+        table_card.grid(row=3, column=0, sticky="nsew", pady=(0, 8))
+        table_card.columnconfigure(0, weight=1)
+        table_card.rowconfigure(1, weight=1)
+        filter_bar = ttk.Frame(table_card)
+        filter_bar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        ttk.Label(filter_bar, text="Show").pack(side="left", padx=(0, 6))
+        self.var_filter = tk.StringVar(value="All")
+        ttk.Combobox(
+            filter_bar,
+            textvariable=self.var_filter,
+            values=_COMPARISON_FILTERS,
+            state="readonly",
+            width=20,
+        ).pack(side="left")
+        self.lbl_region_count = ttk.Label(
+            filter_bar,
+            text="",
+            style=MIDNIGHTSTUDIO_STYLES["card_secondary"],
+        )
+        self.lbl_region_count.pack(side="left", padx=(12, 0))
+
+        self.tree = ttk.Treeview(
+            table_card,
+            columns=(
+                "classification",
+                "whisper_time",
+                "crisper_time",
+                "whisper",
+                "crisper",
+            ),
+            show="headings",
+            selectmode="browse",
+            style=MIDNIGHTSTUDIO_STYLES["comparison_tree"],
+        )
+        for column, heading, width, stretch in (
+            ("classification", "Classification", 170, False),
+            ("whisper_time", "WhisperX time", 145, False),
+            ("crisper_time", "CrisperWhisper time", 145, False),
+            ("whisper", "WhisperX text", 330, True),
+            ("crisper", "CrisperWhisper text", 330, True),
+        ):
+            self.tree.heading(column, text=heading)
+            self.tree.column(
+                column,
+                width=width,
+                minwidth=70,
+                anchor="w",
+                stretch=stretch,
+            )
+        self.tree.grid(row=1, column=0, sticky="nsew")
+        tree_scroll = ttk.Scrollbar(
+            table_card,
+            orient="vertical",
+            command=self.tree.yview,
+            style=MIDNIGHTSTUDIO_STYLES["review_scrollbar"],
+        )
+        tree_scroll.grid(row=1, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=tree_scroll.set)
+        apply_midnightstudio_card_style(table_card)
+
+        details = ttk.LabelFrame(main, text="Selected region details", padding=8)
+        details.grid(row=4, column=0, sticky="nsew", pady=(0, 8))
+        details.columnconfigure(0, weight=1)
+        details.columnconfigure(1, weight=1)
+        details.rowconfigure(1, weight=1)
+        self.lbl_detail = ttk.Label(
+            details,
+            text="Select a comparison region.",
+            style=MIDNIGHTSTUDIO_STYLES["card_secondary"],
+            wraplength=1100,
+            justify="left",
+        )
+        self.lbl_detail.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        whisper_detail = ttk.LabelFrame(details, text="WhisperX original text", padding=5)
+        whisper_detail.grid(row=1, column=0, sticky="nsew", padx=(0, 4))
+        crisper_detail = ttk.LabelFrame(
+            details, text="CrisperWhisper original text", padding=5
+        )
+        crisper_detail.grid(row=1, column=1, sticky="nsew", padx=(4, 0))
+        self.txt_whisper = self._detail_text(whisper_detail)
+        self.txt_crisper = self._detail_text(crisper_detail)
+        apply_midnightstudio_card_style(whisper_detail)
+        apply_midnightstudio_card_style(crisper_detail)
+        apply_midnightstudio_card_style(details)
+
+        buttons = ttk.Frame(main, style=MIDNIGHTSTUDIO_STYLES["page"])
+        buttons.grid(row=5, column=0, sticky="ew")
+        buttons.columnconfigure(0, weight=1)
+        self.lbl_preview = ttk.Label(
+            buttons,
+            text=("" if self._preview_available else (preview_unavailable_reason or "Preview is unavailable.")),
+            style=MIDNIGHTSTUDIO_STYLES["secondary"],
+        )
+        self.lbl_preview.grid(row=0, column=0, sticky="w")
+        self.btn_preview_whisper = tb.Button(
+            buttons,
+            text="Preview WhisperX time",
+            command=lambda: self._preview_engine("whisperx"),
+            bootstyle="primary-outline",
+        )
+        self.btn_preview_whisper.grid(row=0, column=1, padx=(8, 0))
+        self.btn_preview_crisper = tb.Button(
+            buttons,
+            text="Preview CrisperWhisper time",
+            command=lambda: self._preview_engine("crisperwhisper"),
+            bootstyle="primary-outline",
+        )
+        self.btn_preview_crisper.grid(row=0, column=2, padx=(8, 0))
+        tb.Button(
+            buttons,
+            text="Open WhisperX result",
+            command=lambda: self._open_result("whisperx"),
+            bootstyle="secondary-outline",
+        ).grid(row=0, column=3, padx=(8, 0))
+        tb.Button(
+            buttons,
+            text="Open CrisperWhisper result",
+            command=lambda: self._open_result("crisperwhisper"),
+            bootstyle="secondary-outline",
+        ).grid(row=0, column=4, padx=(8, 0))
+        tb.Button(
+            buttons,
+            text="Close",
+            command=self._close,
+            bootstyle="secondary-outline",
+        ).grid(row=0, column=5, padx=(8, 0))
+
+        self.cmb_whisper.bind("<<ComboboxSelected>>", self._pair_changed, add="+")
+        self.cmb_crisper.bind("<<ComboboxSelected>>", self._pair_changed, add="+")
+        self.var_filter.trace_add("write", self._filter_changed)
+        self.tree.bind("<<TreeviewSelect>>", self._selection_changed, add="+")
+        self.tree.bind("<ButtonRelease-1>", self._select_clicked_row, add="+")
+        self.tree.bind("<Double-1>", self._double_click, add="+")
+        self.bind("<Return>", self._preview_unambiguous)
+        self.bind("<Escape>", self._close)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        reinforce_midnightstudio_control_states(tb.Style.get_instance() or tb.Style())
+        self._refresh_comparison()
+        self.grab_set()
+        self.after_idle(self.tree.focus_set)
+
+    @staticmethod
+    def _revision_sort_key(descriptor):
+        value = descriptor.created_at or descriptor.modified_at
+        timestamp = value.timestamp() if value is not None else float("-inf")
+        return (-timestamp, descriptor.result_id)
+
+    @staticmethod
+    def _format_time(value):
+        if value is None:
+            return "-"
+        seconds = max(0.0, float(value))
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        remainder = seconds % 60
+        return (
+            f"{hours:02d}:{minutes:02d}:{remainder:05.2f}"
+            if hours
+            else f"{minutes:02d}:{remainder:05.2f}"
+        )
+
+    @staticmethod
+    def _short_text(value, limit=92):
+        text = " ".join(str(value or "").split())
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 3)].rstrip() + "..."
+
+    @classmethod
+    def _format_time_range(cls, start, end):
+        if start is None:
+            return "-"
+        if end is None:
+            return cls._format_time(start)
+        return f"{cls._format_time(start)}-{cls._format_time(end)}"
+
+    @staticmethod
+    def _descriptor_label(descriptor):
+        engine_model = descriptor.model or "Model unknown"
+        mode = f" | {descriptor.mode.title()}" if descriptor.mode else ""
+        status = descriptor.status.title()
+        when = descriptor.created_at or descriptor.modified_at
+        timestamp = when.astimezone().strftime("%Y-%m-%d %H:%M") if when else "Time unknown"
+        return (
+            f"{engine_model}{mode} | {status} | {timestamp} | "
+            f"{descriptor.result_id}"
+        )
+
+    @staticmethod
+    def _summary_text(comparison_result):
+        summary = comparison_result.summary
+        parts = [
+            f"Matched words: {summary.matched_normalized_words}",
+            f"Agreement: {summary.agreement_percentage:.1f}%",
+            f"WhisperX-only words: {summary.whisperx_unique_words}",
+            f"CrisperWhisper-only words: {summary.crisperwhisper_unique_words}",
+            f"Discrepancy regions: {summary.discrepancy_region_count}",
+            f"Timing conflicts: {summary.timing_conflict_count}",
+        ]
+        coverage = comparison_result.crisperwhisper.revision.coverage
+        if coverage is not None and not coverage.coverage_complete:
+            parts.append(
+                "CrisperWhisper reports "
+                f"{coverage.remaining_speech_active_gap_count} coverage warning range(s)"
+            )
+        return " | ".join(parts)
+
+    @classmethod
+    def _region_detail_text(cls, region):
+        whisper_speakers = ", ".join(region.whisperx_speakers) or "Unknown"
+        crisper_speakers = ", ".join(region.crisperwhisper_speakers) or "Unknown"
+        timing_part = (
+            f"Maximum timing difference: {region.maximum_timing_delta:.2f}s"
+            if region.maximum_timing_delta is not None
+            else "Maximum timing difference: -"
+        )
+        return (
+            f"WhisperX: {cls._format_time_range(region.whisperx_start, region.whisperx_end)} | "
+            f"CrisperWhisper: {cls._format_time_range(region.crisperwhisper_start, region.crisperwhisper_end)} | "
+            f"{timing_part}\n"
+            f"{region.classification} | WhisperX speaker: {whisper_speakers} | "
+            f"CrisperWhisper speaker: {crisper_speakers}\n{region.explanation}"
+        )
+
+    @classmethod
+    def _region_table_values(cls, region):
+        return (
+            region.classification,
+            cls._format_time_range(region.whisperx_start, region.whisperx_end),
+            cls._format_time_range(
+                region.crisperwhisper_start,
+                region.crisperwhisper_end,
+            ),
+            cls._short_text(region.whisperx_text),
+            cls._short_text(region.crisperwhisper_text),
+        )
+
+    @classmethod
+    def _descriptor_labels(cls, descriptors):
+        labels = {}
+        for descriptor in descriptors:
+            label = cls._descriptor_label(descriptor)
+            suffix = 2
+            unique = label
+            while unique in labels:
+                unique = f"{label} ({suffix})"
+                suffix += 1
+            labels[unique] = descriptor
+        return labels
+
+    @staticmethod
+    def _label_for_descriptor(descriptor, labels):
+        for label, candidate in labels.items():
+            if candidate.file_identity == descriptor.file_identity:
+                return label
+        raise ResultComparisonError("The default comparison revision is unavailable.")
+
+    @staticmethod
+    def _detail_text(parent):
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
+        text = tk.Text(parent, wrap="word", height=6)
+        style_midnightstudio_text(text, readonly=True)
+        scroll = ttk.Scrollbar(
+            parent,
+            orient="vertical",
+            command=text.yview,
+            style=MIDNIGHTSTUDIO_STYLES["review_scrollbar"],
+        )
+        text.configure(yscrollcommand=scroll.set, state="disabled")
+        text.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+        return text
+
+    @staticmethod
+    def _set_text(widget, value):
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        widget.insert("1.0", value or "No corresponding text in this result.")
+        widget.configure(state="disabled")
+
+    def _selected_descriptors(self):
+        return (
+            self._whisper_labels.get(self.var_whisper.get()),
+            self._crisper_labels.get(self.var_crisper.get()),
+        )
+
+    def _report(self, message):
+        if self._report_callback is not None:
+            self._report_callback(message)
+
+    def _pair_changed(self, _event=None):
+        self._refresh_comparison()
+
+    def _refresh_comparison(self):
+        whisper, crisper = self._selected_descriptors()
+        if whisper is None or crisper is None:
+            return
+        try:
+            self._comparison = compare_results(whisper, crisper)
+            self._model = _ComparisonDialogModel(self._comparison)
+        except Exception as exc:
+            self._comparison = None
+            self._model = None
+            self._report(f"[comparison] Could not compare the selected revisions: {exc}")
+            self.lbl_summary.configure(text=f"Comparison unavailable: {exc}")
+            self._render_regions()
+            return
+        self.lbl_summary.configure(text=self._summary_text(self._comparison))
+        self._render_regions()
+
+    def _filter_changed(self, *_args):
+        self._render_regions()
+
+    def _current_region(self):
+        selection = self.tree.selection()
+        return self._row_regions.get(selection[0]) if selection else None
+
+    def _render_regions(self):
+        selected = self._current_region()
+        selected_id = selected.region_id if selected is not None else None
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self._row_regions = {}
+        visible = self._model.visible(self.var_filter.get()) if self._model else ()
+        selected_item = None
+        for index, region in enumerate(visible):
+            item = f"comparison-{index}"
+            self.tree.insert(
+                "",
+                "end",
+                iid=item,
+                values=self._region_table_values(region),
+            )
+            self._row_regions[item] = region
+            if region.region_id == selected_id:
+                selected_item = item
+        children = self.tree.get_children()
+        if selected_item is None and children:
+            selected_item = children[0]
+        if selected_item is not None:
+            self.tree.selection_set(selected_item)
+            self.tree.focus(selected_item)
+            self.tree.see(selected_item)
+        self.lbl_region_count.configure(text=f"{len(visible)} region(s)")
+        self._selection_changed()
+
+    def _selection_changed(self, _event=None):
+        region = self._current_region()
+        if region is None:
+            self.lbl_detail.configure(text="No comparison region selected.")
+            self._set_text(self.txt_whisper, "")
+            self._set_text(self.txt_crisper, "")
+            self.btn_preview_whisper.configure(state="disabled")
+            self.btn_preview_crisper.configure(state="disabled")
+            return
+        self.lbl_detail.configure(text=self._region_detail_text(region))
+        self._set_text(self.txt_whisper, region.whisperx_text)
+        self._set_text(self.txt_crisper, region.crisperwhisper_text)
+        self.btn_preview_whisper.configure(
+            state="normal" if self._can_preview(region, "whisperx") else "disabled"
+        )
+        self.btn_preview_crisper.configure(
+            state=(
+                "normal"
+                if self._can_preview(region, "crisperwhisper")
+                else "disabled"
+            )
+        )
+
+    def _engine_preview_time(self, region, engine):
+        if engine == "whisperx":
+            return region.whisperx_start
+        if engine == "crisperwhisper":
+            return region.crisperwhisper_start
+        raise ValueError(f"Unknown comparison engine: {engine}")
+
+    def _can_preview(self, region, engine):
+        return bool(
+            region is not None
+            and self._preview_available
+            and self._preview_callback is not None
+            and self._engine_preview_time(region, engine) is not None
+        )
+
+    def _select_clicked_row(self, event):
+        item = self.tree.identify_row(event.y)
+        if item:
+            self.tree.selection_set(item)
+            self.tree.focus(item)
+
+    def _double_click(self, event):
+        item = self.tree.identify_row(event.y)
+        if not item:
+            return None
+        self.tree.selection_set(item)
+        self.tree.focus(item)
+        return self._preview_unambiguous()
+
+    def _preview_unambiguous(self, _event=None):
+        region = self._current_region()
+        available = tuple(
+            engine
+            for engine in ("whisperx", "crisperwhisper")
+            if self._can_preview(region, engine)
+        )
+        if len(available) != 1:
+            if len(available) == 2:
+                self.lbl_preview.configure(
+                    text="Choose an explicitly labeled engine preview button."
+                )
+            return "break"
+        return self._preview_engine(available[0])
+
+    def _preview_engine(self, engine):
+        region = self._current_region()
+        if not self._can_preview(region, engine):
+            return "break"
+        preview_time = self._engine_preview_time(region, engine)
+        try:
+            success, reason = self._preview_callback(preview_time)
+        except Exception as exc:
+            success, reason = False, str(exc)
+        if not success:
+            reason = reason or "Media preview is unavailable."
+            self.lbl_preview.configure(text=reason)
+            self._report(f"[comparison] Preview unavailable: {reason}")
+        return "break"
+
+    def _open_result(self, engine):
+        whisper, crisper = self._selected_descriptors()
+        descriptor = whisper if engine == "whisperx" else crisper
+        if descriptor is None:
+            return
+        self.result_action = ("open", descriptor)
+        self._close()
+
+    def _close(self, _event=None):
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        self.destroy()
+        return "break"
+
+
 class ReviewNamePage(ttk.Frame):
     """Persistent host for at most one embedded Name Speakers workspace."""
 
@@ -6368,6 +7040,8 @@ class ReviewNamePage(ttk.Frame):
         open_latest_callback,
         open_result_browser_callback,
         back_to_transcribe_callback,
+        compare_results_callback=None,
+        comparison_available_callback=None,
         apply_complete_callback=None,
         report_callback=None,
     ):
@@ -6375,6 +7049,8 @@ class ReviewNamePage(ttk.Frame):
         self._open_latest_callback = open_latest_callback
         self._open_result_browser_callback = open_result_browser_callback
         self._back_to_transcribe_callback = back_to_transcribe_callback
+        self._compare_results_callback = compare_results_callback
+        self._comparison_available_callback = comparison_available_callback
         self._apply_complete_callback = apply_complete_callback
         self._report_callback = report_callback
         self.workspace = None
@@ -6391,13 +7067,22 @@ class ReviewNamePage(ttk.Frame):
         )
         toolbar.grid(row=0, column=0, sticky="ew")
         toolbar.columnconfigure(0, weight=1)
+        self.btn_compare_results = tb.Button(
+            toolbar,
+            text="Compare Results...",
+            command=self._compare_results_callback,
+            bootstyle="primary-outline",
+            padding=(14, 5),
+            state="disabled",
+        )
+        self.btn_compare_results.grid(row=0, column=1, sticky="e", padx=(0, 8))
         tb.Button(
             toolbar,
             text="Open Result...",
             command=self._open_result_browser_callback,
             bootstyle="primary-outline",
             padding=(14, 5),
-        ).grid(row=0, column=1, sticky="e")
+        ).grid(row=0, column=2, sticky="e")
 
         self.incomplete_banner = ttk.Frame(
             self,
@@ -6558,6 +7243,40 @@ class ReviewNamePage(ttk.Frame):
         if self._report_callback is not None:
             self._report_callback(message)
 
+    def _refresh_comparison_availability(self):
+        enabled = False
+        availability_callback = getattr(
+            self,
+            "_comparison_available_callback",
+            None,
+        )
+        if (
+            isinstance(self.current_result_descriptor, ResultDescriptor)
+            and availability_callback is not None
+        ):
+            try:
+                enabled = bool(
+                    availability_callback(
+                        self.current_result_descriptor
+                    )
+                )
+            except Exception:
+                enabled = False
+        if hasattr(self, "btn_compare_results"):
+            self.btn_compare_results.configure(
+                state="normal" if enabled else "disabled"
+            )
+
+    def comparison_preview_status(self):
+        if self.workspace is None:
+            return False, "No Review result is loaded."
+        return self.workspace.comparison_preview_status()
+
+    def preview_comparison_time(self, seconds):
+        if self.workspace is None:
+            return False, "No Review result is loaded."
+        return self.workspace.preview_comparison_time(seconds)
+
     @staticmethod
     def _dispose_workspace(workspace, *, save_view_preferences=True):
         if workspace is None:
@@ -6637,6 +7356,7 @@ class ReviewNamePage(ttk.Frame):
             self.current_result_descriptor = current_descriptor
             self.workspace.set_result_descriptor(current_descriptor)
             self._set_incomplete_warning(current_descriptor)
+            self._refresh_comparison_availability()
             self.on_activated()
             return True
 
@@ -6789,6 +7509,7 @@ class ReviewNamePage(ttk.Frame):
         self.current_result_identity = verified_preflight.identity
         self.current_result_descriptor = current_descriptor
         self._set_incomplete_warning(current_descriptor)
+        self._refresh_comparison_availability()
         if current_descriptor.status == "incomplete":
             self._report(
                 "[review] Loaded an Incomplete result. Some speech may be missing."
@@ -6808,6 +7529,7 @@ class ReviewNamePage(ttk.Frame):
             self._set_incomplete_warning(self.current_result_descriptor)
             self.workspace.set_result_descriptor(self.current_result_descriptor)
             self.workspace.refresh_available_subtitles()
+            self._refresh_comparison_availability()
         if self._apply_complete_callback is not None:
             self._apply_complete_callback()
 
@@ -6817,6 +7539,7 @@ class ReviewNamePage(ttk.Frame):
         self.current_result_paths = None
         self.current_result_identity = None
         self.current_result_descriptor = None
+        self._refresh_comparison_availability()
         if hasattr(self, "incomplete_banner"):
             self.incomplete_banner.grid_remove()
         if workspace is None:
@@ -6828,6 +7551,7 @@ class ReviewNamePage(ttk.Frame):
             pass
 
     def on_activated(self):
+        self._refresh_comparison_availability()
         if self.workspace is not None:
             self.workspace.on_host_activated()
 
@@ -6929,6 +7653,8 @@ class App(ttk.Frame):
             open_latest_callback=self.on_name_speakers,
             open_result_browser_callback=self.on_open_result_browser,
             back_to_transcribe_callback=lambda: self.show_page("transcribe"),
+            compare_results_callback=self.on_compare_results,
+            comparison_available_callback=self._comparison_available,
             apply_complete_callback=lambda: self.show_page("review"),
             report_callback=self.log,
         )
@@ -8900,6 +9626,111 @@ class App(ttk.Frame):
             selected.segments_json,
             result_descriptor=selected,
         ):
+            return False
+        self.show_page("review")
+        return True
+
+    def _comparison_descriptors(self, loaded_descriptor, *, log_issues=False):
+        catalog = discover_results(output_root())
+        if log_issues:
+            for issue in catalog.issues:
+                try:
+                    label = str(
+                        issue.path.resolve().relative_to(output_root().resolve())
+                    )
+                except (OSError, ValueError):
+                    label = issue.path.name
+                self.log(
+                    f"[comparison] Skipped invalid result {label}: {issue.message}"
+                )
+        descriptors = list(catalog.results)
+        if isinstance(loaded_descriptor, ResultDescriptor) and not any(
+            item.file_identity == loaded_descriptor.file_identity
+            for item in descriptors
+        ):
+            descriptors.append(loaded_descriptor)
+        return tuple(descriptors)
+
+    def _comparison_available(self, loaded_descriptor):
+        if not isinstance(loaded_descriptor, ResultDescriptor):
+            return False
+        descriptors = self._comparison_descriptors(loaded_descriptor)
+        return bool(compatible_counterparts(loaded_descriptor, descriptors))
+
+    def on_compare_results(self):
+        loaded = self.review_page.current_result_descriptor
+        if not isinstance(loaded, ResultDescriptor):
+            return False
+        try:
+            current = revalidate_descriptor(loaded)
+        except Exception as exc:
+            self.log(f"[comparison] Loaded result is no longer valid: {exc}")
+            messagebox.showerror(
+                "Could not compare results",
+                f"The loaded result is no longer valid:\n{exc}\n\n"
+                "The current Review workspace was left unchanged.",
+                parent=self.winfo_toplevel(),
+            )
+            return False
+        if current.file_identity != self.review_page.current_result_identity:
+            self.log(
+                "[comparison] Loaded result files changed outside Review; comparison was cancelled."
+            )
+            messagebox.showwarning(
+                "Result changed",
+                "The loaded result changed on disk. Open it again before comparing. "
+                "The current Review workspace was left unchanged.",
+                parent=self.winfo_toplevel(),
+            )
+            return False
+
+        descriptors = self._comparison_descriptors(current, log_issues=True)
+        if not compatible_counterparts(current, descriptors):
+            self.review_page._refresh_comparison_availability()
+            messagebox.showinfo(
+                "No compatible comparison",
+                "No opposite-engine revision has the same verified source identity.",
+                parent=self.winfo_toplevel(),
+            )
+            return False
+        preview_available, preview_reason = (
+            self.review_page.comparison_preview_status()
+        )
+        try:
+            dialog = _ResultComparisonDialog(
+                self.winfo_toplevel(),
+                current,
+                descriptors,
+                preview_callback=self.review_page.preview_comparison_time,
+                preview_available=preview_available,
+                preview_unavailable_reason=preview_reason,
+                report_callback=self.log,
+            )
+        except Exception as exc:
+            self.log(f"[comparison] Could not open comparison: {exc}")
+            messagebox.showerror(
+                "Could not compare results",
+                f"The comparison could not be created:\n{exc}",
+                parent=self.winfo_toplevel(),
+            )
+            return False
+        self.wait_window(dialog)
+        action = dialog.result_action
+        if not action or action[0] != "open":
+            return True
+        selected = action[1]
+        try:
+            selected = revalidate_descriptor(selected)
+        except Exception as exc:
+            self.log(f"[comparison] Selected result could not be opened: {exc}")
+            messagebox.showerror(
+                "Could not open result",
+                f"The selected result changed or became unavailable:\n{exc}\n\n"
+                "The current Review workspace was left unchanged.",
+                parent=self.winfo_toplevel(),
+            )
+            return False
+        if not self.review_page.load_result(selected):
             return False
         self.show_page("review")
         return True

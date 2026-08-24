@@ -529,6 +529,7 @@ class ResultRevision:
         execution_backend: Optional[str],
         status: str,
         coverage: Optional[Mapping[str, Any]],
+        comparison_job_id: Optional[str],
     ) -> dict[str, Any]:
         speakers_path = self.output_root / "speakers.json"
         segments_path = self.output_root / "segments.json"
@@ -562,7 +563,7 @@ class ResultRevision:
                 "speakers": _sha256_file(speakers_path),
                 "segments": _sha256_file(segments_path),
             },
-            "comparison_job_id": None,
+            "comparison_job_id": comparison_job_id,
         }
         if coverage is not None:
             manifest["coverage"] = dict(coverage)
@@ -576,6 +577,7 @@ class ResultRevision:
         execution_backend: Optional[str],
         status: str = "complete",
         coverage: Optional[Mapping[str, Any]] = None,
+        comparison_job_id: Optional[str] = None,
         validate_outputs: Optional[Callable[[Path], None]] = None,
     ) -> Path:
         if self.committed:
@@ -596,6 +598,7 @@ class ResultRevision:
             execution_backend=execution_backend,
             status=status,
             coverage=coverage,
+            comparison_job_id=comparison_job_id,
         )
         result_path = self.output_root / "result.json"
         _atomic_write_json(result_path, manifest_data)
