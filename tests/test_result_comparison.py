@@ -598,7 +598,7 @@ class ComparisonGuiContractTests(unittest.TestCase):
             modified_at=None,
             result_id="revision-1",
         )
-        label = gui._ResultComparisonDialog._descriptor_label(descriptor)
+        label = gui._ResultComparisonWorkspace._descriptor_label(descriptor)
         self.assertEqual(
             label,
             "medium | Verbatim | Complete | Time unknown | revision-1",
@@ -618,7 +618,7 @@ class ComparisonGuiContractTests(unittest.TestCase):
                 revision=SimpleNamespace(coverage=None)
             ),
         )
-        summary_text = gui._ResultComparisonDialog._summary_text(comparison_result)
+        summary_text = gui._ResultComparisonWorkspace._summary_text(comparison_result)
         self.assertIn("Matched words: 12 | Agreement: 75.0%", summary_text)
 
         region = self.comparison_region(
@@ -630,7 +630,7 @@ class ComparisonGuiContractTests(unittest.TestCase):
             maximum_timing_delta=2.0,
             explanation="The aligned wording differs.",
         )
-        detail_text = gui._ResultComparisonDialog._region_detail_text(region)
+        detail_text = gui._ResultComparisonWorkspace._region_detail_text(region)
         self.assertIn(
             "WhisperX: 00:12.00-00:13.50 | "
             "CrisperWhisper: 00:14.00-00:15.50 | "
@@ -638,7 +638,7 @@ class ComparisonGuiContractTests(unittest.TestCase):
             detail_text,
         )
 
-        truncated = gui._ResultComparisonDialog._short_text(
+        truncated = gui._ResultComparisonWorkspace._short_text(
             "abcdefghijklmnopqrstuvwxyz", limit=10
         )
         self.assertEqual(truncated, "abcdefg...")
@@ -647,10 +647,10 @@ class ComparisonGuiContractTests(unittest.TestCase):
 
     def test_table_and_detail_show_separate_engine_times(self):
         region = self.comparison_region()
-        values = gui._ResultComparisonDialog._region_table_values(region)
+        values = gui._ResultComparisonWorkspace._region_table_values(region)
         self.assertEqual(values[1], "06:34.33-06:35.59")
         self.assertEqual(values[2], "06:57.78-06:59.04")
-        detail = gui._ResultComparisonDialog._region_detail_text(region)
+        detail = gui._ResultComparisonWorkspace._region_detail_text(region)
         self.assertIn("WhisperX: 06:34.33-06:35.59", detail)
         self.assertIn("CrisperWhisper: 06:57.78-06:59.04", detail)
         self.assertIn("Maximum timing difference: 23.45s", detail)
@@ -662,7 +662,7 @@ class ComparisonGuiContractTests(unittest.TestCase):
             crisperwhisper_text="",
         )
         self.assertEqual(
-            gui._ResultComparisonDialog._region_table_values(whisper_only)[2],
+            gui._ResultComparisonWorkspace._region_table_values(whisper_only)[2],
             "-",
         )
 
@@ -754,13 +754,12 @@ class ComparisonGuiContractTests(unittest.TestCase):
 
     def test_engine_preview_buttons_use_exact_immutable_region_times(self):
         region = self.comparison_region()
-        dialog = object.__new__(gui._ResultComparisonDialog)
+        dialog = object.__new__(gui._ResultComparisonWorkspace)
         dialog._preview_available = True
         dialog._preview_callback = mock.Mock(return_value=(True, None))
         dialog._current_region = lambda: region
         dialog.lbl_preview = mock.Mock()
         dialog._report = mock.Mock()
-        dialog.result_action = None
 
         self.assertEqual(dialog._preview_engine("whisperx"), "break")
         self.assertEqual(dialog._preview_engine("crisperwhisper"), "break")
@@ -772,10 +771,13 @@ class ComparisonGuiContractTests(unittest.TestCase):
             dialog._preview_callback.call_args_list[0],
             dialog._preview_callback.call_args_list[1],
         )
-        self.assertIsNone(dialog.result_action)
+        self.assertIn(
+            "CrisperWhisper",
+            dialog.lbl_preview.configure.call_args.kwargs["text"],
+        )
 
     def test_preview_enablement_is_engine_specific_and_source_safe(self):
-        dialog = object.__new__(gui._ResultComparisonDialog)
+        dialog = object.__new__(gui._ResultComparisonWorkspace)
         dialog._preview_available = True
         dialog._preview_callback = mock.Mock(return_value=(True, None))
         both = self.comparison_region()
@@ -799,7 +801,7 @@ class ComparisonGuiContractTests(unittest.TestCase):
         self.assertFalse(dialog._can_preview(both, "crisperwhisper"))
 
     def test_no_selection_disables_both_preview_buttons(self):
-        dialog = object.__new__(gui._ResultComparisonDialog)
+        dialog = object.__new__(gui._ResultComparisonWorkspace)
         dialog._current_region = lambda: None
         dialog.lbl_detail = mock.Mock()
         dialog.txt_whisper = mock.Mock()
@@ -813,7 +815,7 @@ class ComparisonGuiContractTests(unittest.TestCase):
 
     def test_enter_and_double_click_do_not_choose_between_two_times(self):
         region = self.comparison_region()
-        dialog = object.__new__(gui._ResultComparisonDialog)
+        dialog = object.__new__(gui._ResultComparisonWorkspace)
         dialog._preview_available = True
         dialog._preview_callback = mock.Mock(return_value=(True, None))
         dialog._current_region = lambda: region
@@ -841,15 +843,13 @@ class ComparisonGuiContractTests(unittest.TestCase):
         self.assertEqual(dialog._preview_unambiguous(), "break")
         dialog._preview_callback.assert_called_once_with(394.33)
 
-    def test_escape_closes_comparison_dialog(self):
-        dialog = object.__new__(gui._ResultComparisonDialog)
-
-        dialog.grab_release = mock.Mock()
-        dialog.destroy = mock.Mock()
+    def test_escape_returns_to_review_without_destroying_comparison_state(self):
+        dialog = object.__new__(gui._ResultComparisonWorkspace)
+        dialog._back_to_review_callback = mock.Mock()
         self.assertEqual(dialog._close(), "break")
-        dialog.destroy.assert_called_once_with()
+        dialog._back_to_review_callback.assert_called_once_with()
 
-    def test_open_compared_result_uses_existing_safe_review_loader(self):
+    def test_compare_results_opens_the_in_page_review_mode(self):
         with tempfile.TemporaryDirectory() as temporary:
             fixture = ComparisonFixture(Path(temporary))
             whisper = fixture.result(
@@ -863,35 +863,174 @@ class ComparisonGuiContractTests(unittest.TestCase):
                 [fixture.one_segment("hello", 0.0)],
             )
 
-            class Dialog:
-                def __init__(self, *_args, **_kwargs):
-                    self.result_action = ("open", crisper)
-
             app = object.__new__(gui.App)
             app.review_page = mock.Mock()
             app.review_page.current_result_descriptor = whisper
             app.review_page.current_result_identity = whisper.file_identity
-            app.review_page.comparison_preview_status.return_value = (
-                False,
-                "Preview unavailable in fixture.",
-            )
-            app.review_page.load_result.return_value = True
+            app.review_page.open_comparison.return_value = True
             app._comparison_descriptors = mock.Mock(
                 return_value=(whisper, crisper)
             )
             app.log = mock.Mock()
             app.winfo_toplevel = lambda: None
-            app.wait_window = mock.Mock()
             app.show_page = mock.Mock()
-            with mock.patch.object(gui, "_ResultComparisonDialog", Dialog), mock.patch.object(
-                gui, "get_embedded_vlc_status"
-            ) as vlc:
+            with mock.patch.object(gui, "get_embedded_vlc_status") as vlc:
                 self.assertTrue(app.on_compare_results())
             vlc.assert_not_called()
-            app.review_page.load_result.assert_called_once_with(mock.ANY)
-            opened = app.review_page.load_result.call_args.args[0]
-            self.assertEqual(opened.file_identity, crisper.file_identity)
+            app.review_page.open_comparison.assert_called_once_with(
+                whisper,
+                (whisper, crisper),
+            )
             app.show_page.assert_called_once_with("review")
+
+
+class OptionalIntegratedReviewWorkspaceTests(unittest.TestCase):
+    def setUp(self):
+        try:
+            self.root = gui.tb.Window(themename="litera")
+        except gui.tk.TclError as exc:
+            self.skipTest(f"Tk is unavailable: {exc}")
+        gui.register_midnightstudio_theme(self.root)
+        self.root.geometry("1366x768+0+0")
+        self.temporary = tempfile.TemporaryDirectory()
+        self.fixture = ComparisonFixture(Path(self.temporary.name))
+        whisper_segments = [
+            self.fixture.one_segment(f"Whisper passage {index}", index * 4.0)
+            for index in range(12)
+        ]
+        crisper_segments = [
+            self.fixture.one_segment(
+                f"Crisper passage {index}",
+                index * 4.0 + 2.0,
+            )
+            for index in range(12)
+        ]
+        self.whisper = self.fixture.result(
+            "whisper",
+            "whisperx",
+            whisper_segments,
+        )
+        self.crisper = self.fixture.result(
+            "crisper",
+            "crisperwhisper",
+            crisper_segments,
+        )
+        self.page = gui.ReviewNamePage(
+            self.root,
+            open_latest_callback=lambda: None,
+            open_result_browser_callback=lambda: None,
+            back_to_transcribe_callback=lambda: None,
+            compare_results_callback=lambda: None,
+            comparison_available_callback=lambda _descriptor: True,
+            report_callback=lambda _message: None,
+        )
+        self.page.pack(fill="both", expand=True)
+        self.vlc_patch = mock.patch.object(
+            gui,
+            "get_embedded_vlc_status",
+            return_value={"available": False, "reason": "Synthetic unavailable VLC."},
+        )
+        self.candidate_patch = mock.patch.object(
+            gui,
+            "_extract_candidates_from_text",
+            return_value=[],
+        )
+        self.vlc_patch.start()
+        self.candidate_patch.start()
+        self.assertTrue(self.page.load_result(self.whisper))
+        self.root.update()
+
+    def tearDown(self):
+        try:
+            workspace = getattr(self.page, "workspace", None)
+            if workspace is not None:
+                self.page._reset_embedded_modes()
+                workspace.shutdown(save_view_preferences=False)
+                workspace.destroy()
+        except (AttributeError, gui.tk.TclError):
+            pass
+        self.candidate_patch.stop()
+        self.vlc_patch.stop()
+        try:
+            self.root.destroy()
+        except gui.tk.TclError:
+            pass
+        self.temporary.cleanup()
+
+    def test_review_compare_fusion_navigation_is_in_page_and_keeps_player_host(self):
+        workspace = self.page.workspace
+        player = object()
+        video_loop = object()
+        word_loop = object()
+        workspace._vlc_player = player
+        workspace._video_update_after = video_loop
+        workspace._word_sync_after = word_loop
+        surface_id = workspace.video_surface.winfo_id()
+        dirty_before = workspace.has_unsaved_changes()
+        descriptor_before = self.page.current_result_descriptor
+
+        self.assertTrue(
+            self.page.open_comparison(
+                self.whisper,
+                (self.whisper, self.crisper),
+            )
+        )
+        comparison_view = self.page._comparison_workspace
+        comparison_view._open_fusion_draft()
+        fusion_view = self.page._fusion_workspace
+        self.assertIsNotNone(fusion_view)
+
+        for geometry in ("1366x768+0+0", "1920x1080+0+0"):
+            self.root.geometry(geometry)
+            self.root.update()
+            workspace._apply_embedded_mode_sash()
+            fusion_view._set_initial_pane_position()
+            self.root.update()
+            children = fusion_view.tree.get_children()
+            self.assertGreaterEqual(len(children), 8)
+            eighth = fusion_view.tree.bbox(children[7])
+            self.assertTrue(eighth)
+            self.assertLessEqual(
+                eighth[1] + eighth[3],
+                fusion_view.tree.winfo_height(),
+            )
+            self.assertGreaterEqual(workspace.video_surface.winfo_width(), 420)
+            self.assertGreaterEqual(workspace.video_surface.winfo_height(), 150)
+
+        try:
+            self.root.state("zoomed")
+            self.root.update()
+            workspace._apply_embedded_mode_sash()
+            fusion_view._set_initial_pane_position()
+            self.root.update()
+            eighth = fusion_view.tree.bbox(fusion_view.tree.get_children()[7])
+            self.assertTrue(eighth)
+            self.assertGreaterEqual(workspace.video_surface.winfo_width(), 420)
+            self.assertGreaterEqual(workspace.video_surface.winfo_height(), 150)
+        except gui.tk.TclError:
+            pass
+
+        session = fusion_view.session
+        self.assertTrue(self.page.show_comparison_mode())
+        self.assertTrue(self.page.show_review_mode())
+        self.assertTrue(self.page.show_comparison_mode())
+        self.assertTrue(self.page._open_fusion_workspace(session.comparison))
+        self.assertIs(self.page._fusion_workspace.session, session)
+        self.assertIs(workspace._vlc_player, player)
+        self.assertIs(workspace._video_update_after, video_loop)
+        self.assertIs(workspace._word_sync_after, word_loop)
+        self.assertEqual(workspace.video_surface.winfo_id(), surface_id)
+        self.assertIs(self.page.current_result_descriptor, descriptor_before)
+        self.assertEqual(workspace.has_unsaved_changes(), dirty_before)
+        self.assertFalse(
+            any(
+                isinstance(child, gui.tk.Toplevel)
+                for child in self.root.winfo_children()
+            )
+        )
+        workspace._vlc_player = None
+        workspace._video_update_after = None
+        workspace._word_sync_after = None
 
 
 if __name__ == "__main__":

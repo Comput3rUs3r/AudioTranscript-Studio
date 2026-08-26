@@ -56,6 +56,12 @@ class _Widget:
     def winfo_id(self):
         return 123
 
+    def update_idletasks(self):
+        return None
+
+    def winfo_height(self):
+        return 200
+
 
 class _CaptionText(_Widget):
     def __init__(self):
@@ -104,6 +110,7 @@ class _Player:
         self.paused = False
         self.volume = 80
         self.hwnd_calls = 0
+        self.hwnd_values = []
         self.release_count = 0
         self.stop_count = 0
         self.spu_calls = []
@@ -150,8 +157,9 @@ class _Player:
     def audio_get_volume(self):
         return self.volume
 
-    def set_hwnd(self, _hwnd):
+    def set_hwnd(self, hwnd):
         self.hwnd_calls += 1
+        self.hwnd_values.append(hwnd)
 
     def video_set_spu(self, track):
         self.spu_calls.append(track)
@@ -274,6 +282,53 @@ class AudioMediaPlayerTests(unittest.TestCase):
         if gui.os.name == "nt":
             self.assertEqual(workspace._vlc_player.hwnd_calls, 1)
         self.assertFalse(workspace.audio_caption.placed)
+
+    def test_comparison_preview_keeps_the_permanent_player_and_hwnd(self):
+        source = self._source(".mp4")
+        workspace = _base_workspace(source)
+        player = workspace._vlc_player
+        media = _Media(str(source))
+        workspace._vlc_media = media
+        workspace._loaded_video_path = gui.os.path.normcase(str(source.resolve()))
+        workspace._loaded_media_kind = "video"
+        player.media = media
+        player.time_ms = 2345
+        player.playing = True
+        player.volume = 37
+        workspace.video_volume_var.set(37)
+        workspace.subtitle_var.set("SRT")
+        workspace._video_update_after = "existing-poll-loop"
+        workspace._word_sync_after = "existing-word-loop"
+        created_before = len(workspace._vlc_instance.created_media)
+        hwnd_before = tuple(player.hwnd_values)
+
+        success, reason = workspace.preview_comparison_time(6.25)
+
+        self.assertTrue(success, reason)
+        self.assertIs(workspace._vlc_player, player)
+        self.assertIs(workspace._vlc_media, media)
+        self.assertEqual(len(workspace._vlc_instance.created_media), created_before)
+        self.assertEqual(workspace._video_update_after, "existing-poll-loop")
+        self.assertEqual(workspace._word_sync_after, "existing-word-loop")
+        self.assertEqual(workspace.subtitle_var.get(), "SRT")
+        workspace._schedule_video_start_seek.assert_called_once_with(6.25)
+        if gui.os.name == "nt":
+            self.assertGreaterEqual(len(player.hwnd_values), len(hwnd_before))
+            self.assertTrue(all(value == 123 for value in player.hwnd_values))
+
+    def test_comparison_preview_status_never_creates_a_player(self):
+        missing = self.root / "missing.mp4"
+        workspace = _base_workspace(missing)
+        player = workspace._vlc_player
+        created_before = len(workspace._vlc_instance.created_media)
+
+        success, reason = workspace.comparison_preview_status()
+
+        self.assertFalse(success)
+        self.assertIn("missing", reason.lower())
+        self.assertIs(workspace._vlc_player, player)
+        self.assertEqual(len(workspace._vlc_instance.created_media), created_before)
+        self.assertFalse(hasattr(workspace, "loan_embedded_player"))
 
     def test_timed_word_click_loads_audio_without_informational_popup(self):
         source = self._source(".mp3")

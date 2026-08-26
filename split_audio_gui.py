@@ -4,7 +4,7 @@ import ttkbootstrap as tb
 from ttkbootstrap.style import ThemeDefinition
 from tkinter import ttk, messagebox, filedialog, font as tkfont
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from collections import Counter
 from bisect import bisect_right
 from split_audio import (
@@ -50,6 +50,25 @@ from result_comparison import (
     compare_results,
     compatible_counterparts,
     strict_same_source,
+)
+from result_fusion import (
+    INCLUDE_ENGINE_ONLY as _FUSION_INCLUDE_ENGINE_ONLY,
+    KEEP_BOTH as _FUSION_KEEP_BOTH,
+    OMIT_BOTH as _FUSION_OMIT_BOTH,
+    OMIT_ENGINE_ONLY as _FUSION_OMIT_ENGINE_ONLY,
+    RESET_TO_UNRESOLVED as _FUSION_RESET,
+    USE_CRISPERWHISPER as _FUSION_USE_CRISPER,
+    USE_CRISPERWHISPER_TIMING as _FUSION_USE_CRISPER_TIMING,
+    USE_WHISPERX as _FUSION_USE_WHISPER,
+    USE_WHISPERX_TIMING as _FUSION_USE_WHISPER_TIMING,
+    FusionDecisionError,
+    FusionNotReadyError,
+    FusionValidationError,
+    apply_decision as apply_fusion_decision,
+    build_combined_preview,
+    create_fusion_plan,
+    reset_decision as reset_fusion_decision,
+    valid_decision_actions,
 )
 from result_storage import build_apply_manifest_updates, cleanup_process_staging
 
@@ -115,6 +134,7 @@ MIDNIGHTSTUDIO_STYLES = {
     "segment_tree": "MidnightStudio.SegmentCorrection.Treeview",
     "result_tree": "MidnightStudio.ResultBrowser.Treeview",
     "comparison_tree": "MidnightStudio.ResultComparison.Treeview",
+    "fusion_tree": "MidnightStudio.FusionDraft.Treeview",
     "media_tree": "MidnightStudio.SelectedMedia.Treeview",
 }
 
@@ -306,6 +326,7 @@ def _configure_midnightstudio_styles(style):
         styles["segment_tree"],
         styles["result_tree"],
         styles["comparison_tree"],
+        styles["fusion_tree"],
         styles["media_tree"],
     ):
         style.configure(
@@ -354,6 +375,11 @@ def _configure_midnightstudio_styles(style):
             foreground=[("pressed", colors["selectfg"]), ("active", colors["fg"])],
             bordercolor=[("focus", tokens["focus"]), ("active", tokens["focus"])],
         )
+
+    # The fusion review can contain hundreds of decisions.  Its compact rows
+    # keep a useful working set visible without shrinking the original-text
+    # panes at ordinary laptop resolutions.
+    style.configure(styles["fusion_tree"], rowheight=22)
 
     style.configure(
         styles["card"],
@@ -2365,6 +2391,7 @@ class NamingWorkspace(ttk.Frame):
         self._view_preferences_saved = False
         self._preview_ratio_after = None
         self._preview_ratio_applied = False
+        self._mode_sash_after = None
         self._video_reattach_after = None
         try:
             self._naming_cfg = read_yaml(conf_path())
@@ -2500,6 +2527,10 @@ class NamingWorkspace(ttk.Frame):
         left.columnconfigure(0, weight=1)
         left.rowconfigure(0, weight=1, minsize=150)
         left.rowconfigure(1, weight=1, minsize=125)
+        self._review_left_frame = left
+        self._embedded_mode_frame = None
+        self._embedded_mode = "review"
+        self._mode_left_ratio = 0.64
         right.columnconfigure(0, weight=1)
         right.rowconfigure(1, weight=1)
         self.inputs = {}
@@ -2707,6 +2738,7 @@ class NamingWorkspace(ttk.Frame):
             state="disabled",
         )
         self.btn_revert.pack(side="left", padx=(8, 0))
+        self._review_mode_widgets = (assignments, pool_frame, opts, btns)
 
         toolbar = ttk.LabelFrame(right, text="Search", padding=10)
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
@@ -3006,6 +3038,77 @@ class NamingWorkspace(ttk.Frame):
             self.lbl_result_metadata_trailing.configure(text=display.trailing_text)
         return True
 
+    @property
+    def embedded_mode(self):
+        return self._embedded_mode
+
+    @property
+    def embedded_mode_parent(self):
+        return self._review_left_frame
+
+    def show_embedded_mode(self, frame, mode):
+        """Show an in-page review tool without moving or recreating the player."""
+
+        if mode not in {"compare", "fusion"}:
+            raise ValueError(f"Unsupported Review mode: {mode}")
+        if self._embedded_mode_frame is not None and self._embedded_mode_frame is not frame:
+            self._embedded_mode_frame.grid_remove()
+        for widget in self._review_mode_widgets:
+            widget.grid_remove()
+        frame.grid(row=0, column=0, rowspan=4, sticky="nsew")
+        self._embedded_mode_frame = frame
+        self._embedded_mode = mode
+        self._schedule_mode_sash(self._apply_embedded_mode_sash)
+
+    def show_review_mode(self):
+        if self._embedded_mode_frame is not None:
+            self._embedded_mode_frame.grid_remove()
+        for widget in self._review_mode_widgets:
+            widget.grid()
+        self._embedded_mode = "review"
+        self._schedule_mode_sash(self._restore_review_mode_sash)
+
+    def _schedule_mode_sash(self, callback):
+        self._cancel_mode_sash_callback()
+
+        def apply():
+            self._mode_sash_after = None
+            callback()
+
+        try:
+            self._mode_sash_after = self.after_idle(apply)
+        except tk.TclError:
+            self._mode_sash_after = None
+
+    def _cancel_mode_sash_callback(self):
+        if getattr(self, "_mode_sash_after", None) is None:
+            return
+        try:
+            self.after_cancel(self._mode_sash_after)
+        except (AttributeError, tk.TclError):
+            pass
+        self._mode_sash_after = None
+
+    def _apply_embedded_mode_sash(self):
+        try:
+            width = self._workspace_paned.winfo_width()
+            if width > 1 and len(self._workspace_paned.panes()) == 2:
+                ratio = max(0.52, min(0.72, float(self._mode_left_ratio)))
+                self._workspace_paned.sashpos(0, int(round(width * ratio)))
+        except (AttributeError, TypeError, ValueError, tk.TclError):
+            pass
+
+    def _restore_review_mode_sash(self):
+        try:
+            width = self._workspace_paned.winfo_width()
+            if width > 1 and len(self._workspace_paned.panes()) == 2:
+                self._workspace_paned.sashpos(
+                    0,
+                    int(round(width * self._workspace_left_ratio)),
+                )
+        except (AttributeError, tk.TclError):
+            pass
+
     def start(self):
         """Start host-dependent services after the workspace has been placed."""
         if self._started or self._player_closing:
@@ -3018,7 +3121,7 @@ class NamingWorkspace(ttk.Frame):
         self._schedule_initial_pane_ratios(100)
 
     def on_host_activated(self):
-        """Reattach the existing video output after an embedded host is remapped."""
+        """Keep the permanent Review video surface attached when its page is shown."""
         self._schedule_initial_pane_ratios()
         if (
             os.name != "nt"
@@ -3036,8 +3139,7 @@ class NamingWorkspace(ttk.Frame):
             try:
                 if not self.winfo_exists() or not self.video_surface.winfo_exists():
                     return
-                self.video_surface.update_idletasks()
-                self._vlc_player.set_hwnd(self.video_surface.winfo_id())
+                self._attach_video_output(self.video_surface)
             except (AttributeError, tk.TclError):
                 pass
             except Exception:
@@ -3160,7 +3262,12 @@ class NamingWorkspace(ttk.Frame):
             ):
                 self._schedule_initial_pane_ratios()
                 return
-            left_sash = int(round(available_width * self._workspace_left_ratio))
+            left_ratio = (
+                self._workspace_left_ratio
+                if getattr(self, "_embedded_mode", "review") == "review"
+                else self._mode_left_ratio
+            )
+            left_sash = int(round(available_width * left_ratio))
             video_sash = int(round(available_height * self._preview_video_ratio))
             self._workspace_paned.sashpos(0, left_sash)
             self._preview_paned.sash_place(0, 0, video_sash)
@@ -3172,6 +3279,8 @@ class NamingWorkspace(ttk.Frame):
                 self._schedule_initial_pane_ratios()
 
     def _current_workspace_left_ratio(self):
+        if getattr(self, "_embedded_mode", "review") != "review":
+            return self._workspace_left_ratio
         if not self._preview_ratio_applied:
             return self._workspace_left_ratio
         try:
@@ -3197,6 +3306,18 @@ class NamingWorkspace(ttk.Frame):
 
     def _remember_current_pane_ratios(self):
         if not self._preview_ratio_applied or self._player_closing:
+            return
+        if getattr(self, "_embedded_mode", "review") != "review":
+            try:
+                width = self._workspace_paned.winfo_width()
+                if width > 1:
+                    self._mode_left_ratio = max(
+                        0.52,
+                        min(0.72, self._workspace_paned.sashpos(0) / width),
+                    )
+            except (AttributeError, tk.TclError):
+                pass
+            self._preview_video_ratio = self._current_preview_video_ratio()
             return
         self._workspace_left_ratio = self._current_workspace_left_ratio()
         self._preview_video_ratio = self._current_preview_video_ratio()
@@ -3285,6 +3406,19 @@ class NamingWorkspace(ttk.Frame):
                 or "Embedded VLC playback is unavailable.",
             )
         return True, None
+
+    def _attach_video_output(self, surface):
+        if (
+            os.name != "nt"
+            or self._vlc_player is None
+            or self._loaded_media_kind != "video"
+        ):
+            return
+        try:
+            surface.update_idletasks()
+        except AttributeError:
+            pass
+        self._vlc_player.set_hwnd(surface.winfo_id())
 
     def preview_comparison_time(self, seconds):
         available, reason = self.comparison_preview_status()
@@ -3621,6 +3755,12 @@ class NamingWorkspace(ttk.Frame):
         self._video_update_after = None
         if self._player_closing or self._vlc_player is None:
             return
+        self._update_video_ui_once()
+        self._schedule_video_ui_update()
+
+    def _update_video_ui_once(self):
+        if self._player_closing or self._vlc_player is None:
+            return
         try:
             duration_ms = max(0, int(self._vlc_player.get_length()))
             current_ms = max(0, int(self._vlc_player.get_time()))
@@ -3635,10 +3775,10 @@ class NamingWorkspace(ttk.Frame):
             self.lbl_video_time.configure(
                 text=f"{self._format_video_time(current)} / {self._format_video_time(duration)}"
             )
-            self.btn_video_play.configure(text="Pause" if self._vlc_player.is_playing() else "Play")
+            is_playing = bool(self._vlc_player.is_playing())
+            self.btn_video_play.configure(text="Pause" if is_playing else "Play")
         except Exception:
             pass
-        self._schedule_video_ui_update()
 
     def _cancel_pending_video_seek(self):
         if self._pending_seek_after is not None:
@@ -3721,6 +3861,7 @@ class NamingWorkspace(ttk.Frame):
                 self.btn_video_play.configure(text="Pause")
                 self._schedule_selected_subtitle_after_play()
                 self._schedule_word_synchronization()
+            self._update_video_ui_once()
         except Exception as exc:
             messagebox.showerror(
                 "Media Preview",
@@ -4257,7 +4398,7 @@ class NamingWorkspace(ttk.Frame):
                     pass
 
         if os.name == "nt" and media_kind == "video":
-            self._vlc_player.set_hwnd(self.video_surface.winfo_id())
+            self._attach_video_output(self.video_surface)
         self.video_message.place_forget()
         if media_kind == "video":
             self._audio_caption_render_key = None
@@ -4283,6 +4424,7 @@ class NamingWorkspace(ttk.Frame):
         if save_view_preferences:
             self._save_name_speakers_view_preferences()
         self._player_closing = True
+        self._cancel_mode_sash_callback()
         self._cancel_pending_preview_ratio()
         self._cancel_word_synchronization()
         self._clear_current_word()
@@ -4348,7 +4490,9 @@ class NamingWorkspace(ttk.Frame):
             "pane_ratio_pending": self._preview_ratio_after is not None,
         }
 
+
         self._cancel_pending_preview_ratio()
+        self._cancel_mode_sash_callback()
         self._cancel_word_synchronization()
         self._cancel_pending_video_seek()
         self._cancel_pending_subtitle_apply()
@@ -6121,7 +6265,7 @@ class _OpenResultDialog(tk.Toplevel):
         )
         main.grid(row=0, column=0, sticky="nsew")
         main.columnconfigure(0, weight=1)
-        main.rowconfigure(2, weight=1)
+        main.rowconfigure(1, weight=1)
 
         ttk.Label(
             main,
@@ -6440,8 +6584,1895 @@ class _ComparisonDialogModel:
         )
 
 
-class _ResultComparisonDialog(tk.Toplevel):
-    """Read-only Midnight Studio comparison of two exact result revisions."""
+_FUSION_FILTERS = (
+    "Unresolved",
+    "All",
+    "Resolved",
+    "Engine-only",
+    "Text conflicts",
+    "Timing conflicts",
+    "Possible duplicates",
+    "Warnings",
+)
+
+_FUSION_ACTION_LABELS = {
+    _FUSION_USE_WHISPER: "Use WhisperX wording",
+    _FUSION_USE_CRISPER: "Use CrisperWhisper wording",
+    _FUSION_USE_WHISPER_TIMING: "Use WhisperX timing",
+    _FUSION_USE_CRISPER_TIMING: "Use CrisperWhisper timing",
+    _FUSION_INCLUDE_ENGINE_ONLY: "Include passage",
+    _FUSION_OMIT_ENGINE_ONLY: "Omit passage",
+    _FUSION_KEEP_BOTH: "Keep both",
+    _FUSION_OMIT_BOTH: "Omit both",
+}
+_FUSION_UNASSIGNED_CRISPER_SPEAKER = "<unassigned CrisperWhisper speaker>"
+
+
+def _fusion_action_label(action, classification=None):
+    if action == _FUSION_INCLUDE_ENGINE_ONLY:
+        if classification == _COMPARISON_WHISPER_ONLY:
+            return "Include WhisperX passage"
+        if classification == _COMPARISON_CRISPER_ONLY:
+            return "Include CrisperWhisper passage"
+    return _FUSION_ACTION_LABELS.get(action, action)
+
+
+def _fusion_engine_label(engine):
+    if engine == "whisperx":
+        return "WhisperX"
+    if engine == "crisperwhisper":
+        return "CrisperWhisper"
+    return "Not selected"
+
+
+def _fusion_decision_label(region):
+    if region.automatically_resolved:
+        return "WhisperX canonical agreement"
+    decision = region.decision
+    if decision is None:
+        return "-"
+    if region.classification == _COMPARISON_TEXT_CONFLICT and decision.action not in {
+        _FUSION_KEEP_BOTH,
+        _FUSION_OMIT_BOTH,
+    }:
+        return (
+            f"Text: {_fusion_engine_label(decision.text_source_engine)} | "
+            f"Timing: {_fusion_engine_label(decision.timing_source_engine)}"
+        )
+    return _fusion_action_label(decision.action, region.classification)
+
+
+@dataclass(frozen=True)
+class _FusionSpeaker:
+    speaker_id: str
+    name: str
+    created_for_combined: bool = False
+
+
+@dataclass(frozen=True)
+class _FusionSpeakerMapping:
+    source_speaker_id: str
+    target_speaker_id: str
+    target_name: str
+    decision_source: str
+
+
+@dataclass(frozen=True)
+class _FusionRegionSpeakerDecision:
+    region_id: str
+    target_speaker_id: str
+    target_name: str
+    source_speaker_id: str
+    decision_source: str
+
+
+@dataclass(frozen=True)
+class _FusionDraftState:
+    plan: object
+    mappings: tuple[_FusionSpeakerMapping, ...]
+    combined_speakers: tuple[_FusionSpeaker, ...]
+    region_speakers: tuple[_FusionRegionSpeakerDecision, ...]
+
+
+@dataclass(frozen=True)
+class _FusionPreviewPresentation:
+    state: str
+    window_title: str
+    banner: str
+    clean_text: str
+    audit_text: str
+    preview: object
+    validation_error: str = ""
+
+
+class _FusionDraftSession:
+    """In-memory controller for one exact immutable comparison snapshot."""
+
+    def __init__(self, comparison):
+        self.comparison = comparison
+        plan = create_fusion_plan(comparison)
+        self.whisper_speakers = self._speaker_inventory(comparison.whisperx)
+        self.crisper_speakers = self._speaker_inventory(comparison.crisperwhisper)
+        automatic = self._automatic_mappings(
+            self.whisper_speakers,
+            self.crisper_speakers,
+        )
+        self._initial_state = _FusionDraftState(plan, automatic, (), ())
+        self._state = self._initial_state
+        self._undo = []
+
+    @staticmethod
+    def _speaker_inventory(snapshot):
+        inventory = {}
+        for word in snapshot.words:
+            speaker_id = str(word.speaker_id or "").strip()
+            if not speaker_id and snapshot.revision.engine == "crisperwhisper":
+                speaker_id = _FUSION_UNASSIGNED_CRISPER_SPEAKER
+            if not speaker_id:
+                continue
+            name = str(word.speaker_name or "").strip()
+            if speaker_id not in inventory or (not inventory[speaker_id] and name):
+                inventory[speaker_id] = name
+        return tuple(
+            _FusionSpeaker(speaker_id, name)
+            for speaker_id, name in inventory.items()
+        )
+
+    @staticmethod
+    def _automatic_mappings(whisper_speakers, crisper_speakers):
+        whisper_by_name = {}
+        crisper_by_name = {}
+        for speaker in whisper_speakers:
+            if speaker.name:
+                whisper_by_name.setdefault(speaker.name, []).append(speaker)
+        for speaker in crisper_speakers:
+            if speaker.name:
+                crisper_by_name.setdefault(speaker.name, []).append(speaker)
+        mappings = []
+        for name in sorted(set(whisper_by_name).intersection(crisper_by_name)):
+            whisper_matches = whisper_by_name[name]
+            crisper_matches = crisper_by_name[name]
+            if len(whisper_matches) != 1 or len(crisper_matches) != 1:
+                continue
+            mappings.append(
+                _FusionSpeakerMapping(
+                    crisper_matches[0].speaker_id,
+                    whisper_matches[0].speaker_id,
+                    whisper_matches[0].name,
+                    "automatic_unique_name",
+                )
+            )
+        return tuple(mappings)
+
+    @property
+    def plan(self):
+        return self._state.plan
+
+    @property
+    def mappings(self):
+        return self._state.mappings
+
+    @property
+    def combined_speakers(self):
+        return self._state.combined_speakers
+
+    @property
+    def region_speakers(self):
+        return self._state.region_speakers
+
+    @property
+    def has_changes(self):
+        return self._state != self._initial_state
+
+    @property
+    def can_undo(self):
+        return bool(self._undo)
+
+    @property
+    def final_ready(self):
+        return (
+            self.plan.ready_for_final_generation
+            and not self.unresolved_speaker_ids()
+        )
+
+    def _replace_state(self, state):
+        if state == self._state:
+            return False
+        self._undo.append(self._state)
+        self._state = state
+        return True
+
+    def region(self, region_id):
+        region = next(
+            (item for item in self.plan.regions if item.region_id == region_id),
+            None,
+        )
+        if region is None:
+            raise FusionDecisionError(f"Unknown fusion region: {region_id}")
+        return region
+
+    def comparison_region(self, region_id):
+        return next(
+            item for item in self.comparison.regions if item.region_id == region_id
+        )
+
+    def visible_regions(self, filter_name="Unresolved"):
+        normalized = str(filter_name or "Unresolved").strip().casefold()
+        if normalized == "all":
+            return self.plan.regions
+        if normalized == "unresolved":
+            return tuple(region for region in self.plan.regions if not region.resolved)
+        if normalized == "resolved":
+            return tuple(region for region in self.plan.regions if region.resolved)
+        if normalized == "warnings":
+            return tuple(region for region in self.plan.regions if region.warning)
+        classes = {
+            "engine-only": {_COMPARISON_WHISPER_ONLY, _COMPARISON_CRISPER_ONLY},
+            "text conflicts": {_COMPARISON_TEXT_CONFLICT},
+            "timing conflicts": {_COMPARISON_TIMING_CONFLICT},
+            "possible duplicates": {_COMPARISON_POSSIBLE_DUPLICATE},
+        }.get(normalized)
+        if classes is None:
+            raise ValueError(f"Unknown fusion filter: {filter_name}")
+        return tuple(
+            region for region in self.plan.regions if region.classification in classes
+        )
+
+    def valid_actions(self, region_id):
+        return valid_decision_actions(self.plan, region_id)
+
+    def supported_actions(self, region_id):
+        """Return every semantically valid action, independent of safety state."""
+
+        region = self.region(region_id)
+        if region.classification == _COMPARISON_AGREEMENT:
+            return ()
+        if region.classification == _COMPARISON_TIMING_CONFLICT:
+            return tuple(
+                action
+                for action, engine in (
+                    (_FUSION_USE_WHISPER_TIMING, "whisperx"),
+                    (_FUSION_USE_CRISPER_TIMING, "crisperwhisper"),
+                )
+                if self._candidate_for_engine(region, engine) is not None
+            )
+        if region.classification == _COMPARISON_TEXT_CONFLICT:
+            whisper = self._candidate_for_engine(region, "whisperx")
+            crisper = self._candidate_for_engine(region, "crisperwhisper")
+            actions = []
+            if whisper is not None:
+                actions.extend(
+                    (_FUSION_USE_WHISPER, _FUSION_USE_WHISPER_TIMING)
+                )
+            if crisper is not None:
+                actions.extend(
+                    (_FUSION_USE_CRISPER, _FUSION_USE_CRISPER_TIMING)
+                )
+            if whisper is not None and crisper is not None:
+                actions.append(_FUSION_KEEP_BOTH)
+            actions.append(_FUSION_OMIT_BOTH)
+            return tuple(actions)
+        if region.classification == _COMPARISON_WHISPER_ONLY:
+            return (_FUSION_INCLUDE_ENGINE_ONLY, _FUSION_OMIT_ENGINE_ONLY)
+        if region.classification == _COMPARISON_CRISPER_ONLY:
+            return (_FUSION_INCLUDE_ENGINE_ONLY, _FUSION_OMIT_ENGINE_ONLY)
+        whisper = self._candidate_for_engine(region, "whisperx")
+        crisper = self._candidate_for_engine(region, "crisperwhisper")
+        actions = []
+        if whisper is not None:
+            actions.append(_FUSION_USE_WHISPER)
+        if crisper is not None:
+            actions.append(_FUSION_USE_CRISPER)
+        if whisper is not None and crisper is not None:
+            actions.append(_FUSION_KEEP_BOTH)
+        actions.append(_FUSION_OMIT_BOTH)
+        return tuple(actions)
+
+    def action_states(self, region_id):
+        """Return supported actions with content-free safety results."""
+
+        states = []
+        for action in self.supported_actions(region_id):
+            try:
+                apply_fusion_decision(self.plan, region_id, action)
+            except (FusionDecisionError, FusionValidationError) as exc:
+                states.append((action, False, str(exc)))
+            else:
+                states.append((action, True, None))
+        return tuple(states)
+
+    def apply(self, region_id, action):
+        updated = apply_fusion_decision(self.plan, region_id, action)
+        return self._replace_state(replace(self._state, plan=updated))
+
+    def reset_selected(self, region_id):
+        region = self.region(region_id)
+        if region.automatically_resolved or region.decision is None:
+            return False
+        updated = reset_fusion_decision(self.plan, region_id)
+        return self._replace_state(replace(self._state, plan=updated))
+
+    def reset_all(self):
+        return self._replace_state(self._initial_state)
+
+    def undo(self):
+        if not self._undo:
+            return False
+        self._state = self._undo.pop()
+        return True
+
+    @staticmethod
+    def _candidate_for_engine(region, engine):
+        return next(
+            (item for item in region.candidates if item.source_engine == engine),
+            None,
+        )
+
+    def resolve_whisperx_baseline(self):
+        pending_actions = []
+        working = self.plan
+        for region in working.regions:
+            if region.resolved:
+                continue
+            if region.classification == _COMPARISON_TIMING_CONFLICT:
+                preferred = _FUSION_USE_WHISPER_TIMING
+            elif region.classification == _COMPARISON_TEXT_CONFLICT:
+                preferred = _FUSION_USE_WHISPER
+            elif region.classification == _COMPARISON_WHISPER_ONLY:
+                preferred = _FUSION_INCLUDE_ENGINE_ONLY
+            elif region.classification == _COMPARISON_CRISPER_ONLY:
+                preferred = _FUSION_OMIT_ENGINE_ONLY
+            else:
+                preferred = (
+                    _FUSION_USE_WHISPER
+                    if self._candidate_for_engine(region, "whisperx") is not None
+                    else _FUSION_OMIT_BOTH
+                )
+            try:
+                updated = apply_fusion_decision(working, region.region_id, preferred)
+            except FusionValidationError:
+                fallback = (
+                    _FUSION_OMIT_ENGINE_ONLY
+                    if region.classification
+                    in {_COMPARISON_WHISPER_ONLY, _COMPARISON_CRISPER_ONLY}
+                    else _FUSION_OMIT_BOTH
+                )
+                if region.classification == _COMPARISON_TIMING_CONFLICT:
+                    raise
+                if preferred != fallback:
+                    updated = apply_fusion_decision(
+                        working,
+                        region.region_id,
+                        fallback,
+                    )
+                    preferred = fallback
+                else:
+                    raise
+            pending_actions.append((working, updated, region.region_id, preferred))
+            working = updated
+        if not pending_actions:
+            return ()
+        for prior, _updated, _region_id, _action in pending_actions:
+            self._undo.append(replace(self._state, plan=prior))
+        self._state = replace(self._state, plan=working)
+        return tuple((region_id, action) for _, _, region_id, action in pending_actions)
+
+    def all_canonical_speakers(self):
+        return self.whisper_speakers + self.combined_speakers
+
+    def mapping_for(self, source_speaker_id):
+        return next(
+            (
+                mapping
+                for mapping in self.mappings
+                if mapping.source_speaker_id == source_speaker_id
+            ),
+            None,
+        )
+
+    def region_speaker_for(self, region_id):
+        return next(
+            (item for item in self.region_speakers if item.region_id == region_id),
+            None,
+        )
+
+    def map_to_existing(self, source_speaker_id, target_speaker_id):
+        target = next(
+            (
+                speaker
+                for speaker in self.all_canonical_speakers()
+                if speaker.speaker_id == target_speaker_id
+            ),
+            None,
+        )
+        if target is None:
+            raise FusionValidationError("Choose an existing Combined speaker target.")
+        return self._set_mapping(
+            _FusionSpeakerMapping(
+                source_speaker_id,
+                target.speaker_id,
+                target.name,
+                "explicit_user_mapping",
+            )
+        )
+
+    def set_region_speaker(self, region_id, source_speaker_id, target_speaker_id):
+        self.region(region_id)
+        if not any(
+            speaker.speaker_id == source_speaker_id
+            for speaker in self.crisper_speakers
+        ):
+            raise FusionValidationError("The CrisperWhisper speaker is unavailable.")
+        target = next(
+            (
+                speaker
+                for speaker in self.all_canonical_speakers()
+                if speaker.speaker_id == target_speaker_id
+            ),
+            None,
+        )
+        if target is None:
+            raise FusionValidationError("Choose an existing Combined speaker target.")
+        decision = _FusionRegionSpeakerDecision(
+            region_id,
+            target.speaker_id,
+            target.name,
+            source_speaker_id,
+            "explicit_region_speaker",
+        )
+        decisions = tuple(
+            item for item in self.region_speakers if item.region_id != region_id
+        ) + (decision,)
+        return self._replace_state(replace(self._state, region_speakers=decisions))
+
+    def create_and_map_speaker(self, source_speaker_id, name, *, explicit_unnamed=False):
+        normalized_name = str(name or "").strip()
+        if not normalized_name and not explicit_unnamed:
+            raise FusionValidationError(
+                "Enter a speaker name or explicitly choose an unnamed speaker."
+            )
+        used = {speaker.speaker_id for speaker in self.all_canonical_speakers()}
+        number = 0
+        while f"SPEAKER_{number:02d}" in used:
+            number += 1
+        speaker = _FusionSpeaker(
+            f"SPEAKER_{number:02d}",
+            normalized_name,
+            True,
+        )
+        mapping = _FusionSpeakerMapping(
+            source_speaker_id,
+            speaker.speaker_id,
+            speaker.name,
+            "explicit_new_combined_speaker",
+        )
+        mappings = tuple(
+            item for item in self.mappings if item.source_speaker_id != source_speaker_id
+        ) + (mapping,)
+        state = replace(
+            self._state,
+            mappings=mappings,
+            combined_speakers=self.combined_speakers + (speaker,),
+        )
+        self._replace_state(state)
+        return speaker
+
+    def _set_mapping(self, mapping):
+        if not any(
+            speaker.speaker_id == mapping.source_speaker_id
+            for speaker in self.crisper_speakers
+        ):
+            raise FusionValidationError("The CrisperWhisper speaker is unavailable.")
+        mappings = tuple(
+            item
+            for item in self.mappings
+            if item.source_speaker_id != mapping.source_speaker_id
+        ) + (mapping,)
+        return self._replace_state(replace(self._state, mappings=mappings))
+
+    def _selected_candidates(self, region):
+        if not region.resolved:
+            return ()
+        preview = build_combined_preview(self.plan, provisional=True)
+        return tuple(
+            candidate
+            for candidate in preview.candidates
+            if candidate.region_id == region.region_id
+        )
+
+    def required_crisper_speaker_ids(self):
+        required = []
+        seen = set()
+        for region in self.plan.regions:
+            for candidate in self._selected_candidates(region):
+                for word in candidate.words:
+                    if word.speaker_source_engine != "crisperwhisper":
+                        continue
+                    speaker_id = str(word.speaker_id or "").strip()
+                    if not speaker_id:
+                        speaker_id = _FUSION_UNASSIGNED_CRISPER_SPEAKER
+                    if speaker_id and speaker_id not in seen:
+                        seen.add(speaker_id)
+                        required.append(speaker_id)
+        return tuple(required)
+
+    def unresolved_speaker_ids(self):
+        return tuple(
+            speaker_id
+            for speaker_id in self.required_crisper_speaker_ids()
+            if self.mapping_for(speaker_id) is None
+        )
+
+    def _mapped_preview(self, preview):
+        region_decisions = {
+            item.region_id: item for item in self.region_speakers
+        }
+        mapped_candidates = []
+        for candidate in preview.candidates:
+            mapped_words = []
+            for word in candidate.words:
+                updated_word = word
+                if word.speaker_source_engine == "crisperwhisper":
+                    source_speaker_id = str(word.speaker_id or "").strip()
+                    if not source_speaker_id:
+                        source_speaker_id = _FUSION_UNASSIGNED_CRISPER_SPEAKER
+                    mapping = self.mapping_for(source_speaker_id)
+                    if mapping is not None:
+                        updated_word = replace(
+                            updated_word,
+                            speaker_id=mapping.target_speaker_id,
+                            speaker_name=mapping.target_name or None,
+                            speaker_source_engine="crisperwhisper",
+                            speaker_decision_source=mapping.decision_source,
+                        )
+                region_speaker = region_decisions.get(candidate.region_id)
+                if region_speaker is not None:
+                    updated_word = replace(
+                        updated_word,
+                        speaker_id=region_speaker.target_speaker_id,
+                        speaker_name=region_speaker.target_name or None,
+                        speaker_source_engine=(
+                            "crisperwhisper"
+                            if region_speaker.source_speaker_id
+                            else updated_word.speaker_source_engine
+                        ),
+                        speaker_decision_source=region_speaker.decision_source,
+                    )
+                mapped_words.append(updated_word)
+            mapped_candidates.append(replace(candidate, words=tuple(mapped_words)))
+        mapped_candidates = tuple(mapped_candidates)
+        return replace(
+            preview,
+            candidates=mapped_candidates,
+            words=tuple(word for item in mapped_candidates for word in item.words),
+        )
+
+    def preview(self, *, provisional=False):
+        if not provisional and self.unresolved_speaker_ids():
+            raise FusionValidationError(
+                "Every included CrisperWhisper speaker requires an explicit or verified mapping."
+            )
+        return self._mapped_preview(
+            build_combined_preview(self.plan, provisional=provisional)
+        )
+
+    @staticmethod
+    def _preview_speaker_label(candidate):
+        speaker = next(
+            (word for word in candidate.words if word.speaker_id),
+            None,
+        )
+        if speaker is None:
+            return ""
+        label = speaker.speaker_id
+        if speaker.speaker_name:
+            label += f" ({speaker.speaker_name})"
+        return label + ": "
+
+    def clean_preview_text(self, preview):
+        return "\n\n".join(
+            self._preview_speaker_label(candidate) + candidate.text
+            for candidate in preview.candidates
+            if candidate.text
+        ).strip()
+
+    @staticmethod
+    def _preview_time_range(candidate):
+        if candidate.start is None or candidate.end is None:
+            return "Untimed"
+        return f"{float(candidate.start):.3f}s-{float(candidate.end):.3f}s"
+
+    def audit_preview_text(self, preview):
+        candidate_by_region = {}
+        for candidate in preview.candidates:
+            candidate_by_region.setdefault(candidate.region_id, []).append(candidate)
+        lines = []
+        for region in self.plan.regions:
+            candidates = candidate_by_region.get(region.region_id, ())
+            if not region.resolved:
+                lines.append(
+                    f"[UNRESOLVED: {region.classification} - provisional WhisperX baseline]"
+                )
+            elif region.automatically_resolved:
+                lines.append("[AUTOMATIC AGREEMENT]")
+            else:
+                lines.append(
+                    f"[EXPLICIT: {_fusion_decision_label(region)}]"
+                )
+            if not candidates:
+                lines.append("[NO PASSAGE SELECTED]")
+            for candidate in candidates:
+                lines.append(self._preview_speaker_label(candidate) + candidate.text)
+                first_word = candidate.words[0] if candidate.words else None
+                text_source = candidate.text_source_engine or (
+                    first_word.text_source_engine if first_word else None
+                )
+                timing_source = candidate.timing_source_engine or (
+                    first_word.timing_source_engine if first_word else None
+                )
+                speaker_source = candidate.speaker_source_engine or (
+                    first_word.speaker_source_engine if first_word else None
+                )
+                timing_derived = candidate.timing_is_derived or bool(
+                    first_word and first_word.timing_is_derived
+                )
+                transformation = candidate.timing_transformation or (
+                    first_word.timing_transformation if first_word else None
+                )
+                lines.extend(
+                    (
+                        f"Text: {_fusion_engine_label(text_source)}",
+                        f"Timing: {_fusion_engine_label(timing_source)}",
+                        f"Speaker: {_fusion_engine_label(speaker_source)}",
+                        (
+                            "Timing status: Derived"
+                            + (
+                                f" ({transformation})"
+                                if transformation
+                                else ""
+                            )
+                            if timing_derived
+                            else "Timing status: Native"
+                        ),
+                        f"Selected timeline: {self._preview_time_range(candidate)}",
+                    )
+                )
+                provenance_groups = {}
+                for word in candidate.words:
+                    for item in word.provenance:
+                        key = (
+                            item.source_engine,
+                            item.revision_id,
+                            item.speakers_sha256,
+                            item.segments_sha256,
+                        )
+                        references = provenance_groups.setdefault(key, set())
+                        references.add(
+                            (
+                                item.segment_index,
+                                item.word_index,
+                                item.ordinal,
+                                item.source_roles,
+                            )
+                        )
+                for (
+                    source_engine,
+                    revision_id,
+                    speakers_sha256,
+                    segments_sha256,
+                ), references in provenance_groups.items():
+                    reference_text = ", ".join(
+                        "segment "
+                        f"{segment_index} / word "
+                        f"{word_index if word_index is not None else '-'} / ordinal "
+                        f"{ordinal} / roles {','.join(roles) or '-'}"
+                        for segment_index, word_index, ordinal, roles in sorted(
+                            references,
+                            key=lambda value: (
+                                value[0],
+                                -1 if value[1] is None else value[1],
+                                value[2],
+                                value[3],
+                            ),
+                        )
+                    )
+                    lines.append(
+                        f"Provenance: {_fusion_engine_label(source_engine)} | "
+                        f"revision {revision_id} | speakers SHA-256 {speakers_sha256} | "
+                        f"segments SHA-256 {segments_sha256} | {reference_text}"
+                    )
+            lines.append("")
+        missing_speakers = self.unresolved_speaker_ids()
+        if missing_speakers:
+            lines.insert(
+                0,
+                "[SPEAKER MAPPING REQUIRED: "
+                + ", ".join(missing_speakers)
+                + "]\n",
+            )
+        if self.plan.warnings:
+            lines.insert(0, "[WARNINGS: " + " | ".join(self.plan.warnings) + "]\n")
+        return "\n".join(lines).strip()
+
+    def preview_text(self, *, provisional=True):
+        preview = self.preview(provisional=provisional)
+        return self.audit_preview_text(preview)
+
+    def preview_presentation(self):
+        validation_error = ""
+        if self.final_ready:
+            try:
+                preview = self.validate_final()
+            except (FusionNotReadyError, FusionValidationError) as exc:
+                validation_error = str(exc)
+            else:
+                return _FusionPreviewPresentation(
+                    state="final_ready",
+                    window_title="Final-ready Combined Draft Preview",
+                    banner="Final-ready. This Combined Draft has not been saved yet.",
+                    clean_text=self.clean_preview_text(preview),
+                    audit_text=self.audit_preview_text(preview),
+                    preview=preview,
+                )
+        if not validation_error:
+            if self.plan.ready_for_final_generation:
+                missing = self.unresolved_speaker_ids()
+                validation_error = (
+                    "Speaker mapping is still required for: " + ", ".join(missing)
+                    if missing
+                    else "Final validation has not passed."
+                )
+            else:
+                validation_error = "The Combined Draft still has unresolved regions."
+        preview = self.preview(provisional=True)
+        unresolved = bool(preview.unresolved_region_ids)
+        banner = (
+            "Provisional only. Unresolved regions are marked and this draft is not ready to save."
+            if unresolved
+            else "Provisional only. Final validation has not passed and this draft is not ready to save."
+        )
+        return _FusionPreviewPresentation(
+            state="provisional",
+            window_title="Provisional Combined Draft Preview",
+            banner=banner,
+            clean_text=self.clean_preview_text(preview),
+            audit_text=self.audit_preview_text(preview),
+            preview=preview,
+            validation_error=validation_error,
+        )
+
+    def validate_final(self):
+        if not self.final_ready:
+            missing = self.unresolved_speaker_ids()
+            if missing:
+                raise FusionValidationError(
+                    "Speaker mapping is still required for: " + ", ".join(missing)
+                )
+            raise FusionNotReadyError("The Combined Draft still has unresolved regions.")
+        return self.preview(provisional=False)
+
+
+class _FusionPreviewDialog(tk.Toplevel):
+    """Read-only clean and audit views of one immutable in-memory draft."""
+
+    def __init__(self, parent, presentation, *, error=None):
+        super().__init__(parent)
+        style_midnightstudio_toplevel(self)
+        self.presentation = presentation
+        self.title(presentation.window_title)
+        self.geometry("960x680")
+        self.minsize(700, 440)
+        self.resizable(True, True)
+        self.transient(parent)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        ttk.Label(
+            self,
+            text=(
+                f"Preview unavailable: {error}"
+                if error
+                else presentation.banner
+            ),
+            style=(
+                MIDNIGHTSTUDIO_STYLES["dialog_warning"]
+                if error or presentation.state == "provisional"
+                else MIDNIGHTSTUDIO_STYLES["secondary"]
+            ),
+            wraplength=900,
+            justify="left",
+        ).grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 8))
+
+        body = ttk.Frame(self, padding=(12, 0, 12, 8))
+        body.grid(row=1, column=0, sticky="nsew")
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
+        self.notebook = ttk.Notebook(
+            body,
+            style=MIDNIGHTSTUDIO_STYLES["notebook"],
+        )
+        self.notebook.grid(row=0, column=0, sticky="nsew")
+        clean_page = ttk.Frame(
+            self.notebook,
+            padding=8,
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
+        audit_page = ttk.Frame(
+            self.notebook,
+            padding=8,
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
+        self.notebook.add(clean_page, text="Clean Transcript")
+        self.notebook.add(audit_page, text="Decision & Provenance Details")
+
+        def add_readonly_view(page, value):
+            page.columnconfigure(0, weight=1)
+            page.rowconfigure(0, weight=1)
+            widget = tk.Text(page, wrap="word", width=90, height=24)
+            style_midnightstudio_text(widget, readonly=True)
+            scroll = ttk.Scrollbar(
+                page,
+                orient="vertical",
+                command=widget.yview,
+                style=MIDNIGHTSTUDIO_STYLES["review_scrollbar"],
+            )
+            widget.configure(yscrollcommand=scroll.set, state="normal")
+            widget.insert("1.0", value)
+            widget.configure(state="disabled")
+            widget.grid(row=0, column=0, sticky="nsew")
+            scroll.grid(row=0, column=1, sticky="ns")
+            return widget
+
+        self.clean_text = add_readonly_view(clean_page, presentation.clean_text)
+        self.audit_text = add_readonly_view(audit_page, presentation.audit_text)
+        self.text = self.clean_text
+        self.notebook.select(clean_page)
+
+        tb.Button(
+            self,
+            text="Close Preview",
+            command=self._close,
+            bootstyle="secondary-outline",
+        ).grid(row=2, column=0, sticky="e", padx=12, pady=(0, 12))
+        self.bind("<Escape>", self._close)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.grab_set()
+        self.after_idle(self.clean_text.focus_set)
+
+    def _close(self, _event=None):
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        self.destroy()
+        return "break"
+
+
+class _FusionDraftWorkspace(ttk.Frame):
+    """In-page, write-free editor for one in-memory Combined Draft plan."""
+
+    def __init__(
+        self,
+        parent,
+        comparison,
+        *,
+        preview_callback=None,
+        preview_available=False,
+        preview_unavailable_reason=None,
+        report_callback=None,
+        back_to_compare_callback=None,
+        back_to_review_callback=None,
+    ):
+        super().__init__(parent, style=MIDNIGHTSTUDIO_STYLES["page"])
+        self._preview_callback = preview_callback
+        self._preview_available = bool(preview_available)
+        self._preview_unavailable_reason = preview_unavailable_reason
+        self._report_callback = report_callback
+        self._back_to_compare_callback = back_to_compare_callback
+        self._back_to_review_callback = back_to_review_callback
+        self.session = _FusionDraftSession(comparison)
+        self._comparison_regions = {
+            region.region_id: region for region in comparison.regions
+        }
+        self._row_regions = {}
+        self._action_buttons = []
+
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        main = ttk.Frame(self, padding=(4, 0), style=MIDNIGHTSTUDIO_STYLES["page"])
+        main.grid(row=0, column=0, sticky="nsew")
+        main.columnconfigure(0, weight=1)
+        main.rowconfigure(2, weight=1)
+
+        identities = ttk.LabelFrame(
+            main,
+            text="Exact source revisions",
+            padding=(8, 4),
+        )
+        identities.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        identities.columnconfigure(0, weight=1)
+        identities.columnconfigure(1, weight=1)
+        whisper = comparison.whisperx.revision
+        crisper = comparison.crisperwhisper.revision
+        ttk.Label(
+            identities,
+            text=self._revision_text(whisper, include_mode=False),
+            justify="left",
+        ).grid(row=0, column=0, sticky="nw", padx=(0, 12))
+        crisper_text = self._revision_text(crisper, include_mode=True)
+        if crisper.coverage is not None and not crisper.coverage.coverage_complete:
+            crisper_text += (
+                "\nCoverage warning: "
+                f"{crisper.coverage.remaining_speech_active_gap_count} range(s), "
+                f"{crisper.coverage.remaining_speech_active_gap_duration:.2f}s"
+            )
+        self.lbl_crisper_revision = ttk.Label(
+            identities,
+            text=crisper_text,
+            justify="left",
+            style=(
+                MIDNIGHTSTUDIO_STYLES["dialog_warning"]
+                if crisper.status != "complete"
+                else MIDNIGHTSTUDIO_STYLES["card_label"]
+            ),
+        )
+        self.lbl_crisper_revision.grid(row=0, column=1, sticky="new")
+        self.lbl_pair_identity = ttk.Label(
+            identities,
+            text=(
+                f"Project: {self.session.plan.pair_identity.project_id or 'Legacy result pair'} | "
+                f"Exact pair SHA-256: {self.session.plan.pair_identity.comparison_pair_id}"
+            ),
+            style=MIDNIGHTSTUDIO_STYLES["card_secondary"],
+            wraplength=1280,
+            justify="left",
+        )
+        self.lbl_pair_identity.grid(
+            row=1, column=0, columnspan=2, sticky="ew", pady=(7, 0)
+        )
+        apply_midnightstudio_card_style(identities)
+        self.lbl_pair_identity.configure(
+            style=MIDNIGHTSTUDIO_STYLES["card_secondary"]
+        )
+        if crisper.status != "complete":
+            self.lbl_crisper_revision.configure(
+                style=MIDNIGHTSTUDIO_STYLES["dialog_warning"]
+            )
+
+        self.main_paned = tk.PanedWindow(
+            main,
+            orient="vertical",
+            sashwidth=9,
+            sashrelief="flat",
+            bd=0,
+        )
+        style_midnightstudio_native_panedwindow(self.main_paned)
+        self.main_paned.grid(row=1, column=0, sticky="nsew", pady=(0, 6))
+
+        upper_area = ttk.Frame(
+            self.main_paned,
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
+        upper_area.columnconfigure(0, weight=1)
+        upper_area.rowconfigure(0, weight=1)
+        self.main_paned.add(upper_area, minsize=235, stretch="always")
+        table_card = ttk.LabelFrame(
+            upper_area,
+            text="Fusion regions",
+            padding=(8, 4),
+        )
+        table_card.grid(row=0, column=0, sticky="nsew")
+        table_card.columnconfigure(0, weight=1)
+        table_card.rowconfigure(1, weight=1)
+        filters = ttk.Frame(table_card)
+        filters.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        ttk.Label(filters, text="Show").pack(side="left", padx=(0, 6))
+        self.var_filter = tk.StringVar(value="Unresolved")
+        ttk.Combobox(
+            filters,
+            textvariable=self.var_filter,
+            values=_FUSION_FILTERS,
+            state="readonly",
+            width=21,
+        ).pack(side="left")
+        self.lbl_region_count = ttk.Label(
+            filters,
+            text="",
+            style=MIDNIGHTSTUDIO_STYLES["card_secondary"],
+        )
+        self.lbl_region_count.pack(side="left", padx=(12, 0))
+        self.lbl_counts = ttk.Label(
+            filters,
+            text="",
+            style=MIDNIGHTSTUDIO_STYLES["secondary"],
+        )
+        self.lbl_counts.pack(side="left", padx=(12, 0))
+        self.lbl_final = ttk.Label(
+            filters,
+            text="",
+            style=MIDNIGHTSTUDIO_STYLES["secondary"],
+        )
+        self.lbl_final.pack(side="right", padx=(12, 0))
+
+        self.tree = ttk.Treeview(
+            table_card,
+            columns=(
+                "resolution",
+                "classification",
+                "whisper_time",
+                "crisper_time",
+                "whisper",
+                "crisper",
+                "decision",
+            ),
+            show="headings",
+            selectmode="browse",
+            style=MIDNIGHTSTUDIO_STYLES["fusion_tree"],
+            height=10,
+        )
+        for column, heading, width, stretch in (
+            ("resolution", "Resolution", 80, False),
+            ("classification", "Classification", 110, False),
+            ("whisper_time", "WhisperX time", 100, False),
+            ("crisper_time", "CrisperWhisper time", 100, False),
+            ("whisper", "WhisperX text", 140, True),
+            ("crisper", "CrisperWhisper text", 140, True),
+            ("decision", "Decision", 120, False),
+        ):
+            self.tree.heading(column, text=heading)
+            self.tree.column(
+                column,
+                width=width,
+                minwidth=70,
+                anchor="w",
+                stretch=stretch,
+            )
+        self.tree.grid(row=1, column=0, sticky="nsew")
+        tree_scroll = ttk.Scrollbar(
+            table_card,
+            orient="vertical",
+            command=self.tree.yview,
+            style=MIDNIGHTSTUDIO_STYLES["review_scrollbar"],
+        )
+        tree_scroll.grid(row=1, column=1, sticky="ns")
+        tree_hscroll = ttk.Scrollbar(
+            table_card,
+            orient="horizontal",
+            command=self.tree.xview,
+            style=MIDNIGHTSTUDIO_STYLES["dialog_hscrollbar"],
+        )
+        tree_hscroll.grid(row=2, column=0, sticky="ew")
+        self.tree.configure(
+            yscrollcommand=tree_scroll.set,
+            xscrollcommand=tree_hscroll.set,
+        )
+        apply_midnightstudio_card_style(table_card)
+
+        review_pane = ttk.Frame(
+            self.main_paned,
+            style=MIDNIGHTSTUDIO_STYLES["page"],
+        )
+        review_pane.columnconfigure(0, weight=3)
+        review_pane.columnconfigure(1, weight=2)
+        review_pane.rowconfigure(0, weight=1)
+        self.main_paned.add(review_pane, minsize=185, stretch="always")
+
+        detail = ttk.LabelFrame(review_pane, text="Selected region", padding=8)
+        detail.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        detail.columnconfigure(0, weight=1)
+        detail.columnconfigure(1, weight=1)
+        detail.rowconfigure(2, weight=1)
+        self.lbl_detail = ttk.Label(
+            detail,
+            text="Select a fusion region.",
+            style=MIDNIGHTSTUDIO_STYLES["card_secondary"],
+            justify="left",
+            wraplength=1280,
+        )
+        self.lbl_detail.grid(row=0, column=0, columnspan=2, sticky="ew")
+        preview_bar = ttk.Frame(detail)
+        preview_bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 6))
+        preview_bar.columnconfigure(0, weight=1)
+        self.lbl_preview_status = ttk.Label(
+            preview_bar,
+            text=(
+                ""
+                if self._preview_available
+                else preview_unavailable_reason or "Media preview is unavailable."
+            ),
+            style=MIDNIGHTSTUDIO_STYLES["card_secondary"],
+        )
+        self.lbl_preview_status.grid(row=0, column=0, sticky="w")
+        self.btn_preview_whisper = tb.Button(
+            preview_bar,
+            text="Preview WhisperX time",
+            command=lambda: self._preview_engine("whisperx"),
+            bootstyle="primary-outline",
+        )
+        self.btn_preview_whisper.grid(row=0, column=1, padx=(8, 0))
+        self.btn_preview_crisper = tb.Button(
+            preview_bar,
+            text="Preview CrisperWhisper time",
+            command=lambda: self._preview_engine("crisperwhisper"),
+            bootstyle="primary-outline",
+        )
+        self.btn_preview_crisper.grid(row=0, column=2, padx=(8, 0))
+        whisper_card = ttk.LabelFrame(detail, text="WhisperX original", padding=5)
+        crisper_card = ttk.LabelFrame(detail, text="CrisperWhisper original", padding=5)
+        whisper_card.grid(row=2, column=0, sticky="nsew", padx=(0, 4))
+        crisper_card.grid(row=2, column=1, sticky="nsew", padx=(4, 0))
+        self.txt_whisper = _ResultComparisonWorkspace._detail_text(whisper_card)
+        self.txt_crisper = _ResultComparisonWorkspace._detail_text(crisper_card)
+        apply_midnightstudio_card_style(whisper_card)
+        apply_midnightstudio_card_style(crisper_card)
+        apply_midnightstudio_card_style(detail)
+
+        controls = ttk.LabelFrame(
+            review_pane,
+            text="Decision and speaker mapping",
+            padding=8,
+        )
+        controls.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+        controls.columnconfigure(1, weight=1)
+        self.action_frame = ttk.Frame(controls)
+        self.action_frame.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self.action_frame.columnconfigure(0, weight=1)
+        self.action_frame.columnconfigure(1, weight=1)
+        self.lbl_action_reason = ttk.Label(
+            controls,
+            text="",
+            style=MIDNIGHTSTUDIO_STYLES["card_secondary"],
+            wraplength=1240,
+            justify="left",
+        )
+        self.lbl_action_reason.grid(
+            row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0)
+        )
+        ttk.Label(controls, text="CrisperWhisper speaker").grid(
+            row=2, column=0, sticky="w", pady=(8, 0), padx=(0, 6)
+        )
+        self.var_source_speaker = tk.StringVar()
+        self.cmb_source_speaker = ttk.Combobox(
+            controls,
+            textvariable=self.var_source_speaker,
+            state="readonly",
+            width=24,
+        )
+        self.cmb_source_speaker.grid(row=2, column=1, sticky="ew", pady=(8, 0))
+        ttk.Label(controls, text="Target").grid(row=3, column=0, sticky="w", pady=(6, 0), padx=(0, 6))
+        self.var_target_speaker = tk.StringVar()
+        self.cmb_target_speaker = ttk.Combobox(
+            controls,
+            textvariable=self.var_target_speaker,
+            state="readonly",
+            width=30,
+        )
+        self.cmb_target_speaker.grid(row=3, column=1, sticky="ew", pady=(6, 0))
+        ttk.Label(controls, text="New name").grid(row=4, column=0, sticky="w", pady=(6, 0), padx=(0, 6))
+        self.var_new_speaker_name = tk.StringVar()
+        ttk.Entry(
+            controls,
+            textvariable=self.var_new_speaker_name,
+            width=22,
+        ).grid(row=4, column=1, sticky="ew", pady=(6, 0))
+        self.var_explicit_unnamed = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            controls,
+            text="Explicitly unnamed",
+            variable=self.var_explicit_unnamed,
+        ).grid(row=5, column=1, sticky="w", pady=(5, 0))
+        self.lbl_mapping = ttk.Label(
+            controls,
+            text="",
+            style=MIDNIGHTSTUDIO_STYLES["card_secondary"],
+        )
+        self.lbl_mapping.configure(wraplength=430, justify="left")
+        self.lbl_mapping.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(5, 0))
+        tb.Button(
+            controls,
+            text="Apply speaker mapping",
+            command=self._apply_speaker_mapping,
+            bootstyle="primary-outline",
+        ).grid(row=7, column=0, columnspan=2, sticky="e", pady=(5, 0))
+        apply_midnightstudio_card_style(controls)
+
+        bottom = ttk.Frame(main, style=MIDNIGHTSTUDIO_STYLES["page"])
+        bottom.grid(row=2, column=0, sticky="ew")
+        bottom.columnconfigure(1, weight=1)
+        self.btn_undo = tb.Button(
+            bottom,
+            text="Undo Last Decision",
+            command=self._undo,
+            bootstyle="secondary-outline",
+        )
+        self.btn_undo.grid(row=0, column=0, sticky="w")
+        tb.Button(
+            bottom,
+            text="Reset Selected",
+            command=self._reset_selected,
+            bootstyle="secondary-outline",
+        ).grid(row=0, column=1, sticky="w", padx=(8, 0))
+        tb.Button(
+            bottom,
+            text="Reset All Decisions",
+            command=self._reset_all,
+            bootstyle="danger-outline",
+        ).grid(row=0, column=2, padx=(8, 0))
+        tb.Button(
+            bottom,
+            text="Resolve Remaining with WhisperX Baseline...",
+            command=self._resolve_baseline,
+            bootstyle="warning-outline",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.btn_provisional = tb.Button(
+            bottom,
+            text="Preview Combined Draft",
+            command=self._render_preview,
+            bootstyle="primary-outline",
+        )
+        self.btn_provisional.grid(row=1, column=2, padx=(8, 0), pady=(6, 0))
+        self.btn_validate = tb.Button(
+            bottom,
+            text="Validate Final Draft",
+            command=self._validate_final,
+            bootstyle="success",
+        )
+        self.btn_validate.grid(row=1, column=3, padx=(8, 0), pady=(6, 0))
+
+        self.var_filter.trace_add("write", self._filter_changed)
+        self.cmb_source_speaker.bind(
+            "<<ComboboxSelected>>",
+            lambda _event: self._refresh_mapping_controls(self._current_region()),
+            add="+",
+        )
+        self.tree.bind("<<TreeviewSelect>>", self._selection_changed, add="+")
+        self.tree.bind("<ButtonRelease-1>", self._select_clicked_row, add="+")
+        self.bind("<Escape>", self._close)
+        reinforce_midnightstudio_control_states(tb.Style.get_instance() or tb.Style())
+        self._refresh_all()
+        self.after_idle(self._set_initial_pane_position)
+        self.after_idle(self.tree.focus_set)
+
+    @staticmethod
+    def _date_text(revision):
+        value = revision.created_at or revision.modified_at
+        return value.astimezone().strftime("%b %d, %Y %I:%M %p") if value else "Unknown"
+
+    @classmethod
+    def _revision_text(cls, revision, *, include_mode):
+        engine = "WhisperX" if revision.engine == "whisperx" else "CrisperWhisper"
+        fields = [
+            engine,
+            revision.model or "Model unknown",
+        ]
+        if include_mode:
+            fields.append((revision.mode or "Mode unknown").title())
+        fields.extend(
+            (
+                revision.status.title(),
+                cls._date_text(revision),
+                f"Revision {revision.result_id}",
+            )
+        )
+        return " | ".join(fields)
+
+    def _set_initial_pane_position(self):
+        try:
+            height = self.main_paned.winfo_height()
+            if height > 1 and len(self.main_paned.panes()) == 2:
+                self.main_paned.sash_place(0, 0, max(300, int(height * 0.60)))
+        except (AttributeError, tk.TclError):
+            pass
+
+    def _report(self, message):
+        if self._report_callback is not None:
+            self._report_callback(message)
+
+    def _current_region(self):
+        selection = self.tree.selection()
+        return self._row_regions.get(selection[0]) if selection else None
+
+    @staticmethod
+    def _resolution_text(region):
+        if region.automatically_resolved:
+            return "Automatic"
+        if region.decision is not None:
+            return "Explicit"
+        return "Unresolved"
+
+    @staticmethod
+    def _decision_text(region):
+        return _fusion_decision_label(region)
+
+    def _refresh_all(self, *, selected_region_id=None):
+        self._render_regions(selected_region_id=selected_region_id)
+        summary = self.session.plan.summary
+        self.lbl_counts.configure(
+            text=(
+                f"Automatic: {summary.automatically_resolved_region_count} | "
+                f"Explicit: {summary.explicitly_resolved_region_count} | "
+                f"Unresolved: {summary.unresolved_region_count} | "
+                f"Warnings: {summary.warning_region_count}"
+            )
+        )
+        missing = self.session.unresolved_speaker_ids()
+        final_text = "Final-ready" if self.session.final_ready else "Not final-ready"
+        if missing:
+            final_text += f" | Speaker mappings needed: {len(missing)}"
+        self.lbl_final.configure(text=final_text)
+        self.btn_validate.configure(
+            state="normal" if self.session.final_ready else "disabled"
+        )
+        self.btn_provisional.configure(state="normal")
+        self.btn_undo.configure(state="normal" if self.session.can_undo else "disabled")
+
+    def _render_regions(self, *, selected_region_id=None):
+        current = self._current_region()
+        desired_id = selected_region_id or (current.region_id if current else None)
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self._row_regions = {}
+        visible = self.session.visible_regions(self.var_filter.get())
+        chosen_item = None
+        for index, region in enumerate(visible):
+            comparison_region = self._comparison_regions[region.region_id]
+            item = f"fusion-{index}"
+            self.tree.insert(
+                "",
+                "end",
+                iid=item,
+                values=(
+                    self._resolution_text(region),
+                    region.classification,
+                    _ResultComparisonWorkspace._format_time_range(
+                        comparison_region.whisperx_start,
+                        comparison_region.whisperx_end,
+                    ),
+                    _ResultComparisonWorkspace._format_time_range(
+                        comparison_region.crisperwhisper_start,
+                        comparison_region.crisperwhisper_end,
+                    ),
+                    _ResultComparisonWorkspace._short_text(comparison_region.whisperx_text),
+                    _ResultComparisonWorkspace._short_text(comparison_region.crisperwhisper_text),
+                    self._decision_text(region),
+                ),
+            )
+            self._row_regions[item] = region
+            if region.region_id == desired_id:
+                chosen_item = item
+        children = self.tree.get_children()
+        if chosen_item is None and children:
+            chosen_item = children[0]
+        if chosen_item:
+            self.tree.selection_set(chosen_item)
+            self.tree.focus(chosen_item)
+            self.tree.see(chosen_item)
+        self.lbl_region_count.configure(text=f"{len(visible)} region(s)")
+        self._selection_changed()
+
+    def _filter_changed(self, *_args):
+        self._render_regions()
+
+    def _selected_crisper_speakers(self, region):
+        if region is None:
+            return ()
+        speakers = []
+        seen = set()
+        original = self._comparison_regions[region.region_id]
+        for word in original.crisperwhisper_words:
+            speaker_id = str(word.speaker_id or "").strip()
+            if not speaker_id:
+                speaker_id = _FUSION_UNASSIGNED_CRISPER_SPEAKER
+            if speaker_id and speaker_id not in seen:
+                seen.add(speaker_id)
+                speakers.append(speaker_id)
+        return tuple(speakers)
+
+    def _speaker_label(self, speaker):
+        return (
+            f"{speaker.speaker_id} ({speaker.name})"
+            if speaker.name
+            else f"{speaker.speaker_id} (unnamed)"
+        )
+
+    def _engine_detail_text(self, original, engine):
+        if engine == "whisperx":
+            words = original.whisperx_words
+            text = original.whisperx_text
+            start, end = original.whisperx_start, original.whisperx_end
+            speakers = original.whisperx_speakers
+            revision = self.session.comparison.whisperx.revision
+        else:
+            words = original.crisperwhisper_words
+            text = original.crisperwhisper_text
+            start, end = original.crisperwhisper_start, original.crisperwhisper_end
+            speakers = original.crisperwhisper_speakers
+            revision = self.session.comparison.crisperwhisper.revision
+        provenance = ", ".join(
+            f"ordinal {word.ordinal} / segment {word.segment_index}"
+            + (f" / word {word.word_index}" if word.word_index is not None else "")
+            for word in words
+        ) or "No word provenance"
+        value = (
+            f"Time: {_ResultComparisonWorkspace._format_time_range(start, end)}\n"
+            f"Speaker: {', '.join(speakers) or 'Unknown'}\n"
+            f"Revision: {revision.result_id}\n"
+            f"Segments SHA-256: {revision.segments_sha256}\n"
+            f"Word provenance: {provenance}\n\n"
+            f"{text or 'No corresponding text in this result.'}"
+        )
+        if engine == "crisperwhisper" and self.session.plan.warnings:
+            value += "\n\nWarnings: " + " | ".join(self.session.plan.warnings)
+        return value
+
+    def _refresh_mapping_controls(self, region):
+        source_ids = self._selected_crisper_speakers(region)
+        self.cmb_source_speaker.configure(values=source_ids)
+        if self.var_source_speaker.get() not in source_ids:
+            self.var_source_speaker.set(source_ids[0] if source_ids else "")
+        targets = tuple(self._speaker_label(item) for item in self.session.all_canonical_speakers())
+        self._target_labels = {
+            self._speaker_label(item): item.speaker_id
+            for item in self.session.all_canonical_speakers()
+        }
+        self.cmb_target_speaker.configure(values=targets + ("New Combined speaker...",))
+        if self.var_target_speaker.get() not in self.cmb_target_speaker.cget("values"):
+            self.var_target_speaker.set("")
+        source_id = self.var_source_speaker.get()
+        mapping = self.session.mapping_for(source_id) if source_id else None
+        region_speaker = (
+            self.session.region_speaker_for(region.region_id)
+            if region is not None
+            else None
+        )
+        if mapping:
+            value = (
+                f"{source_id} -> {mapping.target_speaker_id}"
+                + (f" ({mapping.target_name})" if mapping.target_name else " (unnamed)")
+                + f" | {mapping.decision_source.replace('_', ' ')}"
+            )
+            if region_speaker is not None:
+                value += (
+                    f" | This region -> {region_speaker.target_speaker_id}"
+                    + (
+                        f" ({region_speaker.target_name})"
+                        if region_speaker.target_name
+                        else " (unnamed)"
+                    )
+                )
+            self.lbl_mapping.configure(text=value)
+        elif source_id:
+            self.lbl_mapping.configure(
+                text="Mapping required if this CrisperWhisper passage is included."
+            )
+        else:
+            self.lbl_mapping.configure(text="No CrisperWhisper speaker in this region.")
+
+    def _selection_changed(self, _event=None):
+        region = self._current_region()
+        for child in self.action_frame.winfo_children():
+            child.destroy()
+        self._action_buttons = []
+        if region is None:
+            self.lbl_detail.configure(text="No fusion region selected.")
+            _ResultComparisonWorkspace._set_text(self.txt_whisper, "")
+            _ResultComparisonWorkspace._set_text(self.txt_crisper, "")
+            self.btn_preview_whisper.configure(state="disabled")
+            self.btn_preview_crisper.configure(state="disabled")
+            self.lbl_action_reason.configure(text="")
+            self._refresh_mapping_controls(None)
+            return
+        original = self._comparison_regions[region.region_id]
+        speaker_warning = (
+            "\nSpeaker warning: engine speakers disagree."
+            if original.speaker_disagreement
+            else ""
+        )
+        duration_text = (
+            f"Authoritative media duration: {self.session.plan.authoritative_media_duration:.3f}s "
+            f"({self.session.plan.authoritative_duration_source})"
+            if self.session.plan.authoritative_media_duration is not None
+            else (
+                f"Known transcript bound: {self.session.plan.known_transcript_bound:.3f}s "
+                "(not authoritative media duration)"
+                if self.session.plan.known_transcript_bound is not None
+                else "No media-duration bound is available."
+            )
+        )
+        provenance = []
+        display_candidates = region.candidates
+        if region.decision is not None:
+            try:
+                display_candidates = tuple(
+                    candidate
+                    for candidate in self.session.preview(
+                        provisional=True
+                    ).candidates
+                    if candidate.region_id == region.region_id
+                ) or region.candidates
+            except FusionValidationError:
+                display_candidates = region.candidates
+        for candidate in display_candidates:
+            if not candidate.words:
+                continue
+            word = candidate.words[0]
+            speaker_target = word.speaker_id or "-"
+            if word.speaker_name:
+                speaker_target += f" ({word.speaker_name})"
+            provenance.append(
+                f"{candidate.source_engine}: text={word.text_source_engine or '-'}, "
+                f"timing={word.timing_source_engine or '-'}, "
+                f"speaker={word.speaker_source_engine or '-'} -> {speaker_target} "
+                f"({word.speaker_decision_source or '-'}), "
+                f"revision={word.provenance[0].revision_id}"
+            )
+        coverage_warning = (
+            "\nWarnings: " + " | ".join(self.session.plan.warnings)
+            if self.session.plan.warnings
+            else ""
+        )
+        selection_detail = ""
+        if (
+            region.classification == _COMPARISON_TEXT_CONFLICT
+            and region.decision is not None
+            and region.decision.action not in {_FUSION_KEEP_BOTH, _FUSION_OMIT_BOTH}
+        ):
+            selected_candidate = display_candidates[0] if display_candidates else None
+            selected_speaker = None
+            if selected_candidate is not None:
+                selected_speaker = next(
+                    (word for word in selected_candidate.words if word.speaker_id),
+                    None,
+                )
+            speaker_text = "Not assigned"
+            if selected_speaker is not None:
+                speaker_text = selected_speaker.speaker_id
+                if selected_speaker.speaker_name:
+                    speaker_text += f" ({selected_speaker.speaker_name})"
+            timing_status = "Native word timing"
+            if selected_candidate is not None and selected_candidate.timing_is_derived:
+                timing_status = (
+                    "Derived word timing within "
+                    f"{_fusion_engine_label(selected_candidate.timing_source_engine)} region"
+                )
+            selection_detail = (
+                "\nSelected sources: "
+                f"Text: {_fusion_engine_label(region.decision.text_source_engine)} | "
+                f"Timing: {_fusion_engine_label(region.decision.timing_source_engine)} | "
+                f"Speaker: {speaker_text}\nTiming status: {timing_status}"
+            )
+        self.lbl_detail.configure(
+            text=(
+                f"{region.classification} | {original.explanation}{speaker_warning}\n"
+                f"{duration_text}{selection_detail}\nProvenance: "
+                + " | ".join(provenance)
+                + coverage_warning
+            )
+        )
+        _ResultComparisonWorkspace._set_text(
+            self.txt_whisper,
+            self._engine_detail_text(original, "whisperx"),
+        )
+        _ResultComparisonWorkspace._set_text(
+            self.txt_crisper,
+            self._engine_detail_text(original, "crisperwhisper"),
+        )
+        self.btn_preview_whisper.configure(
+            state="normal" if self._can_preview(original, "whisperx") else "disabled"
+        )
+        self.btn_preview_crisper.configure(
+            state="normal" if self._can_preview(original, "crisperwhisper") else "disabled"
+        )
+        if region.automatically_resolved:
+            ttk.Label(
+                self.action_frame,
+                text="Agreement is resolved automatically; duplicate insertion is disabled.",
+                style=MIDNIGHTSTUDIO_STYLES["card_secondary"],
+                wraplength=420,
+                justify="left",
+            ).grid(row=0, column=0, columnspan=2, sticky="ew")
+            self.lbl_action_reason.configure(text="")
+        else:
+            blocked_reasons = []
+            action_states = self.session.action_states(region.region_id)
+            state_by_action = {
+                action: (enabled, reason)
+                for action, enabled, reason in action_states
+            }
+
+            def add_action_button(action, row, column):
+                enabled, reason = state_by_action[action]
+                button = tb.Button(
+                    self.action_frame,
+                    text=_fusion_action_label(action, region.classification),
+                    command=lambda value=action: self._apply_decision(value),
+                    bootstyle="primary-outline",
+                )
+                button.grid(
+                    row=row,
+                    column=column,
+                    sticky="ew",
+                    padx=(0 if column == 0 else 4, 4 if column == 0 else 0),
+                    pady=(0, 4),
+                )
+                if not enabled:
+                    button.configure(state="disabled")
+                    blocked_reasons.append(
+                        f"{_fusion_action_label(action, region.classification)}: {reason}"
+                    )
+                self._action_buttons.append(button)
+                return button
+
+            if region.classification == _COMPARISON_TEXT_CONFLICT:
+                groups = (
+                    ("Text", (_FUSION_USE_WHISPER, _FUSION_USE_CRISPER)),
+                    (
+                        "Timing",
+                        (_FUSION_USE_WHISPER_TIMING, _FUSION_USE_CRISPER_TIMING),
+                    ),
+                    ("Whole passage", (_FUSION_KEEP_BOTH, _FUSION_OMIT_BOTH)),
+                )
+                next_row = 0
+                for group_label, actions in groups:
+                    visible_actions = tuple(
+                        action for action in actions if action in state_by_action
+                    )
+                    if not visible_actions:
+                        continue
+                    ttk.Label(
+                        self.action_frame,
+                        text=group_label,
+                        style=MIDNIGHTSTUDIO_STYLES["card_secondary"],
+                    ).grid(
+                        row=next_row,
+                        column=0,
+                        columnspan=2,
+                        sticky="w",
+                        pady=(2 if next_row else 0, 3),
+                    )
+                    next_row += 1
+                    for column, action in enumerate(visible_actions):
+                        add_action_button(action, next_row, column)
+                    next_row += 1
+            else:
+                for index, (action, _enabled, _reason) in enumerate(action_states):
+                    add_action_button(action, index // 2, index % 2)
+                next_row = (len(action_states) + 1) // 2
+            if region.decision is not None:
+                reset_button = tb.Button(
+                    self.action_frame,
+                    text="Reset to unresolved",
+                    command=self._reset_selected,
+                    bootstyle="secondary-outline",
+                )
+                reset_button.grid(
+                    row=next_row,
+                    column=0,
+                    columnspan=2,
+                    sticky="ew",
+                    padx=0,
+                    pady=(0, 4),
+                )
+                self._action_buttons.append(reset_button)
+            self.lbl_action_reason.configure(
+                text=(
+                    "Unavailable decision: " + " | ".join(blocked_reasons)
+                    if blocked_reasons
+                    else ""
+                )
+            )
+        self._refresh_mapping_controls(region)
+
+    def _select_clicked_row(self, event):
+        item = self.tree.identify_row(event.y)
+        if item:
+            self.tree.selection_set(item)
+            self.tree.focus(item)
+
+    @staticmethod
+    def _engine_time(region, engine):
+        return region.whisperx_start if engine == "whisperx" else region.crisperwhisper_start
+
+    def _can_preview(self, region, engine):
+        return bool(
+            region is not None
+            and self._preview_available
+            and self._preview_callback is not None
+            and self._engine_time(region, engine) is not None
+        )
+
+    def _preview_engine(self, engine):
+        region = self._current_region()
+        original = self._comparison_regions.get(region.region_id) if region else None
+        if not self._can_preview(original, engine):
+            return "break"
+        tree = getattr(self, "tree", None)
+        selection = tree.selection() if tree is not None else ()
+        if selection:
+            tree.focus(selection[0])
+            tree.see(selection[0])
+        preview_time = self._engine_time(original, engine)
+        try:
+            success, reason = self._preview_callback(preview_time)
+        except Exception as exc:
+            success, reason = False, str(exc)
+        if not success:
+            reason = reason or "Media preview is unavailable."
+            self.lbl_preview_status.configure(text=reason)
+            self._report(f"[fusion] Preview unavailable: {reason}")
+        else:
+            engine_label = "WhisperX" if engine == "whisperx" else "CrisperWhisper"
+            self.lbl_preview_status.configure(
+                text=(
+                    f"Previewing {engine_label} at "
+                    f"{_ResultComparisonWorkspace._format_time(preview_time)}."
+                )
+            )
+        return "break"
+
+    def _apply_decision(self, action):
+        region = self._current_region()
+        if region is None:
+            return
+        try:
+            self.session.apply(region.region_id, action)
+        except (FusionDecisionError, FusionValidationError) as exc:
+            messagebox.showwarning(
+                "Decision not safe",
+                str(exc),
+                parent=self,
+            )
+            return
+        self._refresh_all(selected_region_id=region.region_id)
+
+    def _undo(self):
+        if self.session.undo():
+            self._refresh_all()
+
+    def _reset_selected(self):
+        region = self._current_region()
+        if region is not None and self.session.reset_selected(region.region_id):
+            self._refresh_all(selected_region_id=region.region_id)
+
+    def _reset_all(self):
+        if not self.session.has_changes:
+            return
+        if not messagebox.askyesno(
+            "Reset all decisions",
+            "Reset every explicit fusion decision and manual speaker mapping?",
+            parent=self,
+        ):
+            return
+        self.session.reset_all()
+        self._refresh_all()
+
+    def _resolve_baseline(self):
+        if not messagebox.askyesno(
+            "Resolve with WhisperX baseline",
+            "Resolve every remaining region as follows:\n\n"
+            "- Text conflict: choose WhisperX.\n"
+            "- Timing conflict: choose WhisperX timing.\n"
+            "- WhisperX-only: include.\n"
+            "- CrisperWhisper-only: omit.\n"
+            "- Possible duplicate: use the safe WhisperX occurrence when available; otherwise omit.\n"
+            "- Unresolved: use WhisperX only when available; otherwise omit.\n\n"
+            "Each choice remains individually reviewable and undoable.",
+            parent=self,
+        ):
+            return
+        try:
+            self.session.resolve_whisperx_baseline()
+        except (FusionDecisionError, FusionValidationError) as exc:
+            messagebox.showwarning("Baseline could not be applied", str(exc), parent=self)
+            return
+        self._refresh_all()
+
+    def _apply_speaker_mapping(self):
+        source_id = self.var_source_speaker.get().strip()
+        if not source_id:
+            messagebox.showinfo(
+                "Speaker mapping",
+                "Select a CrisperWhisper speaker to map.",
+                parent=self,
+            )
+            return
+        target_label = self.var_target_speaker.get().strip()
+        try:
+            if target_label and target_label != "New Combined speaker...":
+                target_id = self._target_labels[target_label]
+                self.session.map_to_existing(source_id, target_id)
+                region = self._current_region()
+                if region is not None:
+                    self.session.set_region_speaker(
+                        region.region_id,
+                        source_id,
+                        target_id,
+                    )
+            else:
+                speaker = self.session.create_and_map_speaker(
+                    source_id,
+                    self.var_new_speaker_name.get(),
+                    explicit_unnamed=self.var_explicit_unnamed.get(),
+                )
+                region = self._current_region()
+                if region is not None:
+                    self.session.set_region_speaker(
+                        region.region_id,
+                        source_id,
+                        speaker.speaker_id,
+                    )
+        except (KeyError, FusionValidationError) as exc:
+            messagebox.showinfo("Speaker mapping", str(exc), parent=self)
+            return
+        self.var_new_speaker_name.set("")
+        self.var_explicit_unnamed.set(False)
+        region = self._current_region()
+        self._refresh_all(selected_region_id=region.region_id if region else None)
+
+    def _combined_preview_payload(self):
+        try:
+            return self.session.preview_presentation(), None
+        except (FusionNotReadyError, FusionValidationError) as exc:
+            return None, str(exc)
+
+    def _provisional_preview_payload(self):
+        """Compatibility adapter for older tests and callers."""
+
+        presentation, error = self._combined_preview_payload()
+        return (
+            presentation.audit_text
+            if presentation is not None
+            else "No Combined Draft preview could be generated.",
+            error,
+        )
+
+    def _render_preview(self):
+        presentation, error = self._combined_preview_payload()
+        if presentation is None:
+            reason = error or "No Combined Draft preview could be generated."
+            self.lbl_final.configure(text=f"Combined Draft preview unavailable: {reason}")
+            self._report(f"[fusion] Combined Draft preview unavailable: {reason}")
+            return False
+        try:
+            dialog = _FusionPreviewDialog(
+                self.winfo_toplevel(),
+                presentation,
+                error=error,
+            )
+        except Exception as exc:
+            reason = error or str(exc)
+            self.lbl_final.configure(text=f"Combined Draft preview unavailable: {reason}")
+            self._report(f"[fusion] Combined Draft preview unavailable: {reason}")
+            return False
+        self.wait_window(dialog)
+        return error is None
+
+    def _validate_final(self):
+        try:
+            self.session.validate_final()
+        except (FusionNotReadyError, FusionValidationError) as exc:
+            self.lbl_final.configure(text=f"Validation failed: {exc}")
+            self._report(f"[fusion] Final validation failed: {exc}")
+            return False
+        self.lbl_final.configure(
+            text="Final-ready Combined Draft. No files have been written."
+        )
+        self._report("[fusion] Final-ready Combined Draft. No files have been written.")
+        return True
+
+    def _close(self, _event=None):
+        if self._back_to_compare_callback is not None:
+            self._back_to_compare_callback()
+        return "break"
+
+    def _back_to_review(self):
+        if self._back_to_review_callback is not None:
+            self._back_to_review_callback()
+        return "break"
+
+
+class _ResultComparisonWorkspace(ttk.Frame):
+    """Read-only in-page comparison of two exact result revisions."""
 
     def __init__(
         self,
@@ -6453,19 +8484,19 @@ class _ResultComparisonDialog(tk.Toplevel):
         preview_available=False,
         preview_unavailable_reason=None,
         report_callback=None,
+        open_result_callback=None,
+        open_fusion_callback=None,
+        back_to_review_callback=None,
     ):
-        super().__init__(parent)
-        style_midnightstudio_toplevel(self)
-        self.title("Compare Results")
-        self.geometry("1320x820")
-        self.minsize(980, 620)
-        self.resizable(True, True)
-        self.transient(parent)
-        self.result_action = None
+        super().__init__(parent, style=MIDNIGHTSTUDIO_STYLES["page"])
         self._preview_callback = preview_callback
         self._preview_available = bool(preview_available)
         self._preview_unavailable_reason = preview_unavailable_reason
         self._report_callback = report_callback
+        self._open_result_callback = open_result_callback
+        self._open_fusion_callback = open_fusion_callback
+        self._back_to_review_callback = back_to_review_callback
+        self._loaded_result_identity = loaded_descriptor.file_identity
         self._comparison = None
         self._model = None
         self._row_regions = {}
@@ -6516,34 +8547,17 @@ class _ResultComparisonDialog(tk.Toplevel):
         self.rowconfigure(0, weight=1)
         main = ttk.Frame(
             self,
-            padding=12,
+            padding=4,
             style=MIDNIGHTSTUDIO_STYLES["page"],
         )
         main.grid(row=0, column=0, sticky="nsew")
         main.columnconfigure(0, weight=1)
-        main.rowconfigure(3, weight=3)
-        main.rowconfigure(4, weight=2)
-
-        ttk.Label(
-            main,
-            text="Compare Results",
-            style=MIDNIGHTSTUDIO_STYLES["review_title"],
-        ).grid(row=0, column=0, sticky="w")
-        ttk.Label(
-            main,
-            text=(
-                "Complete means processing and result validation completed. "
-                "It does not guarantee that every spoken word was recognized."
-            ),
-            style=MIDNIGHTSTUDIO_STYLES["subtitle"],
-            wraplength=1100,
-            justify="left",
-        ).grid(row=1, column=0, sticky="ew", pady=(3, 10))
+        main.rowconfigure(1, weight=3)
+        main.rowconfigure(2, weight=2)
 
         selectors = ttk.LabelFrame(main, text="Exact revision pair", padding=8)
-        selectors.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        selectors.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         selectors.columnconfigure(1, weight=1)
-        selectors.columnconfigure(3, weight=1)
         self.var_whisper = tk.StringVar(
             value=self._label_for_descriptor(default_whisper, self._whisper_labels)
         )
@@ -6562,7 +8576,7 @@ class _ResultComparisonDialog(tk.Toplevel):
         )
         self.cmb_whisper.grid(row=0, column=1, sticky="ew", padx=(0, 14))
         ttk.Label(selectors, text="CrisperWhisper").grid(
-            row=0, column=2, sticky="w", padx=(0, 6)
+            row=1, column=0, sticky="w", padx=(0, 6), pady=(5, 0)
         )
         self.cmb_crisper = ttk.Combobox(
             selectors,
@@ -6571,7 +8585,7 @@ class _ResultComparisonDialog(tk.Toplevel):
             state="readonly",
             width=52,
         )
-        self.cmb_crisper.grid(row=0, column=3, sticky="ew")
+        self.cmb_crisper.grid(row=1, column=1, sticky="ew", pady=(5, 0))
         self.lbl_summary = ttk.Label(
             selectors,
             text="",
@@ -6579,12 +8593,12 @@ class _ResultComparisonDialog(tk.Toplevel):
             justify="left",
         )
         self.lbl_summary.grid(
-            row=1, column=0, columnspan=4, sticky="ew", pady=(8, 0)
+            row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0)
         )
         apply_midnightstudio_card_style(selectors)
 
         table_card = ttk.LabelFrame(main, text="Ordered comparison regions", padding=8)
-        table_card.grid(row=3, column=0, sticky="nsew", pady=(0, 8))
+        table_card.grid(row=1, column=0, sticky="nsew", pady=(0, 6))
         table_card.columnconfigure(0, weight=1)
         table_card.rowconfigure(1, weight=1)
         filter_bar = ttk.Frame(table_card)
@@ -6641,11 +8655,21 @@ class _ResultComparisonDialog(tk.Toplevel):
             style=MIDNIGHTSTUDIO_STYLES["review_scrollbar"],
         )
         tree_scroll.grid(row=1, column=1, sticky="ns")
-        self.tree.configure(yscrollcommand=tree_scroll.set)
+        tree_hscroll = ttk.Scrollbar(
+            table_card,
+            orient="horizontal",
+            command=self.tree.xview,
+            style=MIDNIGHTSTUDIO_STYLES["dialog_hscrollbar"],
+        )
+        tree_hscroll.grid(row=2, column=0, sticky="ew")
+        self.tree.configure(
+            yscrollcommand=tree_scroll.set,
+            xscrollcommand=tree_hscroll.set,
+        )
         apply_midnightstudio_card_style(table_card)
 
         details = ttk.LabelFrame(main, text="Selected region details", padding=8)
-        details.grid(row=4, column=0, sticky="nsew", pady=(0, 8))
+        details.grid(row=2, column=0, sticky="nsew", pady=(0, 6))
         details.columnconfigure(0, weight=1)
         details.columnconfigure(1, weight=1)
         details.rowconfigure(1, weight=1)
@@ -6670,46 +8694,47 @@ class _ResultComparisonDialog(tk.Toplevel):
         apply_midnightstudio_card_style(details)
 
         buttons = ttk.Frame(main, style=MIDNIGHTSTUDIO_STYLES["page"])
-        buttons.grid(row=5, column=0, sticky="ew")
+        buttons.grid(row=3, column=0, sticky="ew")
         buttons.columnconfigure(0, weight=1)
         self.lbl_preview = ttk.Label(
             buttons,
             text=("" if self._preview_available else (preview_unavailable_reason or "Preview is unavailable.")),
             style=MIDNIGHTSTUDIO_STYLES["secondary"],
         )
-        self.lbl_preview.grid(row=0, column=0, sticky="w")
+        self.lbl_preview.grid(row=0, column=0, columnspan=4, sticky="w")
+        self.btn_build_combined = tb.Button(
+            buttons,
+            text="Build Combined Draft...",
+            command=self._open_fusion_draft,
+            bootstyle="success-outline",
+        )
+        self.btn_build_combined.grid(row=1, column=0, sticky="w", pady=(6, 0))
         self.btn_preview_whisper = tb.Button(
             buttons,
             text="Preview WhisperX time",
             command=lambda: self._preview_engine("whisperx"),
             bootstyle="primary-outline",
         )
-        self.btn_preview_whisper.grid(row=0, column=1, padx=(8, 0))
+        self.btn_preview_whisper.grid(row=1, column=1, padx=(8, 0), pady=(6, 0))
         self.btn_preview_crisper = tb.Button(
             buttons,
             text="Preview CrisperWhisper time",
             command=lambda: self._preview_engine("crisperwhisper"),
             bootstyle="primary-outline",
         )
-        self.btn_preview_crisper.grid(row=0, column=2, padx=(8, 0))
+        self.btn_preview_crisper.grid(row=1, column=2, padx=(8, 0), pady=(6, 0))
         tb.Button(
             buttons,
             text="Open WhisperX result",
             command=lambda: self._open_result("whisperx"),
             bootstyle="secondary-outline",
-        ).grid(row=0, column=3, padx=(8, 0))
+        ).grid(row=2, column=0, sticky="w", pady=(6, 0))
         tb.Button(
             buttons,
             text="Open CrisperWhisper result",
             command=lambda: self._open_result("crisperwhisper"),
             bootstyle="secondary-outline",
-        ).grid(row=0, column=4, padx=(8, 0))
-        tb.Button(
-            buttons,
-            text="Close",
-            command=self._close,
-            bootstyle="secondary-outline",
-        ).grid(row=0, column=5, padx=(8, 0))
+        ).grid(row=2, column=1, padx=(8, 0), pady=(6, 0))
 
         self.cmb_whisper.bind("<<ComboboxSelected>>", self._pair_changed, add="+")
         self.cmb_crisper.bind("<<ComboboxSelected>>", self._pair_changed, add="+")
@@ -6719,10 +8744,8 @@ class _ResultComparisonDialog(tk.Toplevel):
         self.tree.bind("<Double-1>", self._double_click, add="+")
         self.bind("<Return>", self._preview_unambiguous)
         self.bind("<Escape>", self._close)
-        self.protocol("WM_DELETE_WINDOW", self._close)
         reinforce_midnightstudio_control_states(tb.Style.get_instance() or tb.Style())
         self._refresh_comparison()
-        self.grab_set()
         self.after_idle(self.tree.focus_set)
 
     @staticmethod
@@ -7011,22 +9034,46 @@ class _ResultComparisonDialog(tk.Toplevel):
             reason = reason or "Media preview is unavailable."
             self.lbl_preview.configure(text=reason)
             self._report(f"[comparison] Preview unavailable: {reason}")
+        else:
+            engine_label = "WhisperX" if engine == "whisperx" else "CrisperWhisper"
+            self.lbl_preview.configure(
+                text=(
+                    f"Previewing {engine_label} at "
+                    f"{self._format_time(preview_time)}."
+                )
+            )
         return "break"
+
+    def _open_fusion_draft(self):
+        whisper, crisper = self._selected_descriptors()
+        if whisper is None or crisper is None:
+            return
+        try:
+            # compare_results performs descriptor, manifest, fingerprint, strict
+            # source-identity, and exact-pair revalidation immediately here.
+            comparison = compare_results(whisper, crisper)
+        except Exception as exc:
+            self._report(f"[fusion] Could not build the Combined Draft: {exc}")
+            messagebox.showerror(
+                "Could not build Combined Draft",
+                f"The exact result pair could not be revalidated:\n{exc}",
+                parent=self,
+            )
+            return
+        if self._open_fusion_callback is not None:
+            self._open_fusion_callback(comparison)
 
     def _open_result(self, engine):
         whisper, crisper = self._selected_descriptors()
         descriptor = whisper if engine == "whisperx" else crisper
         if descriptor is None:
             return
-        self.result_action = ("open", descriptor)
-        self._close()
+        if self._open_result_callback is not None:
+            self._open_result_callback(descriptor)
 
     def _close(self, _event=None):
-        try:
-            self.grab_release()
-        except tk.TclError:
-            pass
-        self.destroy()
+        if self._back_to_review_callback is not None:
+            self._back_to_review_callback()
         return "break"
 
 
@@ -7057,6 +9104,9 @@ class ReviewNamePage(ttk.Frame):
         self.current_result_paths = None
         self.current_result_identity = None
         self.current_result_descriptor = None
+        self._mode = "review"
+        self._comparison_workspace = None
+        self._fusion_workspace = None
         self.columnconfigure(0, weight=1)
         self.rowconfigure(2, weight=1)
 
@@ -7067,6 +9117,26 @@ class ReviewNamePage(ttk.Frame):
         )
         toolbar.grid(row=0, column=0, sticky="ew")
         toolbar.columnconfigure(0, weight=1)
+        self.lbl_mode_breadcrumb = ttk.Label(
+            toolbar,
+            text="Review & Name",
+            style=MIDNIGHTSTUDIO_STYLES["subtitle"],
+        )
+        self.lbl_mode_breadcrumb.grid(row=0, column=0, sticky="w")
+        self.btn_back_review = tb.Button(
+            toolbar,
+            text="Back to Review",
+            command=self.show_review_mode,
+            bootstyle="secondary-outline",
+            padding=(12, 5),
+        )
+        self.btn_back_compare = tb.Button(
+            toolbar,
+            text="Back to Compare",
+            command=self.show_comparison_mode,
+            bootstyle="secondary-outline",
+            padding=(12, 5),
+        )
         self.btn_compare_results = tb.Button(
             toolbar,
             text="Compare Results...",
@@ -7075,14 +9145,14 @@ class ReviewNamePage(ttk.Frame):
             padding=(14, 5),
             state="disabled",
         )
-        self.btn_compare_results.grid(row=0, column=1, sticky="e", padx=(0, 8))
+        self.btn_compare_results.grid(row=0, column=3, sticky="e", padx=(0, 8))
         tb.Button(
             toolbar,
             text="Open Result...",
             command=self._open_result_browser_callback,
             bootstyle="primary-outline",
             padding=(14, 5),
-        ).grid(row=0, column=2, sticky="e")
+        ).grid(row=0, column=4, sticky="e")
 
         self.incomplete_banner = ttk.Frame(
             self,
@@ -7243,6 +9313,178 @@ class ReviewNamePage(ttk.Frame):
         if self._report_callback is not None:
             self._report_callback(message)
 
+    def _update_mode_navigation(self):
+        if not hasattr(self, "lbl_mode_breadcrumb"):
+            return
+        self.btn_back_review.grid_remove()
+        self.btn_back_compare.grid_remove()
+        self.btn_compare_results.grid_remove()
+        if self._mode == "compare":
+            self.lbl_mode_breadcrumb.configure(
+                text="Review & Name > Compare Results"
+            )
+            self.btn_back_review.grid(row=0, column=1, padx=(0, 8))
+        elif self._mode == "fusion":
+            self.lbl_mode_breadcrumb.configure(
+                text="Review & Name > Compare Results > Combined Draft"
+            )
+            self.btn_back_review.grid(row=0, column=1, padx=(0, 8))
+            self.btn_back_compare.grid(row=0, column=2, padx=(0, 8))
+        else:
+            self.lbl_mode_breadcrumb.configure(text="Review & Name")
+            self.btn_compare_results.grid(
+                row=0,
+                column=3,
+                sticky="e",
+                padx=(0, 8),
+            )
+
+    def show_review_mode(self):
+        if self.workspace is None:
+            return False
+        self.workspace.show_review_mode()
+        self._mode = "review"
+        self._update_mode_navigation()
+        self.workspace.on_host_activated()
+        return True
+
+    def show_comparison_mode(self):
+        if self.workspace is None or self._comparison_workspace is None:
+            return False
+        if (
+            getattr(self, "current_result_identity", None) is not None
+            and self._comparison_workspace._loaded_result_identity
+            != self.current_result_identity
+        ):
+            self._report(
+                "[comparison] The loaded result changed; rebuild the comparison before reopening it."
+            )
+            return False
+        self.workspace.show_embedded_mode(self._comparison_workspace, "compare")
+        self._mode = "compare"
+        self._update_mode_navigation()
+        self.workspace.on_host_activated()
+        return True
+
+    def open_comparison(self, loaded_descriptor, descriptors):
+        if self.workspace is None:
+            return False
+        current_view = self._comparison_workspace
+        if (
+            current_view is not None
+            and current_view._loaded_result_identity == loaded_descriptor.file_identity
+        ):
+            return self.show_comparison_mode()
+        if current_view is not None and not self._confirm_fusion_discard_for_replacement():
+            return False
+
+        preview_available, preview_reason = self.comparison_preview_status()
+        comparison_view = _ResultComparisonWorkspace(
+            self.workspace.embedded_mode_parent,
+            loaded_descriptor,
+            descriptors,
+            preview_callback=self.preview_comparison_time,
+            preview_available=preview_available,
+            preview_unavailable_reason=preview_reason,
+            report_callback=self._report,
+            open_result_callback=self._open_comparison_result,
+            open_fusion_callback=self._open_fusion_workspace,
+            back_to_review_callback=self.show_review_mode,
+        )
+        if current_view is not None:
+            try:
+                current_view.destroy()
+            except tk.TclError:
+                pass
+        self._comparison_workspace = comparison_view
+        self._discard_fusion_workspace()
+        return self.show_comparison_mode()
+
+    def _open_fusion_workspace(self, comparison):
+        if self.workspace is None:
+            return False
+        current = self._fusion_workspace
+        if current is not None and current.session.comparison.pair_id == comparison.pair_id:
+            self.workspace.show_embedded_mode(current, "fusion")
+            self._mode = "fusion"
+            self._update_mode_navigation()
+            self.workspace.on_host_activated()
+            return True
+        if current is not None and current.session.has_changes:
+            if not messagebox.askyesno(
+                "Replace Combined Draft?",
+                "The existing Combined Draft has in-memory decisions. Discard them and build a draft for the newly selected pair?",
+                parent=self.winfo_toplevel(),
+            ):
+                return False
+        preview_available, preview_reason = self.comparison_preview_status()
+        try:
+            fusion_view = _FusionDraftWorkspace(
+                self.workspace.embedded_mode_parent,
+                comparison,
+                preview_callback=self.preview_comparison_time,
+                preview_available=preview_available,
+                preview_unavailable_reason=preview_reason,
+                report_callback=self._report,
+                back_to_compare_callback=self.show_comparison_mode,
+                back_to_review_callback=self.show_review_mode,
+            )
+        except Exception as exc:
+            self._report(f"[fusion] Could not build the Combined Draft: {exc}")
+            messagebox.showerror(
+                "Could not build Combined Draft",
+                f"The exact result pair could not be prepared:\n{exc}",
+                parent=self.winfo_toplevel(),
+            )
+            return False
+        if current is not None:
+            try:
+                current.destroy()
+            except tk.TclError:
+                pass
+        self._fusion_workspace = fusion_view
+        self.workspace.show_embedded_mode(fusion_view, "fusion")
+        self._mode = "fusion"
+        self._update_mode_navigation()
+        self.workspace.on_host_activated()
+        return True
+
+    def _open_comparison_result(self, descriptor):
+        return self.load_result(descriptor)
+
+    def _discard_fusion_workspace(self):
+        fusion = getattr(self, "_fusion_workspace", None)
+        self._fusion_workspace = None
+        if fusion is not None:
+            try:
+                fusion.destroy()
+            except tk.TclError:
+                pass
+
+    def _reset_embedded_modes(self):
+        comparison = getattr(self, "_comparison_workspace", None)
+        self._comparison_workspace = None
+        self._discard_fusion_workspace()
+        if comparison is not None:
+            try:
+                comparison.destroy()
+            except tk.TclError:
+                pass
+        self._mode = "review"
+        self._update_mode_navigation()
+
+    def _confirm_fusion_discard_for_replacement(self):
+        fusion = getattr(self, "_fusion_workspace", None)
+        if fusion is None or not fusion.session.has_changes:
+            return True
+        return bool(
+            messagebox.askyesno(
+                "Discard Combined Draft decisions?",
+                "Loading another result will discard the current in-memory Combined Draft decisions and speaker mappings. Continue?",
+                parent=self.winfo_toplevel(),
+            )
+        )
+
     def _refresh_comparison_availability(self):
         enabled = False
         availability_callback = getattr(
@@ -7366,6 +9608,8 @@ class ReviewNamePage(ttk.Frame):
             == self._result_path_key(self.current_result_identity)
         )
         if self.workspace is not None and confirm_replacement:
+            if not self._confirm_fusion_discard_for_replacement():
+                return False
             if self.workspace.has_unsaved_changes():
                 decision = messagebox.askyesnocancel(
                     "Unsaved Review & Name changes",
@@ -7504,12 +9748,14 @@ class ReviewNamePage(ttk.Frame):
         if old_workspace is not None:
             self._dispose_workspace(old_workspace)
         self.empty_state.grid_remove()
+        self._reset_embedded_modes()
         self.workspace = new_workspace
         self.current_result_paths = result_paths
         self.current_result_identity = verified_preflight.identity
         self.current_result_descriptor = current_descriptor
         self._set_incomplete_warning(current_descriptor)
         self._refresh_comparison_availability()
+        self.workspace.show_review_mode()
         if current_descriptor.status == "incomplete":
             self._report(
                 "[review] Loaded an Incomplete result. Some speech may be missing."
@@ -7535,6 +9781,7 @@ class ReviewNamePage(ttk.Frame):
 
     def _unload_workspace(self):
         workspace = self.workspace
+        self._reset_embedded_modes()
         self.workspace = None
         self.current_result_paths = None
         self.current_result_identity = None
@@ -7557,6 +9804,14 @@ class ReviewNamePage(ttk.Frame):
 
     def approve_application_close(self):
         workspace = self.workspace
+        fusion = self._fusion_workspace
+        if fusion is not None and fusion.session.has_changes:
+            if not messagebox.askyesno(
+                "Discard Combined Draft decisions?",
+                "The current Combined Draft has in-memory decisions and speaker mappings. Discard them and close Transcript Studio?",
+                parent=self.winfo_toplevel(),
+            ):
+                return False
         if workspace is None or not workspace.has_unsaved_changes():
             return True
         decision = messagebox.askyesnocancel(
@@ -9693,18 +11948,10 @@ class App(ttk.Frame):
                 parent=self.winfo_toplevel(),
             )
             return False
-        preview_available, preview_reason = (
-            self.review_page.comparison_preview_status()
-        )
         try:
-            dialog = _ResultComparisonDialog(
-                self.winfo_toplevel(),
+            opened = self.review_page.open_comparison(
                 current,
                 descriptors,
-                preview_callback=self.review_page.preview_comparison_time,
-                preview_available=preview_available,
-                preview_unavailable_reason=preview_reason,
-                report_callback=self.log,
             )
         except Exception as exc:
             self.log(f"[comparison] Could not open comparison: {exc}")
@@ -9714,23 +11961,7 @@ class App(ttk.Frame):
                 parent=self.winfo_toplevel(),
             )
             return False
-        self.wait_window(dialog)
-        action = dialog.result_action
-        if not action or action[0] != "open":
-            return True
-        selected = action[1]
-        try:
-            selected = revalidate_descriptor(selected)
-        except Exception as exc:
-            self.log(f"[comparison] Selected result could not be opened: {exc}")
-            messagebox.showerror(
-                "Could not open result",
-                f"The selected result changed or became unavailable:\n{exc}\n\n"
-                "The current Review workspace was left unchanged.",
-                parent=self.winfo_toplevel(),
-            )
-            return False
-        if not self.review_page.load_result(selected):
+        if not opened:
             return False
         self.show_page("review")
         return True

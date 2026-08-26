@@ -12,7 +12,9 @@ import unittest
 from unittest import mock
 
 import crisperwhisper_backend as crisper_backend
+import crisperwhisper_worker as crisper_worker
 import result_catalog
+import result_comparison
 import split_audio
 import split_audio_gui as gui
 
@@ -651,6 +653,214 @@ class DualEnginePipelineTests(unittest.TestCase):
 
 
 class DualEngineStorageTests(unittest.TestCase):
+    def _run_both_timestamp_fixture(self, words, *, duration=2.0):
+        root = Path(self.temporary_directory.name)
+        output = root / "output"
+        wav_cache = root / "wav-cache"
+        speaker_names = root / "speaker-names"
+        source = root / "same-source.mp4"
+        source.write_bytes(b"synthetic media")
+        cfg = split_audio.Conf(
+            diarize=False,
+            slice_audio=False,
+            slice_video=False,
+            output_format="both",
+            transcription_backend="both",
+            crisperwhisper_license_acknowledged=True,
+            crisperwhisper={},
+        )
+        observed_before_crisper = []
+        project_metadata_before_crisper = []
+
+        def fake_ffmpeg(arguments):
+            Path(arguments[-1]).write_bytes(b"verified synthetic wav")
+
+        def fake_transcription(_wav, _device, engine_cfg, **_kwargs):
+            if engine_cfg.transcription_backend == "whisperx":
+                return {
+                    "segments": [
+                        {
+                            "start": 0.0,
+                            "end": 1.0,
+                            "text": " whisper result",
+                            "words": [
+                                {
+                                    "word": " whisper result",
+                                    "start": 0.0,
+                                    "end": 1.0,
+                                }
+                            ],
+                        }
+                    ]
+                }, None
+
+            existing = result_catalog.discover_results(output).results
+            observed_before_crisper.append(existing)
+            project_metadata_before_crisper.append(
+                next(output.glob("same-source--*/project.json")).read_bytes()
+            )
+            normalized, repairs = crisper_worker.normalize_word_timestamps(
+                [
+                    {"word": word, "start": start, "end": end}
+                    for word, start, end in words
+                ],
+                " ".join(word for word, _start, _end in words),
+                duration,
+                diagnostic_context={
+                    "model_family": "medium",
+                    "strategy": "continuation",
+                    "chunks": [
+                        {
+                            "chunk_index": 0,
+                            "start": 0.0,
+                            "end": duration,
+                            "text": " ".join(
+                                word for word, _start, _end in words
+                            ),
+                        }
+                    ],
+                },
+            )
+            return {
+                "segments": [
+                    {
+                        "start": normalized[0]["start"],
+                        "end": normalized[-1]["end"],
+                        "text": " " + " ".join(item["word"] for item in normalized),
+                        "words": normalized,
+                    }
+                ]
+            }, {
+                "model": {"family": "medium"},
+                "requested_settings": {
+                    "transcription": {"mode": "verbatim"}
+                },
+                "execution_backend": "transformers",
+                "result_status": "complete",
+                "coverage_complete": True,
+                "word_timestamp_repairs": repairs,
+            }
+
+        adapter = mock.Mock()
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(split_audio, "OUT_DIR", output))
+            stack.enter_context(mock.patch.object(split_audio, "WAV_DIR", wav_cache))
+            stack.enter_context(
+                mock.patch.object(split_audio, "SPEAKER_NAMES_DIR", speaker_names)
+            )
+            stack.enter_context(
+                mock.patch.object(split_audio, "load_conf", return_value=(cfg, None))
+            )
+            stack.enter_context(
+                mock.patch.object(split_audio, "setup_device", return_value="cuda")
+            )
+            stack.enter_context(
+                mock.patch.object(split_audio, "preflight_whisperx_runtime")
+            )
+            stack.enter_context(
+                mock.patch.object(split_audio, "probe_duration_seconds", return_value=None)
+            )
+            stack.enter_context(
+                mock.patch.object(split_audio, "run_ffmpeg", side_effect=fake_ffmpeg)
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    split_audio,
+                    "transcribe_configured_backend",
+                    side_effect=fake_transcription,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    crisper_backend,
+                    "CrisperWhisperBackend",
+                    return_value=adapter,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    crisper_backend,
+                    "resolve_crisperwhisper_settings",
+                    return_value={
+                        "model": {"family": "medium"},
+                        "transcription": {"mode": "verbatim"},
+                    },
+                )
+            )
+            with redirect_stdout(io.StringIO()):
+                split_audio.run_pipeline([str(source)])
+
+        return output, observed_before_crisper, project_metadata_before_crisper
+
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+
+    def test_same_chunk_repair_makes_both_revisions_comparison_eligible(self):
+        (
+            output,
+            observed_before_crisper,
+            _project_before,
+        ) = self._run_both_timestamp_fixture(
+            [
+                ("private-alpha", 0.98, 1.00),
+                ("private-beta", 0.98, 1.005),
+                ("private-gamma", 1.015, 1.40),
+                ("private-delta", 1.45, 1.80),
+            ]
+        )
+
+        self.assertEqual(len(observed_before_crisper), 1)
+        before = observed_before_crisper[0]
+        self.assertEqual([item.engine for item in before], ["whisperx"])
+        self.assertEqual(
+            result_comparison.compatible_counterparts(before[0], before),
+            (),
+        )
+
+        results = result_catalog.discover_results(output).results
+        self.assertEqual(
+            {item.engine for item in results},
+            {"whisperx", "crisperwhisper"},
+        )
+        whisper = next(item for item in results if item.engine == "whisperx")
+        counterparts = result_comparison.compatible_counterparts(whisper, results)
+        self.assertEqual(len(counterparts), 1)
+        self.assertEqual(counterparts[0].engine, "crisperwhisper")
+
+    def test_unsafe_same_chunk_repair_keeps_only_whisper_revision(self):
+        output, observed_before_crisper, project_before = (
+            self._run_both_timestamp_fixture(
+                [
+                    ("private-anchor", 0.98, 1.00),
+                    *[
+                        (
+                            f"private-{index}",
+                            0.99 + index * 0.005,
+                            0.995 + index * 0.005,
+                        )
+                        for index in range(9)
+                    ],
+                ],
+                duration=3.0,
+            )
+        )
+
+        self.assertEqual(len(observed_before_crisper), 1)
+        results = result_catalog.discover_results(output).results
+        self.assertEqual([item.engine for item in results], ["whisperx"])
+        self.assertEqual(
+            result_comparison.compatible_counterparts(results[0], results),
+            (),
+        )
+        project_dir = next(output.glob("same-source--*"))
+        self.assertEqual(list((project_dir / "crisperwhisper").glob("*")), [])
+        self.assertEqual(
+            (project_dir / "project.json").read_bytes(),
+            project_before[0],
+        )
+        self.assertFalse(any(output.rglob(".staging-*")))
+
     def test_repeated_both_runs_create_independent_revisions_and_reuse_wav(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

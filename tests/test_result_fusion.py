@@ -392,6 +392,196 @@ class FusionPlanningTests(unittest.TestCase):
         self.assertTrue(omitted.ready_for_final_generation)
         self.assertEqual(fusion.build_combined_preview(omitted).words, ())
 
+    def test_text_conflict_can_use_crisper_wording_with_safe_whisper_timing(self):
+        result = self.fixture.compare(
+            [
+                self.fixture.segment("before", 7.4, 8.0),
+                self.fixture.segment("73,000", 8.18, 8.76),
+                self.fixture.segment("after", 8.9, 9.4),
+            ],
+            [
+                self.fixture.segment("before", 7.4, 8.0),
+                self.fixture.segment("seventy three thousand", 7.95, 9.08),
+                self.fixture.segment("after", 8.9, 9.4),
+            ],
+        )
+        plan = fusion.create_fusion_plan(result)
+        region = next(
+            item
+            for item in plan.regions
+            if item.classification == comparison.TEXT_CONFLICT
+        )
+        original_crisper_words = region.candidates[1].words
+        valid = fusion.valid_decision_actions(plan, region.region_id)
+        self.assertIn(fusion.USE_CRISPERWHISPER_TEXT, valid)
+        self.assertNotIn(fusion.USE_CRISPERWHISPER_TIMING, valid)
+        self.assertNotIn(fusion.KEEP_BOTH, valid)
+
+        decided = fusion.apply_decision(
+            plan,
+            region.region_id,
+            fusion.USE_CRISPERWHISPER_TEXT,
+        )
+        decision = next(
+            item for item in decided.regions if item.region_id == region.region_id
+        ).decision
+        self.assertEqual(decision.text_source_engine, "crisperwhisper")
+        self.assertEqual(decision.timing_source_engine, "whisperx")
+        preview = fusion.build_combined_preview(decided)
+        candidate = next(
+            item for item in preview.candidates if item.region_id == region.region_id
+        )
+        self.assertEqual(candidate.text, "seventy three thousand")
+        self.assertAlmostEqual(candidate.start, 8.18)
+        self.assertAlmostEqual(candidate.end, 8.76)
+        self.assertEqual(
+            tuple(word.text for word in candidate.words),
+            ("seventy", "three", "thousand"),
+        )
+        self.assertTrue(all(word.timing_is_derived for word in candidate.words))
+        self.assertTrue(
+            all(
+                word.timing_transformation == "proportional_region_fit"
+                for word in candidate.words
+            )
+        )
+        self.assertEqual(region.candidates[1].words, original_crisper_words)
+        self.assertTrue(
+            all(
+                word.text_source_engine == "crisperwhisper"
+                and word.timing_source_engine == "whisperx"
+                and word.speaker_source_engine == "crisperwhisper"
+                for word in candidate.words
+            )
+        )
+        self.assertTrue(
+            all(word.end - word.start >= 0.020 - 1e-9 for word in candidate.words)
+        )
+        self.assertEqual(candidate.words[0].start, candidate.start)
+        self.assertEqual(candidate.words[-1].end, candidate.end)
+        self.assertTrue(
+            all(
+                {item.source_engine for item in word.provenance}
+                == {"whisperx", "crisperwhisper"}
+                for word in candidate.words
+            )
+        )
+        self.assertTrue(
+            all(
+                any("text" in item.source_roles for item in word.provenance)
+                and any(
+                    "timing_region_reference" in item.source_roles
+                    for item in word.provenance
+                )
+                for word in candidate.words
+            )
+        )
+        with self.assertRaisesRegex(
+            fusion.FusionValidationError,
+            "overlap",
+        ):
+            fusion.apply_decision(
+                decided,
+                region.region_id,
+                fusion.USE_CRISPERWHISPER_TIMING,
+            )
+
+    def test_mixed_word_fit_fails_when_region_cannot_hold_minimum_durations(self):
+        result = self.fixture.compare(
+            [self.fixture.segment("73,000", 1.0, 1.04)],
+            [self.fixture.segment("seventy three thousand", 1.0, 1.08)],
+        )
+        plan = fusion.create_fusion_plan(result)
+        region = next(
+            item
+            for item in plan.regions
+            if item.classification == comparison.TEXT_CONFLICT
+        )
+        with self.assertRaisesRegex(
+            fusion.FusionValidationError,
+            "at least 20 ms",
+        ):
+            fusion.apply_decision(
+                plan,
+                region.region_id,
+                fusion.USE_CRISPERWHISPER_TEXT,
+            )
+
+    def test_derived_fit_preserves_source_duration_weighting(self):
+        result = self.fixture.compare(
+            [self.fixture.segment("73,000", 2.0, 2.6)],
+            [self.fixture.segment("seventy three thousand", 2.0, 3.2)],
+        )
+        conflict = next(
+            item
+            for item in result.regions
+            if item.classification == comparison.TEXT_CONFLICT
+        )
+        weighted = tuple(
+            replace(word, start=start, end=end)
+            for word, (start, end) in zip(
+                conflict.crisperwhisper_words,
+                ((2.0, 2.1), (2.1, 2.4), (2.4, 3.2)),
+            )
+        )
+        altered_conflict = replace(
+            conflict,
+            crisperwhisper_words=weighted,
+        )
+        altered = replace(
+            result,
+            regions=tuple(
+                altered_conflict if item.region_id == conflict.region_id else item
+                for item in result.regions
+            ),
+        )
+        plan = fusion.create_fusion_plan(altered)
+        decided = fusion.apply_decision(
+            plan,
+            conflict.region_id,
+            fusion.USE_CRISPERWHISPER_TEXT,
+        )
+        candidate = fusion.build_combined_preview(decided).candidates[0]
+        durations = tuple(word.end - word.start for word in candidate.words)
+        self.assertLess(durations[0], durations[1])
+        self.assertLess(durations[1], durations[2])
+        self.assertAlmostEqual(sum(durations), 0.6)
+        self.assertAlmostEqual(durations[1] / durations[0], 3.0)
+        self.assertAlmostEqual(durations[2] / durations[0], 8.0)
+
+    def test_text_and_timing_actions_preserve_the_other_dimension(self):
+        result = self.fixture.compare(
+            [self.fixture.segment("alpha", 1.0, 1.6)],
+            [self.fixture.segment("beta gamma", 2.0, 2.8)],
+        )
+        plan = fusion.create_fusion_plan(result)
+        region = next(
+            item
+            for item in plan.regions
+            if item.classification == comparison.TEXT_CONFLICT
+        )
+        timing_first = fusion.apply_decision(
+            plan,
+            region.region_id,
+            fusion.USE_CRISPERWHISPER_TIMING,
+        )
+        partial = timing_first.regions[plan.regions.index(region)]
+        self.assertFalse(partial.resolved)
+        self.assertIsNone(partial.decision.text_source_engine)
+        self.assertEqual(partial.decision.timing_source_engine, "crisperwhisper")
+        completed = fusion.apply_decision(
+            timing_first,
+            region.region_id,
+            fusion.USE_WHISPERX_TEXT,
+        )
+        completed_region = completed.regions[plan.regions.index(region)]
+        self.assertTrue(completed_region.resolved)
+        self.assertEqual(completed_region.decision.text_source_engine, "whisperx")
+        self.assertEqual(
+            completed_region.decision.timing_source_engine,
+            "crisperwhisper",
+        )
+
     def test_each_engine_only_passage_can_be_included_explicitly(self):
         cases = (
             (

@@ -919,6 +919,194 @@ class TimestampDiagnosticTests(WorkerTestCase):
         )
         self.assertEqual([chunk["chunk_index"] for chunk in candidate["chunks"]], [8, 9])
 
+    def test_real_twenty_millisecond_same_chunk_overlap_uses_bounded_cluster(self):
+        source_words = [
+            ("private-alpha", 0.98, 1.00),
+            ("private-beta", 0.98, 1.005),
+            ("private-gamma", 1.015, 1.40),
+            ("private-delta", 1.45, 1.80),
+        ]
+        candidate = worker._normalize_transcription_candidate(
+            native_result(
+                source_words,
+                duration=2.0,
+                chunks=[
+                    native_chunk(
+                        0,
+                        0.0,
+                        2.0,
+                        "private-alpha private-beta private-gamma private-delta",
+                        is_last=True,
+                    )
+                ],
+            ),
+            "verbatim",
+            model_family="medium",
+            strategy="continuation",
+        )
+
+        words = candidate["words"]
+        self.assertEqual(
+            [word["word"] for word in words],
+            [word for word, _start, _end in source_words],
+        )
+        self.assertEqual(len(words), len(source_words))
+        self.assertEqual((words[0]["start"], words[0]["end"]), (0.98, 1.00))
+        self.assertEqual((words[1]["start"], words[1]["end"]), (1.00, 1.02))
+        self.assertEqual((words[2]["start"], words[2]["end"]), (1.02, 1.40))
+        self.assertEqual((words[3]["start"], words[3]["end"]), (1.45, 1.80))
+        repairs = candidate["word_timestamp_repairs"]
+        self.assertEqual(
+            repairs["categories"],
+            {"same_chunk_overlap_cluster_reflow": 1},
+        )
+        self.assertEqual(repairs["cluster_reflows"][0]["word_count"], 2)
+        self.assertAlmostEqual(
+            repairs["cluster_reflows"][0]["max_displacement_milliseconds"],
+            20.0,
+        )
+        self.assertEqual([chunk["chunk_index"] for chunk in candidate["chunks"]], [0])
+
+    def test_same_chunk_overlap_reflows_only_one_word_when_that_is_sufficient(self):
+        candidate = worker._normalize_transcription_candidate(
+            native_result(
+                [
+                    ("private-alpha", 0.98, 1.00),
+                    ("private-beta", 0.98, 1.40),
+                    ("private-stable", 1.45, 1.80),
+                ],
+                duration=2.0,
+                chunks=[
+                    native_chunk(
+                        0,
+                        0.0,
+                        2.0,
+                        "private-alpha private-beta private-stable",
+                        is_last=True,
+                    )
+                ],
+            ),
+            "verbatim",
+            model_family="medium",
+            strategy="continuation",
+        )
+
+        words = candidate["words"]
+        self.assertEqual((words[1]["start"], words[1]["end"]), (1.00, 1.40))
+        self.assertEqual((words[2]["start"], words[2]["end"]), (1.45, 1.80))
+        cluster = candidate["word_timestamp_repairs"]["cluster_reflows"][0]
+        self.assertEqual(cluster["word_count"], 1)
+        self.assertAlmostEqual(
+            cluster["max_displacement_milliseconds"],
+            20.0,
+        )
+
+    def test_same_chunk_cluster_expands_only_until_stable_downstream_space(self):
+        candidate = worker._normalize_transcription_candidate(
+            native_result(
+                [
+                    ("private-anchor", 0.98, 1.00),
+                    ("private-one", 0.98, 1.005),
+                    ("private-two", 1.015, 1.025),
+                    ("private-three", 1.035, 1.045),
+                    ("private-stable", 1.10, 1.30),
+                ],
+                duration=2.0,
+                chunks=[
+                    native_chunk(
+                        0,
+                        0.0,
+                        2.0,
+                        "private-anchor private-one private-two private-three private-stable",
+                        is_last=True,
+                    )
+                ],
+            ),
+            "verbatim",
+            model_family="medium",
+            strategy="continuation",
+        )
+
+        words = candidate["words"]
+        self.assertEqual(
+            [(word["start"], word["end"]) for word in words[1:4]],
+            [(1.00, 1.02), (1.02, 1.04), (1.04, 1.06)],
+        )
+        self.assertEqual((words[4]["start"], words[4]["end"]), (1.10, 1.30))
+        self.assertEqual(
+            candidate["word_timestamp_repairs"]["cluster_reflows"][0]["word_count"],
+            3,
+        )
+
+    def test_same_chunk_cluster_safety_limits_remain_fatal(self):
+        fixtures = {
+            "more than eight words": (
+                [
+                    ("private-anchor", 0.98, 1.00),
+                    *[
+                        (f"private-{index}", 0.99 + index * 0.005, 0.995 + index * 0.005)
+                        for index in range(9)
+                    ],
+                ],
+                3.0,
+                "cluster_exceeds_maximum_words",
+            ),
+            "displacement exceeds tolerance": (
+                [
+                    ("private-anchor", 0.98, 1.00),
+                    ("private-one", 0.75, 0.77),
+                    ("private-two", 0.775, 0.78),
+                    ("private-stable", 1.20, 1.40),
+                ],
+                3.0,
+                "cluster_displacement_exceeds_tolerance",
+            ),
+            "duplicate range": (
+                [
+                    ("Repeat", 0.98, 1.00),
+                    ("repeat!", 0.98, 1.40),
+                ],
+                2.0,
+                "strict_token_and_time_duplicate",
+            ),
+            "timestamp reset": (
+                [
+                    ("private-anchor", 0.98, 1.00),
+                    ("private-one", 0.98, 1.005),
+                    ("private-reset", 0.70, 0.72),
+                    ("private-stable", 1.20, 1.40),
+                ],
+                2.0,
+                "timestamp_reset_within_native_chunk",
+            ),
+            "media duration boundary": (
+                [
+                    ("private-anchor", 0.98, 1.00),
+                    ("private-last", 0.98, 0.995),
+                ],
+                1.01,
+                "cluster_insufficient_available_span",
+            ),
+        }
+        for label, (words, duration, expected_reason) in fixtures.items():
+            with self.subTest(label=label):
+                details = self.rejected_details(
+                    words,
+                    [
+                        native_chunk(
+                            0,
+                            0.0,
+                            duration,
+                            " ".join(word for word, _start, _end in words),
+                            is_last=True,
+                        )
+                    ],
+                    duration=duration,
+                )
+                self.assertFalse(details["crosses_native_chunk_boundary"])
+                self.assertEqual(details["repair_failure_reason"], expected_reason)
+                self.assertNotIn("private", json.dumps(details))
+
     def test_cluster_with_insufficient_downstream_space_remains_fatal(self):
         details = self.rejected_details(
             [

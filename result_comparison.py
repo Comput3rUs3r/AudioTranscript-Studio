@@ -105,6 +105,8 @@ class RevisionMetadata:
     segments_json: Path
     speakers_sha256: str
     segments_sha256: str
+    authoritative_duration: Optional[float] = None
+    duration_source: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -181,7 +183,41 @@ class ResultComparison:
     regions: tuple[ComparisonRegion, ...]
 
 
-def _revision_metadata(descriptor: ResultDescriptor) -> RevisionMetadata:
+def _authoritative_duration(
+    descriptor: ResultDescriptor,
+    preflight: ResultPreflight,
+) -> tuple[Optional[float], Optional[str]]:
+    """Return only duration metadata that describes the source media itself."""
+
+    candidates = []
+    media_duration = preflight.segments_data.get("media_duration")
+    if descriptor.layout == "project" and isinstance(
+        media_duration, (int, float)
+    ) and not isinstance(media_duration, bool):
+        candidates.append((media_duration, "segments.media_duration"))
+
+    transcription = preflight.segments_data.get("transcription")
+    if descriptor.engine == "crisperwhisper" and isinstance(transcription, dict):
+        candidates.append(
+            (transcription.get("duration"), "segments.transcription.duration")
+        )
+
+    for value, source in candidates:
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+            and float(value) > 0.0
+        ):
+            return float(value), source
+    return None, None
+
+
+def _revision_metadata(
+    descriptor: ResultDescriptor,
+    preflight: ResultPreflight,
+) -> RevisionMetadata:
+    duration, duration_source = _authoritative_duration(descriptor, preflight)
     return RevisionMetadata(
         engine=descriptor.engine,
         result_id=descriptor.result_id,
@@ -201,6 +237,8 @@ def _revision_metadata(descriptor: ResultDescriptor) -> RevisionMetadata:
         segments_json=descriptor.segments_json,
         speakers_sha256=descriptor.speakers_sha256,
         segments_sha256=descriptor.segments_sha256,
+        authoritative_duration=duration,
+        duration_source=duration_source,
     )
 
 
@@ -961,7 +999,7 @@ def _comparison_regions(
 
 def _snapshot(descriptor: ResultDescriptor, preflight: ResultPreflight) -> TranscriptSnapshot:
     return TranscriptSnapshot(
-        revision=_revision_metadata(descriptor),
+        revision=_revision_metadata(descriptor, preflight),
         words=_extract_words(descriptor, preflight),
     )
 

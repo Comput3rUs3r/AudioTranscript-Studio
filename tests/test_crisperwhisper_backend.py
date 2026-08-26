@@ -545,6 +545,33 @@ class ProtocolTests(AdapterTestCase):
             validated["transcription"]["word_timestamp_repairs"]["cluster_reflows"],
             [{"word_count": 2, "max_displacement_milliseconds": 20.0}],
         )
+        same_chunk = make_response(settings)
+        same_chunk["transcription"]["word_timestamp_repairs"] = {
+            "repair_count": 1,
+            "categories": {"same_chunk_overlap_cluster_reflow": 1},
+            "cluster_reflows": [
+                {"word_count": 1, "max_displacement_milliseconds": 20.0}
+            ],
+            "words_remained_untimed": False,
+            "untimed_word_count": 0,
+            "warnings": ["Minor word timestamp anomalies were normalized conservatively."],
+        }
+        validated_same_chunk = backend.validate_transcribe_response(
+            same_chunk,
+            settings,
+        )
+        self.assertEqual(
+            validated_same_chunk["transcription"]["word_timestamp_repairs"][
+                "categories"
+            ],
+            {"same_chunk_overlap_cluster_reflow": 1},
+        )
+        invalid_cross_single = copy.deepcopy(clustered)
+        invalid_cross_single["transcription"]["word_timestamp_repairs"][
+            "cluster_reflows"
+        ][0]["word_count"] = 1
+        with self.assertRaises(backend.CrisperWhisperProtocolError):
+            backend.validate_transcribe_response(invalid_cross_single, settings)
         for mutate in (
             lambda metadata: metadata.pop("cluster_reflows"),
             lambda metadata: metadata["cluster_reflows"][0].update(word_count=9),

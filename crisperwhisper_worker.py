@@ -512,6 +512,7 @@ TIMESTAMP_REPAIR_FAILURE_REASONS = {
     "cluster_exceeds_maximum_words",
     "cluster_displacement_exceeds_tolerance",
     "cluster_insufficient_available_span",
+    "timestamp_reset_within_native_chunk",
     "no_positive_repair_interval",
 }
 COVERAGE_REJECTION_REASONS = {
@@ -879,7 +880,7 @@ def normalize_word_timestamps(
             None,
         )
 
-    def cross_chunk_overlap_cluster_plan(
+    def bounded_overlap_cluster_plan(
         previous_position: int,
         current_position: int,
         previous_end_value: float,
@@ -888,7 +889,7 @@ def normalize_word_timestamps(
         str | None,
         dict[str, Any],
     ]:
-        """Reflow the smallest tightly packed cluster after a chunk boundary."""
+        """Reflow the smallest tightly packed cluster after a safe overlap."""
 
         anchor = float(previous_end_value)
         cursor = anchor
@@ -964,6 +965,7 @@ def normalize_word_timestamps(
                     ),
                 )
             assignment = chunk_assignments[position]
+            previous_assignment = chunk_assignments[position - 1]
             if (
                 assignment is not None
                 and original_start
@@ -979,6 +981,28 @@ def normalize_word_timestamps(
                         duration,
                     ),
                 )
+            if (
+                assignment is not None
+                and previous_assignment is not None
+                and assignment["chunk_index"] == previous_assignment["chunk_index"]
+            ):
+                previous_original_start = parsed[position - 1].get("start")
+                if (
+                    previous_original_start is not None
+                    and original_start
+                    < float(previous_original_start)
+                    - WORD_BOUNDARY_TOLERANCE_SECONDS
+                ):
+                    return (
+                        None,
+                        "timestamp_reset_within_native_chunk",
+                        diagnostic(
+                            words_examined,
+                            max(cursor, original_start)
+                            + WORD_MIN_REPAIR_DURATION_SECONDS,
+                            duration,
+                        ),
+                    )
 
             repaired_start = max(cursor, original_start)
             repaired_end = original_end
@@ -1194,11 +1218,21 @@ def normalize_word_timestamps(
         if following_start is not None and end > following_start:
             overlap = end - following_start
             cross_boundary = False
+            same_chunk = False
             repair_plan = None
             repair_failure_reason = None
             cluster_diagnostic = None
             repair_succeeded = False
+            cluster_attempted = False
             if overlap <= WORD_BOUNDARY_TOLERANCE_SECONDS:
+                current_chunk = chunk_assignments[position]
+                following_chunk = chunk_assignments[following_position]
+                same_chunk = bool(
+                    current_chunk is not None
+                    and following_chunk is not None
+                    and current_chunk["chunk_index"]
+                    == following_chunk["chunk_index"]
+                )
                 (
                     cross_boundary,
                     repair_plan,
@@ -1220,11 +1254,12 @@ def normalize_word_timestamps(
                     "later_word_would_overlap_following_word",
                     "bounded_end_would_overlap_following_word",
                 }:
+                    cluster_attempted = True
                     (
                         cluster_plan,
                         repair_failure_reason,
                         cluster_diagnostic,
-                    ) = cross_chunk_overlap_cluster_plan(
+                    ) = bounded_overlap_cluster_plan(
                         position,
                         following_position,
                         end,
@@ -1241,7 +1276,38 @@ def normalize_word_timestamps(
                         cluster_reflows.append(cluster_diagnostic)
                         following_start = float(parsed[following_position]["start"])
                         repair_succeeded = True
-            if cross_boundary and not repair_succeeded:
+                elif (
+                    same_chunk
+                    and following_start - start
+                    < WORD_MIN_REPAIR_DURATION_SECONDS
+                ):
+                    cluster_attempted = True
+                    if following_position != position + 1:
+                        cluster_plan = None
+                        repair_failure_reason = "words_are_not_adjacent"
+                    else:
+                        (
+                            cluster_plan,
+                            repair_failure_reason,
+                            cluster_diagnostic,
+                        ) = bounded_overlap_cluster_plan(
+                            position,
+                            following_position,
+                            end,
+                        )
+                    if cluster_plan is not None:
+                        for repaired_position, repaired_start, repaired_end in cluster_plan:
+                            repaired_item = parsed[repaired_position]
+                            repaired_item["start"] = repaired_start
+                            repaired_item["end"] = repaired_end
+                        repaired(
+                            "same_chunk_overlap_cluster_reflow",
+                            parsed[following_position]["repair_actions"],
+                        )
+                        cluster_reflows.append(cluster_diagnostic)
+                        following_start = float(parsed[following_position]["start"])
+                        repair_succeeded = True
+            if (cross_boundary or cluster_attempted) and not repair_succeeded:
                 item["start"] = start
                 item["end"] = end
                 details = _timestamp_overlap_details(
@@ -1624,6 +1690,9 @@ def _emit_timestamp_overlap_status(details: dict[str, Any] | None) -> None:
         ),
         "cluster_insufficient_available_span": (
             "the cluster has insufficient downstream time"
+        ),
+        "timestamp_reset_within_native_chunk": (
+            "the cluster contains a same-chunk timestamp reset"
         ),
         "no_positive_repair_interval": "no positive repair interval is available",
     }

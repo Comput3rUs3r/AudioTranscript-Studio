@@ -281,9 +281,12 @@ def _validate_word_timestamp_repairs(value: Any) -> Optional[dict[str, Any]]:
             "Worker result untimed-word repair summary is inconsistent."
         )
     cluster_reflows = metadata.get("cluster_reflows")
-    cluster_category_count = categories.get(
-        "cross_chunk_overlap_cluster_reflow",
-        0,
+    cluster_category_count = sum(
+        categories.get(category, 0)
+        for category in (
+            "cross_chunk_overlap_cluster_reflow",
+            "same_chunk_overlap_cluster_reflow",
+        )
     )
     if cluster_reflows is None:
         if cluster_category_count:
@@ -298,6 +301,7 @@ def _validate_word_timestamp_repairs(value: Any) -> Optional[dict[str, Any]]:
             "Worker result cluster-reflow repair metadata is inconsistent."
         )
     else:
+        single_word_cluster_count = 0
         for cluster in cluster_reflows:
             if not isinstance(cluster, dict) or set(cluster) != {
                 "word_count",
@@ -311,7 +315,7 @@ def _validate_word_timestamp_repairs(value: Any) -> Optional[dict[str, Any]]:
             if (
                 isinstance(word_count, bool)
                 or not isinstance(word_count, int)
-                or not 2 <= word_count <= 8
+                or not 1 <= word_count <= 8
                 or isinstance(displacement, bool)
                 or not isinstance(displacement, (int, float))
                 or not math.isfinite(float(displacement))
@@ -320,6 +324,15 @@ def _validate_word_timestamp_repairs(value: Any) -> Optional[dict[str, Any]]:
                 raise CrisperWhisperProtocolError(
                     "Worker result cluster-reflow repair metadata is invalid."
                 )
+            if word_count == 1:
+                single_word_cluster_count += 1
+        if single_word_cluster_count > categories.get(
+            "same_chunk_overlap_cluster_reflow",
+            0,
+        ):
+            raise CrisperWhisperProtocolError(
+                "Worker result cluster-reflow repair metadata is invalid."
+            )
     warnings = metadata.get("warnings")
     if not isinstance(warnings, list) or any(
         not isinstance(warning, str)

@@ -613,6 +613,42 @@ class TimestampRepairStorageTests(unittest.TestCase):
         response["transcription"] = candidate
         return backend.validate_transcribe_response(response, self.settings)
 
+    def same_chunk_cluster_response(self):
+        native = SimpleNamespace(
+            text="private-alpha private-beta private-gamma private-delta",
+            language="en",
+            mode="verbatim",
+            duration=4.5,
+            processing_time=0.1,
+            chunks=[
+                SimpleNamespace(
+                    chunk_idx=0,
+                    start_sec=0.0,
+                    end_sec=4.5,
+                    text="private-alpha private-beta private-gamma private-delta",
+                    context=None,
+                    is_last=True,
+                    stitch_lcs_length=None,
+                    stitch_lcs_words=None,
+                )
+            ],
+            words=[
+                SimpleNamespace(word="private-alpha", start=0.98, end=1.00),
+                SimpleNamespace(word="private-beta", start=0.98, end=1.005),
+                SimpleNamespace(word="private-gamma", start=1.015, end=1.40),
+                SimpleNamespace(word="private-delta", start=1.45, end=1.80),
+            ],
+        )
+        candidate = worker._normalize_transcription_candidate(
+            native,
+            "verbatim",
+            model_family="medium",
+            strategy="continuation",
+        )
+        response = make_response(self.settings)
+        response["transcription"] = candidate
+        return backend.validate_transcribe_response(response, self.settings)
+
     def test_safe_repairs_commit_revision_with_metadata_and_one_summary_log(self):
         response = self.repaired_response()
 
@@ -721,6 +757,45 @@ class TimestampRepairStorageTests(unittest.TestCase):
         self.assertEqual(
             repairs["categories"],
             {"cross_chunk_overlap_cluster_reflow": 1},
+        )
+        self.assertEqual(repairs["cluster_reflows"][0]["word_count"], 2)
+        self.assertFalse(any(self.output_dir.rglob(".staging-*")))
+
+    def test_same_chunk_cluster_repair_commits_valid_revision(self):
+        response = self.same_chunk_cluster_response()
+
+        class SuccessfulAdapter:
+            def __init__(adapter_self, _root):
+                adapter_self.response = response
+
+            def probe(adapter_self):
+                return {}
+
+            def transcribe(adapter_self, *_args, **_kwargs):
+                return copy.deepcopy(adapter_self.response)
+
+        self.run_pipeline_with(SuccessfulAdapter)
+
+        result_dir = next(self.output_dir.glob("sample--*/crisperwhisper/*"))
+        committed = json.loads(
+            (result_dir / "segments.json").read_text(encoding="utf-8")
+        )
+        words = [
+            word
+            for segment in committed["segments"]
+            for word in segment["words"]
+        ]
+        self.assertEqual(
+            [word["word"] for word in words],
+            ["private-alpha", "private-beta", "private-gamma", "private-delta"],
+        )
+        self.assertEqual(words[0]["end"], words[1]["start"])
+        self.assertEqual(words[1]["end"], words[2]["start"])
+        self.assertEqual((words[3]["start"], words[3]["end"]), (1.45, 1.80))
+        repairs = committed["transcription"]["word_timestamp_repairs"]
+        self.assertEqual(
+            repairs["categories"],
+            {"same_chunk_overlap_cluster_reflow": 1},
         )
         self.assertEqual(repairs["cluster_reflows"][0]["word_count"], 2)
         self.assertFalse(any(self.output_dir.rglob(".staging-*")))
