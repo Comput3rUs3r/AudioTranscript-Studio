@@ -6,28 +6,35 @@ import ctypes
 import datetime as _datetime
 import hashlib
 import json
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
 import secrets
 import shutil
 import tempfile
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 from result_catalog import (
     ManifestValidationError,
     build_source_identity,
+    descriptor_from_json_pair,
     is_valid_source_identity,
+    preflight_result_pair,
     source_identities_match,
     validate_project_manifest,
     validate_result_manifest,
 )
+from result_fusion import FusionPlan, FusionPreview
+from result_comparison import ResultComparison
 
 
 PROJECT_SCHEMA_VERSION = 1
 RESULT_SCHEMA_VERSION = 1
 CACHE_SCHEMA_VERSION = 1
-SUPPORTED_ENGINES = frozenset({"whisperx", "crisperwhisper"})
+SUPPORTED_ENGINES = frozenset({"whisperx", "crisperwhisper", "combined"})
+COMBINED_SCHEMA_VERSION = 1
+FUSION_AUDIT_SCHEMA_VERSION = 1
 _IDENTITY_FIELDS = ("path", "size", "mtime_ns", "st_dev", "st_ino")
 
 
@@ -349,7 +356,7 @@ def generate_result_id(
 
 def _result_record_from_manifest(manifest, project_root: Path) -> dict[str, Any]:
     relative_root = manifest.result_root.relative_to(project_root).as_posix()
-    return {
+    record = {
         "result_id": manifest.result_id,
         "engine": manifest.engine,
         "model": manifest.model,
@@ -375,6 +382,12 @@ def _result_record_from_manifest(manifest, project_root: Path) -> dict[str, Any]
         },
         "comparison_job_id": manifest.comparison_job_id,
     }
+    if manifest.engine == "combined" and manifest.fusion_json is not None:
+        record["paths"]["fusion"] = (
+            manifest.fusion_json.relative_to(project_root).as_posix()
+        )
+        record["fingerprint"]["fusion"] = manifest.fusion_sha256
+    return record
 
 
 def _discover_result_manifests(project_root: Path):
@@ -530,6 +543,7 @@ class ResultRevision:
         status: str,
         coverage: Optional[Mapping[str, Any]],
         comparison_job_id: Optional[str],
+        manifest_extras: Optional[Mapping[str, Any]],
     ) -> dict[str, Any]:
         speakers_path = self.output_root / "speakers.json"
         segments_path = self.output_root / "segments.json"
@@ -538,6 +552,8 @@ class ResultRevision:
             raise ValueError("Result revision status must be complete or incomplete.")
         if normalized_status == "incomplete" and self.engine != "crisperwhisper":
             raise ValueError("Only CrisperWhisper revisions may be incomplete.")
+        if self.engine == "combined" and normalized_status != "complete":
+            raise ValueError("Combined revisions must have Complete status.")
         manifest = {
             "schema_version": RESULT_SCHEMA_VERSION,
             "project_id": self.layout.project_id,
@@ -567,6 +583,28 @@ class ResultRevision:
         }
         if coverage is not None:
             manifest["coverage"] = dict(coverage)
+        if manifest_extras:
+            extras = dict(manifest_extras)
+            protected = set(manifest) - {"paths", "fingerprint"}
+            conflicts = protected.intersection(extras)
+            if conflicts:
+                raise ValueError(
+                    "Combined manifest extras cannot replace required fields: "
+                    + ", ".join(sorted(conflicts))
+                )
+            extra_paths = extras.pop("paths", {})
+            extra_fingerprints = extras.pop("fingerprint", {})
+            if not isinstance(extra_paths, Mapping) or not isinstance(
+                extra_fingerprints, Mapping
+            ):
+                raise ValueError("Manifest path and fingerprint extras must be mappings.")
+            if {"speakers", "segments"}.intersection(extra_paths):
+                raise ValueError("Manifest extras cannot replace required JSON paths.")
+            if {"algorithm", "speakers", "segments"}.intersection(extra_fingerprints):
+                raise ValueError("Manifest extras cannot replace required fingerprints.")
+            manifest["paths"].update(dict(extra_paths))
+            manifest["fingerprint"].update(dict(extra_fingerprints))
+            manifest.update(extras)
         return manifest
 
     def commit(
@@ -579,6 +617,8 @@ class ResultRevision:
         coverage: Optional[Mapping[str, Any]] = None,
         comparison_job_id: Optional[str] = None,
         validate_outputs: Optional[Callable[[Path], None]] = None,
+        manifest_extras: Optional[Mapping[str, Any]] = None,
+        pre_commit_check: Optional[Callable[[], None]] = None,
     ) -> Path:
         if self.committed:
             raise RuntimeError("Result revision has already been committed.")
@@ -599,10 +639,13 @@ class ResultRevision:
             status=status,
             coverage=coverage,
             comparison_job_id=comparison_job_id,
+            manifest_extras=manifest_extras,
         )
         result_path = self.output_root / "result.json"
         _atomic_write_json(result_path, manifest_data)
         validate_result_manifest(result_path, project_root=self.staging_root)
+        if pre_commit_check is not None:
+            pre_commit_check()
         current_source_identity = build_source_identity(self.layout.source_path)
         if not source_identities_match(
             self.layout.source_identity,
@@ -647,6 +690,656 @@ class ResultRevision:
         if not self.committed:
             self._cleanup_empty_parents()
         return False
+
+
+@dataclass(frozen=True)
+class CombinedRevisionCommit:
+    result_root: Path
+    result_id: str
+    speakers_json: Path
+    segments_json: Path
+    fusion_json: Path
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, _datetime.datetime):
+        return utc_now_text(value)
+    return value
+
+
+def _revision_manifest_sha256(revision) -> Optional[str]:
+    path = Path(revision.speakers_json).parent / "result.json"
+    return _sha256_file(path) if path.is_file() else None
+
+
+def _source_revision_record(revision, descriptor) -> dict[str, Any]:
+    coverage = revision.coverage
+    coverage_data = None
+    if coverage is not None:
+        coverage_data = {
+            "coverage_complete": coverage.coverage_complete,
+            "remaining_speech_active_gap_count": (
+                coverage.remaining_speech_active_gap_count
+            ),
+            "remaining_speech_active_gap_duration": (
+                coverage.remaining_speech_active_gap_duration
+            ),
+            "remaining_speech_active_gap_ranges": _json_safe(
+                coverage.remaining_speech_active_gap_ranges
+            ),
+            "selected_strategy": coverage.selected_strategy,
+        }
+    return {
+        "revision_id": revision.result_id,
+        "project_id": revision.project_id,
+        "engine": revision.engine,
+        "model": revision.model,
+        "mode": revision.mode,
+        "execution_backend": revision.execution_backend,
+        "status": revision.status,
+        "created_at": (
+            utc_now_text(revision.created_at)
+            if revision.created_at is not None
+            else None
+        ),
+        "updated_at": (
+            utc_now_text(revision.modified_at)
+            if revision.modified_at is not None
+            else None
+        ),
+        "comparison_job_id": revision.comparison_job_id,
+        "fingerprints": {
+            "algorithm": "sha256",
+            "speakers": revision.speakers_sha256,
+            "segments": revision.segments_sha256,
+            "result_manifest": _revision_manifest_sha256(revision),
+        },
+        "source_state_at_save": descriptor.source_state,
+        "coverage": coverage_data,
+    }
+
+
+def _revalidate_combined_sources(
+    comparison: ResultComparison,
+    plan: FusionPlan,
+) -> tuple[Any, Any]:
+    if not isinstance(comparison, ResultComparison) or not isinstance(plan, FusionPlan):
+        raise ValueError("A Combined save requires the exact comparison and fusion plan.")
+    if comparison.pair_id != plan.pair_identity.comparison_pair_id:
+        raise RuntimeError("The Combined Draft no longer matches its comparison pair.")
+
+    validated = []
+    expected_pairs = (
+        (comparison.whisperx.revision, plan.pair_identity.whisperx_revision),
+        (
+            comparison.crisperwhisper.revision,
+            plan.pair_identity.crisperwhisper_revision,
+        ),
+    )
+    for revision, expected in expected_pairs:
+        try:
+            descriptor = descriptor_from_json_pair(
+                revision.speakers_json,
+                revision.segments_json,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"The {revision.engine} source revision is unavailable or invalid: {exc}"
+            ) from exc
+        current = (
+            descriptor.engine,
+            descriptor.result_id,
+            descriptor.project_id,
+            descriptor.speakers_sha256,
+            descriptor.segments_sha256,
+            descriptor.comparison_job_id,
+            descriptor.status,
+        )
+        retained = (
+            expected.engine,
+            expected.result_id,
+            expected.project_id,
+            expected.speakers_sha256,
+            expected.segments_sha256,
+            expected.comparison_job_id,
+            expected.status,
+        )
+        if current != retained:
+            raise RuntimeError(
+                f"The {revision.engine} source revision changed after the draft was built."
+            )
+        if tuple(sorted(dict(descriptor.source_identity or {}).items())) != (
+            plan.pair_identity.source_identity
+        ):
+            raise RuntimeError("A source revision no longer matches the exact media identity.")
+        validated.append(descriptor)
+
+    whisper, crisper = validated
+    if whisper.engine != "whisperx" or crisper.engine != "crisperwhisper":
+        raise RuntimeError("Combined storage requires one WhisperX and one CrisperWhisper revision.")
+    if not source_identities_match(whisper.source_identity, crisper.source_identity):
+        raise RuntimeError("The source revisions no longer share a strict media identity.")
+    if (
+        whisper.project_id is not None
+        and crisper.project_id is not None
+        and whisper.project_id != crisper.project_id
+    ):
+        raise RuntimeError("The source revisions no longer belong to the same project.")
+    source_path = whisper.source_path or crisper.source_path
+    current_identity = build_source_identity(source_path)
+    if not source_identities_match(whisper.source_identity, current_identity):
+        raise RuntimeError(
+            "The original media changed or became unavailable after the draft was built."
+        )
+    return whisper, crisper
+
+
+_CLOSING_PUNCTUATION = frozenset(",.!?;:%)]}\u2019'\"")
+
+
+def _join_combined_words(words: Iterable[Any]) -> str:
+    text = ""
+    for word in words:
+        value = str(word.text)
+        if not value:
+            continue
+        if not text:
+            text = value.strip()
+        elif value[:1].isspace() or value[:1] in _CLOSING_PUNCTUATION:
+            text += value
+        else:
+            text += " " + value
+    return text.strip()
+
+
+def _combined_segments(
+    preview: FusionPreview,
+    *,
+    authoritative_duration: Optional[float],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    segments = []
+    audit_words = []
+    previous_end = None
+    combined_ordinal = 0
+    for candidate in preview.candidates:
+        if candidate.text and not candidate.words:
+            raise RuntimeError(
+                f"Fusion region {candidate.region_id} contains text without word evidence."
+            )
+        if _join_combined_words(candidate.words) != candidate.text:
+            raise RuntimeError(
+                f"Fusion region {candidate.region_id} text differs from its selected words."
+            )
+        serialized_words = []
+        for word in candidate.words:
+            if (
+                isinstance(word.start, bool)
+                or not isinstance(word.start, (int, float))
+                or isinstance(word.end, bool)
+                or not isinstance(word.end, (int, float))
+                or not math.isfinite(float(word.start))
+                or not math.isfinite(float(word.end))
+            ):
+                raise RuntimeError("Combined words must have finite start and end timestamps.")
+            start = float(word.start)
+            end = float(word.end)
+            if start < 0.0 or end <= start:
+                raise RuntimeError("Combined words must have positive timestamps within the media timeline.")
+            if previous_end is not None and start < previous_end - 1e-9:
+                raise RuntimeError("Combined words must be chronological and nonoverlapping.")
+            if authoritative_duration is not None and end > authoritative_duration + 0.001:
+                raise RuntimeError("Combined words exceed the authoritative media duration.")
+            previous_end = end
+            speaker_id = str(word.speaker_id or "").strip() or None
+            serialized_word = {
+                "word": word.text,
+                "start": start,
+                "end": end,
+            }
+            if speaker_id:
+                serialized_word["speaker"] = speaker_id
+            serialized_words.append(serialized_word)
+            audit_words.append(
+                {
+                    "combined_word_ordinal": combined_ordinal,
+                    "text": word.text,
+                    "start": start,
+                    "end": end,
+                    "speaker_id": speaker_id,
+                    "speaker_name": word.speaker_name,
+                    "text_source": word.text_source_engine,
+                    "timing_source": word.timing_source_engine,
+                    "speaker_source": word.speaker_source_engine,
+                    "speaker_decision_source": word.speaker_decision_source,
+                    "timing": {
+                        "kind": "derived" if word.timing_is_derived else "native",
+                        "transformation": word.timing_transformation,
+                    },
+                    "source_word_references": [
+                        {
+                            "engine": item.source_engine,
+                            "revision_id": item.revision_id,
+                            "speakers_sha256": item.speakers_sha256,
+                            "segments_sha256": item.segments_sha256,
+                            "segment_index": item.segment_index,
+                            "word_index": item.word_index,
+                            "ordinal": item.ordinal,
+                            "text": item.original_text,
+                            "start": item.original_start,
+                            "end": item.original_end,
+                            "speaker_id": item.original_speaker_id,
+                            "speaker_name": item.original_speaker_name,
+                            "classification": item.comparison_classification,
+                            "decision_source": item.decision_source,
+                            "source_roles": list(item.source_roles),
+                        }
+                        for item in word.provenance
+                    ],
+                }
+            )
+            combined_ordinal += 1
+        if not serialized_words:
+            continue
+        segment_start = serialized_words[0]["start"]
+        segment_end = serialized_words[-1]["end"]
+        segment_speaker = serialized_words[0].get("speaker")
+        segment = {
+            "start": segment_start,
+            "end": segment_end,
+            "text": candidate.text,
+            "words": serialized_words,
+            "fusion_region_id": candidate.region_id,
+            "fusion_candidate_id": candidate.candidate_id,
+        }
+        if segment_speaker:
+            segment["speaker"] = segment_speaker
+        segments.append(segment)
+    if not segments or not audit_words:
+        raise RuntimeError("A Combined result cannot be saved without timed transcript words.")
+    if "\n".join(segment["text"] for segment in segments) != preview.text:
+        raise RuntimeError("Serialized Combined segments differ from the validated clean preview.")
+    return segments, audit_words
+
+
+def _decision_data(decision: Any) -> Optional[dict[str, Any]]:
+    if decision is None:
+        return None
+    return {
+        "region_id": decision.region_id,
+        "action": decision.action,
+        "selected_candidate_ids": list(decision.selected_candidate_ids),
+        "decision_source": decision.decision_source,
+        "sequence": decision.sequence,
+        "text_source": decision.text_source_engine,
+        "timing_source": decision.timing_source_engine,
+        "speaker_source": decision.speaker_source_engine,
+        "text_decision_source": decision.text_decision_source,
+        "timing_decision_source": decision.timing_decision_source,
+    }
+
+
+def _fusion_summary(plan: FusionPlan, preview: FusionPreview) -> dict[str, Any]:
+    decisions = [
+        region.decision
+        for region in plan.regions
+        if region.decision is not None
+    ]
+    omitted = sum(
+        decision.action in {"omit_engine_only_passage", "omit_both"}
+        for decision in decisions
+    )
+    included = sum(
+        decision.action == "include_engine_only_passage"
+        for decision in decisions
+    )
+    derived = sum(word.timing_is_derived for word in preview.words)
+    return {
+        "automatic_decision_count": plan.summary.automatically_resolved_region_count,
+        "explicit_decision_count": plan.summary.explicitly_resolved_region_count,
+        "omitted_region_count": omitted,
+        "included_engine_only_count": included,
+        "derived_timing_word_count": derived,
+        "warning_count": len(plan.warnings),
+        "unresolved_count": plan.summary.unresolved_region_count,
+    }
+
+
+def _fusion_audit_data(
+    *,
+    result_id: str,
+    created_at: str,
+    comparison: ResultComparison,
+    plan: FusionPlan,
+    preview: FusionPreview,
+    source_revisions: Mapping[str, Any],
+    mapping_audit: Mapping[str, Any],
+    audit_words: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    regions = []
+    for region in plan.regions:
+        regions.append(
+            {
+                "region_id": region.region_id,
+                "classification": region.classification,
+                "automatically_resolved": region.automatically_resolved,
+                "warning": region.warning,
+                "final_decision": _decision_data(region.decision),
+                "candidates": [
+                    {
+                        "candidate_id": candidate.candidate_id,
+                        "role": candidate.role,
+                        "source_engine": candidate.source_engine,
+                        "supporting_engines": list(candidate.supporting_engines),
+                        "text": candidate.text,
+                        "start": candidate.start,
+                        "end": candidate.end,
+                        "text_source": candidate.text_source_engine,
+                        "timing_source": candidate.timing_source_engine,
+                        "speaker_source": candidate.speaker_source_engine,
+                    }
+                    for candidate in region.candidates
+                ],
+            }
+        )
+    summary = _fusion_summary(plan, preview)
+    return {
+        "schema_version": FUSION_AUDIT_SCHEMA_VERSION,
+        "result_id": result_id,
+        "engine": "combined",
+        "comparison_pair_id": plan.pair_identity.comparison_pair_id,
+        "comparison_job_id": plan.pair_identity.comparison_job_id,
+        "created_at": created_at,
+        "source_revisions": _json_safe(source_revisions),
+        "regions": regions,
+        "decision_history": [
+            _decision_data(decision) for decision in plan.decision_history
+        ],
+        "speaker_mappings": _json_safe(mapping_audit),
+        "per_word_provenance": _json_safe(audit_words),
+        "omitted_region_ids": [
+            region.region_id
+            for region in plan.regions
+            if region.decision is not None
+            and region.decision.action in {"omit_engine_only_passage", "omit_both"}
+        ],
+        "included_engine_only_region_ids": [
+            region.region_id
+            for region in plan.regions
+            if region.decision is not None
+            and region.decision.action == "include_engine_only_passage"
+        ],
+        "source_coverage_warnings": list(plan.warnings),
+        "authoritative_duration": {
+            "seconds": plan.authoritative_media_duration,
+            "authoritative": plan.authoritative_media_duration is not None,
+            "source": plan.authoritative_duration_source,
+            "known_transcript_bound": plan.known_transcript_bound,
+        },
+        "validation": {
+            "final_ready": preview.final_ready,
+            "provisional": preview.provisional,
+            "chronology_valid": True,
+            "word_count": len(preview.words),
+            **summary,
+        },
+    }
+
+
+def _write_json_file(path: Path, data: Mapping[str, Any]) -> None:
+    path.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _validate_combined_staging(
+    output_root: Path,
+    *,
+    title: str,
+    expected_text: str,
+    output_files: Mapping[str, Path],
+) -> None:
+    preflight = preflight_result_pair(
+        output_root / "speakers.json",
+        output_root / "segments.json",
+    )
+    serialized_text = "\n".join(
+        str(segment.get("text") or "")
+        for segment in preflight.segments_data["segments"]
+    )
+    if serialized_text != expected_text:
+        raise RuntimeError("Staged Combined transcript differs from the validated draft.")
+    fusion_path = output_root / "fusion.json"
+    fusion_data = _read_json_object(fusion_path, "fusion.json")
+    if (
+        fusion_data.get("schema_version") != FUSION_AUDIT_SCHEMA_VERSION
+        or fusion_data.get("engine") != "combined"
+        or not fusion_data.get("validation", {}).get("final_ready")
+    ):
+        raise RuntimeError("Staged fusion.json did not pass validation.")
+    for required in ("srt", "txt"):
+        if required not in output_files:
+            raise RuntimeError(f"Combined storage did not create the required {required.upper()} output.")
+    for name, path in output_files.items():
+        resolved = Path(path).resolve()
+        if resolved.parent != output_root.resolve() or not resolved.is_file():
+            raise RuntimeError(f"Staged Combined output {name!r} is missing or unsafe.")
+        raw = resolved.read_bytes()
+        if not raw:
+            raise RuntimeError(f"Staged Combined output {name!r} is empty.")
+        try:
+            raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RuntimeError(f"Staged Combined output {name!r} is not UTF-8.") from exc
+
+
+def save_combined_revision(
+    *,
+    output_root: Path | str,
+    comparison: ResultComparison,
+    plan: FusionPlan,
+    preview: FusionPreview,
+    canonical_speakers: Sequence[Mapping[str, Any]],
+    mapping_audit: Mapping[str, Any],
+    write_exports: Callable[
+        [Path, str, Sequence[Mapping[str, Any]], Mapping[str, str]],
+        Mapping[str, Path | str],
+    ],
+    result_id: Optional[str] = None,
+) -> CombinedRevisionCommit:
+    """Atomically persist one explicitly validated, exact-pair Combined result."""
+
+    if not isinstance(preview, FusionPreview) or preview.provisional or not preview.final_ready:
+        raise RuntimeError("Only a final-ready Combined Draft can be saved.")
+    if not plan.ready_for_final_generation or plan.summary.unresolved_region_count:
+        raise RuntimeError("The Combined Draft still has unresolved regions.")
+    if preview.pair_identity != plan.pair_identity:
+        raise RuntimeError("The validated preview no longer matches its fusion plan.")
+
+    whisper_descriptor, crisper_descriptor = _revalidate_combined_sources(
+        comparison,
+        plan,
+    )
+    source_path = whisper_descriptor.source_path or crisper_descriptor.source_path
+    title = comparison.whisperx.revision.display_title
+    layout = project_layout_for_source(output_root, title, source_path)
+    if plan.pair_identity.project_id and layout.project_id != plan.pair_identity.project_id:
+        raise RuntimeError("The current project identity differs from the fusion pair.")
+
+    source_revisions = {
+        "whisperx": _source_revision_record(
+            comparison.whisperx.revision,
+            whisper_descriptor,
+        ),
+        "crisperwhisper": _source_revision_record(
+            comparison.crisperwhisper.revision,
+            crisper_descriptor,
+        ),
+    }
+    segments, audit_words = _combined_segments(
+        preview,
+        authoritative_duration=plan.authoritative_media_duration,
+    )
+    actual_speaker_ids = []
+    actual_names = {}
+    for word in preview.words:
+        speaker_id = str(word.speaker_id or "").strip()
+        if speaker_id and speaker_id not in actual_speaker_ids:
+            actual_speaker_ids.append(speaker_id)
+        if speaker_id and word.speaker_name:
+            actual_names.setdefault(speaker_id, str(word.speaker_name))
+    for speaker in canonical_speakers:
+        speaker_id = str(speaker.get("speaker_id") or "").strip()
+        if not speaker_id:
+            raise RuntimeError("Combined speaker records must have a speaker ID.")
+        if speaker_id not in actual_speaker_ids:
+            actual_speaker_ids.append(speaker_id)
+        name = str(speaker.get("name") or "").strip()
+        if name:
+            actual_names[speaker_id] = name
+
+    model_label = " + ".join(
+        (
+            comparison.whisperx.revision.model or "WhisperX model unknown",
+            comparison.crisperwhisper.revision.model or "CrisperWhisper model unknown",
+        )
+    )
+    with ResultRevision(
+        layout,
+        "combined",
+        result_id=result_id,
+    ) as revision:
+        segments_data = {
+            "title": title,
+            "source_path": str(layout.source_path),
+            "source_identity": dict(layout.source_identity),
+            "segments": segments,
+            "transcription": {
+                "engine": "combined",
+                "model": model_label,
+                "mode": "User-reviewed fusion",
+                "source_revision_ids": {
+                    "whisperx": comparison.whisperx.revision.result_id,
+                    "crisperwhisper": comparison.crisperwhisper.revision.result_id,
+                },
+                "comparison_pair_id": plan.pair_identity.comparison_pair_id,
+                "fusion_manifest": "fusion.json",
+            },
+            "media_duration": plan.authoritative_media_duration,
+            "media_duration_authoritative": plan.authoritative_media_duration is not None,
+            "media_duration_source": plan.authoritative_duration_source,
+        }
+        speakers_data = {
+            "title": title,
+            "diarization": bool(actual_speaker_ids),
+            "speakers": actual_speaker_ids,
+            "names": actual_names,
+            "engine": "combined",
+            "fusion_manifest": "fusion.json",
+        }
+        fusion_data = _fusion_audit_data(
+            result_id=revision.result_id,
+            created_at=revision.created_at,
+            comparison=comparison,
+            plan=plan,
+            preview=preview,
+            source_revisions=source_revisions,
+            mapping_audit=mapping_audit,
+            audit_words=audit_words,
+        )
+        _write_json_file(revision.output_root / "segments.json", segments_data)
+        _write_json_file(revision.output_root / "speakers.json", speakers_data)
+        _write_json_file(revision.output_root / "fusion.json", fusion_data)
+
+        output_values = write_exports(
+            revision.output_root,
+            title,
+            segments,
+            actual_names,
+        )
+        if not isinstance(output_values, Mapping):
+            raise RuntimeError("Combined export writer did not return an output mapping.")
+        output_files = {
+            str(name): (
+                Path(value)
+                if Path(value).is_absolute()
+                else revision.output_root / Path(value)
+            )
+            for name, value in output_values.items()
+        }
+        _validate_combined_staging(
+            revision.output_root,
+            title=title,
+            expected_text=preview.text,
+            output_files=output_files,
+        )
+        output_manifest = {
+            name: {
+                "path": path.name,
+                "sha256": _sha256_file(path),
+            }
+            for name, path in sorted(output_files.items())
+        }
+        summary = _fusion_summary(plan, preview)
+        manifest_extras = {
+            "paths": {"fusion": "fusion.json"},
+            "fingerprint": {
+                "fusion": _sha256_file(revision.output_root / "fusion.json")
+            },
+            "outputs": output_manifest,
+            "combined": {
+                "schema_version": COMBINED_SCHEMA_VERSION,
+                "comparison_pair_id": plan.pair_identity.comparison_pair_id,
+                "comparison_job_id": plan.pair_identity.comparison_job_id,
+                "source_revisions": source_revisions,
+                "source_state_at_save": {
+                    "whisperx": whisper_descriptor.source_state,
+                    "crisperwhisper": crisper_descriptor.source_state,
+                },
+                "authoritative_duration": {
+                    "seconds": plan.authoritative_media_duration,
+                    "authoritative": plan.authoritative_media_duration is not None,
+                    "source": plan.authoritative_duration_source,
+                },
+                "fusion_summary": summary,
+                "source_coverage_warnings": list(plan.warnings),
+            },
+        }
+
+        def exact_pair_check() -> None:
+            _revalidate_combined_sources(comparison, plan)
+
+        final_root = revision.commit(
+            model=model_label,
+            mode="User-reviewed fusion",
+            execution_backend=None,
+            status="complete",
+            comparison_job_id=plan.pair_identity.comparison_job_id,
+            manifest_extras=manifest_extras,
+            validate_outputs=lambda root: _validate_combined_staging(
+                root,
+                title=title,
+                expected_text=preview.text,
+                output_files={
+                    name: root / path.name for name, path in output_files.items()
+                },
+            ),
+            pre_commit_check=exact_pair_check,
+        )
+
+    return CombinedRevisionCommit(
+        result_root=final_root,
+        result_id=revision.result_id,
+        speakers_json=final_root / "speakers.json",
+        segments_json=final_root / "segments.json",
+        fusion_json=final_root / "fusion.json",
+    )
 
 
 def cache_paths(
@@ -758,6 +1451,7 @@ def build_apply_manifest_updates(
     result_root: Path | str,
     staged_speakers_json: Path | str,
     staged_segments_json: Path | str,
+    staged_output_files: Optional[Mapping[Path | str, Path | str]] = None,
 ) -> tuple[tuple[Path, dict[str, Any]], ...]:
     """Build fingerprint updates for a transactional Review Apply."""
 
@@ -768,12 +1462,44 @@ def build_apply_manifest_updates(
     current = validate_result_manifest(result_path)
     result_data = _read_json_object(result_path, "result.json")
     timestamp = utc_now_text()
-    fingerprints = {
-        "algorithm": "sha256",
-        "speakers": _sha256_file(Path(staged_speakers_json)),
-        "segments": _sha256_file(Path(staged_segments_json)),
-    }
+    existing_fingerprints = result_data.get("fingerprint")
+    fingerprints = (
+        dict(existing_fingerprints)
+        if isinstance(existing_fingerprints, dict)
+        else {}
+    )
+    fingerprints.update(
+        {
+            "algorithm": "sha256",
+            "speakers": _sha256_file(Path(staged_speakers_json)),
+            "segments": _sha256_file(Path(staged_segments_json)),
+        }
+    )
     result_data["fingerprint"] = fingerprints
+    if current.engine == "combined" and staged_output_files:
+        outputs = result_data.get("outputs")
+        if not isinstance(outputs, dict):
+            raise ManifestValidationError(
+                "Combined result.json outputs metadata is malformed."
+            )
+        staged_by_target = {
+            Path(target).resolve(): Path(staged).resolve()
+            for target, staged in staged_output_files.items()
+        }
+        for output_record in outputs.values():
+            if not isinstance(output_record, dict):
+                raise ManifestValidationError(
+                    "Combined result.json output metadata is malformed."
+                )
+            relative = output_record.get("path")
+            if not isinstance(relative, str):
+                raise ManifestValidationError(
+                    "Combined result.json output path is malformed."
+                )
+            target = (result_root / relative).resolve()
+            staged = staged_by_target.get(target)
+            if staged is not None:
+                output_record["sha256"] = _sha256_file(staged)
     result_data["updated_at"] = timestamp
     updates = [(result_path, result_data)]
 
@@ -801,6 +1527,9 @@ def build_apply_manifest_updates(
 
 __all__ = [
     "CACHE_SCHEMA_VERSION",
+    "COMBINED_SCHEMA_VERSION",
+    "CombinedRevisionCommit",
+    "FUSION_AUDIT_SCHEMA_VERSION",
     "PROJECT_SCHEMA_VERSION",
     "ProjectLayout",
     "RESULT_SCHEMA_VERSION",
@@ -815,6 +1544,7 @@ __all__ = [
     "generate_result_id",
     "project_id_for_identity",
     "project_layout_for_source",
+    "save_combined_revision",
     "source_identity_hash",
     "utc_now_text",
     "verify_cached_wav",

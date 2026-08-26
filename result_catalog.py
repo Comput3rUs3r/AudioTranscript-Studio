@@ -21,7 +21,7 @@ from typing import Any, Iterable, Mapping, Optional
 PROJECT_SCHEMA_VERSION = 1
 RESULT_SCHEMA_VERSION = 1
 SOURCE_IDENTITY_FIELDS = ("path", "size", "mtime_ns", "st_dev", "st_ino")
-SUPPORTED_ENGINES = frozenset({"whisperx", "crisperwhisper"})
+SUPPORTED_ENGINES = frozenset({"whisperx", "crisperwhisper", "combined"})
 SUPPORTED_LAYOUTS = frozenset({"project", "legacy"})
 SUPPORTED_SOURCE_STATES = frozenset({"available", "missing", "changed", "unverified"})
 SUPPORTED_RESULT_STATUSES = frozenset({"complete", "failed", "incomplete", "processing"})
@@ -210,6 +210,9 @@ class ResultManifest:
     speakers_sha256: str
     segments_sha256: str
     comparison_job_id: Optional[str]
+    fusion_json: Optional[Path] = None
+    fusion_sha256: Optional[str] = None
+    output_files: tuple[tuple[str, Path, str], ...] = ()
 
 
 def _is_sha256(value: Any) -> bool:
@@ -409,7 +412,7 @@ def _validate_engine(value: Any, label: str) -> str:
     engine = _required_string(value, label).lower()
     if engine not in SUPPORTED_ENGINES:
         raise ManifestValidationError(
-            f"{label} must be 'whisperx' or 'crisperwhisper'."
+            f"{label} must be 'whisperx', 'crisperwhisper', or 'combined'."
         )
     return engine
 
@@ -763,6 +766,101 @@ def validate_result_manifest(
     speakers_sha256, segments_sha256 = _manifest_fingerprints(
         data.get("fingerprint"), "result.json fingerprint"
     )
+    fusion_json = None
+    fusion_sha256 = None
+    output_files = ()
+    if engine == "combined":
+        if status != "complete":
+            raise ManifestValidationError(
+                "A Combined result must have Complete status."
+            )
+        fusion_json = _safe_relative_path(
+            result_root,
+            paths.get("fusion"),
+            resolved_project_root,
+            "result.json paths.fusion",
+        )
+        if fusion_json.parent != result_root or fusion_json.name != "fusion.json":
+            raise ManifestValidationError(
+                "result.json paths.fusion must name fusion.json in the result directory."
+            )
+        fingerprint_data = data.get("fingerprint")
+        fusion_sha256 = (
+            fingerprint_data.get("fusion")
+            if isinstance(fingerprint_data, dict)
+            else None
+        )
+        if not _is_sha256(fusion_sha256):
+            raise ManifestValidationError(
+                "result.json fingerprint.fusion must be a SHA-256 fingerprint."
+            )
+        if not fusion_json.is_file():
+            raise ManifestValidationError("Combined result is missing fusion.json.")
+        _fusion_data, current_fusion_sha256 = _read_json_object(
+            fusion_json,
+            "fusion.json",
+            ManifestValidationError,
+        )
+        if current_fusion_sha256 != fusion_sha256:
+            raise ManifestValidationError(
+                "result.json fusion fingerprint does not match fusion.json."
+            )
+        combined_data = data.get("combined")
+        if not isinstance(combined_data, dict):
+            raise ManifestValidationError(
+                "A Combined result must contain combined metadata."
+            )
+        if combined_data.get("schema_version") != 1:
+            raise ManifestValidationError(
+                "result.json combined.schema_version must be 1."
+            )
+        pair_id = combined_data.get("comparison_pair_id")
+        if not _is_sha256(pair_id):
+            raise ManifestValidationError(
+                "result.json combined.comparison_pair_id is invalid."
+            )
+        source_revisions = combined_data.get("source_revisions")
+        if not isinstance(source_revisions, dict) or set(source_revisions) != {
+            "whisperx",
+            "crisperwhisper",
+        }:
+            raise ManifestValidationError(
+                "result.json combined.source_revisions must identify both engines."
+            )
+        outputs = data.get("outputs")
+        if not isinstance(outputs, dict) or not {"srt", "txt"}.issubset(outputs):
+            raise ManifestValidationError(
+                "A Combined result must index SRT and TXT outputs."
+            )
+        validated_outputs = []
+        for output_name, output_record in outputs.items():
+            label = f"result.json outputs.{output_name}"
+            if not isinstance(output_name, str) or not output_name.strip():
+                raise ManifestValidationError("result.json output names are invalid.")
+            if not isinstance(output_record, dict):
+                raise ManifestValidationError(f"{label} must be an object.")
+            output_path = _safe_relative_path(
+                result_root,
+                output_record.get("path"),
+                resolved_project_root,
+                f"{label}.path",
+            )
+            output_sha256 = output_record.get("sha256")
+            if output_path.parent != result_root or not _is_sha256(output_sha256):
+                raise ManifestValidationError(f"{label} is invalid.")
+            if not output_path.is_file():
+                raise ManifestValidationError(f"{label} is missing.")
+            try:
+                with output_path.open("rb") as output_file:
+                    digest = hashlib.sha256()
+                    for block in iter(lambda: output_file.read(1024 * 1024), b""):
+                        digest.update(block)
+            except OSError as exc:
+                raise ManifestValidationError(f"Could not read {label}: {exc}") from exc
+            if digest.hexdigest() != output_sha256:
+                raise ManifestValidationError(f"{label} fingerprint does not match.")
+            validated_outputs.append((output_name, output_path, output_sha256))
+        output_files = tuple(validated_outputs)
     return ResultManifest(
         path=manifest_path,
         project_root=resolved_project_root,
@@ -789,6 +887,9 @@ def validate_result_manifest(
         comparison_job_id=_optional_string(
             data.get("comparison_job_id"), "result.json comparison_job_id"
         ),
+        fusion_json=fusion_json,
+        fusion_sha256=fusion_sha256,
+        output_files=output_files,
     )
 
 
