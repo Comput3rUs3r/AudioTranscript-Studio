@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 import shutil
 import tempfile
@@ -135,20 +136,44 @@ class CombinedStorageFixture:
     def save(self, comparison, plan=None, preview=None, **kwargs):
         plan = plan or result_fusion.create_fusion_plan(comparison)
         preview = preview or result_fusion.build_combined_preview(plan)
+        map_crisper = kwargs.pop("map_crisper", True)
+        if map_crisper:
+            candidates = tuple(
+                replace(
+                    candidate,
+                    words=tuple(
+                        replace(
+                            word,
+                            speaker_id="SPEAKER_00",
+                            speaker_name="Howard",
+                            speaker_decision_source="automatic_unique_name",
+                        )
+                        if word.speaker_source_engine == "crisperwhisper"
+                        else word
+                        for word in candidate.words
+                    ),
+                )
+                for candidate in preview.candidates
+            )
+            preview = replace(
+                preview,
+                candidates=candidates,
+                words=tuple(word for candidate in candidates for word in candidate.words),
+            )
         return result_storage.save_combined_revision(
             output_root=self.output,
             comparison=comparison,
             plan=plan,
             preview=preview,
-            canonical_speakers=(
+            canonical_speakers=kwargs.pop("canonical_speakers", (
                 {
                     "speaker_id": "SPEAKER_00",
                     "name": "Howard",
                     "created_for_combined": False,
                     "decision_source": "whisperx_canonical",
                 },
-            ),
-            mapping_audit={
+            )),
+            mapping_audit=kwargs.pop("mapping_audit", {
                 "canonical_speakers": [
                     {
                         "speaker_id": "SPEAKER_00",
@@ -156,9 +181,16 @@ class CombinedStorageFixture:
                         "decision_source": "whisperx_canonical",
                     }
                 ],
-                "crisperwhisper_to_combined": [],
+                "crisperwhisper_to_combined": [
+                    {
+                        "source_speaker_id": "SPEAKER_00",
+                        "target_speaker_id": "SPEAKER_00",
+                        "target_name": "Howard",
+                        "decision_source": "automatic_unique_name",
+                    }
+                ],
                 "region_overrides": [],
-            },
+            }),
             write_exports=kwargs.pop("write_exports", self.writer),
             **kwargs,
         )
@@ -209,6 +241,10 @@ class CombinedResultStorageTests(unittest.TestCase):
         self.assertEqual(descriptor.model, "large-v3 + large")
         self.assertEqual(descriptor.mode, "User-reviewed fusion")
         self.assertEqual(descriptor.status, "complete")
+        self.assertEqual(
+            dict(descriptor.provenance_source_states),
+            {"whisperx": "available", "crisperwhisper": "available"},
+        )
         project = json.loads(
             (self.fixture.layout.project_root / "project.json").read_text(encoding="utf-8")
         )
@@ -250,6 +286,10 @@ class CombinedResultStorageTests(unittest.TestCase):
         self.assertEqual(len(combined), 1)
         self.assertEqual(combined[0].source_state, "missing")
         self.assertEqual(combined[0].segments_json, committed.segments_json)
+        self.assertEqual(
+            dict(combined[0].provenance_source_states),
+            {"whisperx": "missing", "crisperwhisper": "missing"},
+        )
 
     def test_project_update_failure_rolls_back_revision_and_preserves_project(self):
         comparison = self.fixture.comparison()
@@ -341,6 +381,366 @@ class CombinedResultStorageTests(unittest.TestCase):
         self.assertEqual(mixed["timing_source"], "whisperx")
         self.assertEqual(mixed["timing"]["kind"], "derived")
         self.assertEqual(mixed["timing"]["transformation"], "proportional_region_fit")
+
+    def test_manifest_and_fusion_audit_are_versioned_and_self_consistent(self):
+        comparison = self.fixture.comparison()
+        committed = self.fixture.save(comparison)
+        manifest = json.loads(
+            (committed.result_root / "result.json").read_text(encoding="utf-8")
+        )
+        fusion_data = json.loads(committed.fusion_json.read_text(encoding="utf-8"))
+
+        self.assertEqual(manifest["schema_version"], 1)
+        self.assertEqual(manifest["revision_id"], manifest["result_id"])
+        self.assertEqual(manifest["engine"], "combined")
+        self.assertEqual(manifest["status"], "complete")
+        self.assertEqual(manifest["combined"]["schema_version"], 1)
+        self.assertEqual(
+            set(manifest["combined"]["source_revisions"]),
+            {"whisperx", "crisperwhisper"},
+        )
+        self.assertEqual(set(manifest["outputs"]), {"srt", "txt"})
+        self.assertEqual(fusion_data["schema_version"], 1)
+        self.assertEqual(fusion_data["result_id"], committed.result_id)
+        self.assertEqual(
+            fusion_data["source_revisions"],
+            manifest["combined"]["source_revisions"],
+        )
+        self.assertTrue(fusion_data["regions"][0]["candidates"][0]["words"])
+        result_catalog.validate_result_manifest(committed.result_root / "result.json")
+
+    def test_project_manifest_rejects_unsafe_combined_fusion_path(self):
+        comparison = self.fixture.comparison()
+        self.fixture.save(comparison)
+        project_path = self.fixture.layout.project_root / "project.json"
+        project_data = json.loads(project_path.read_text(encoding="utf-8"))
+        combined = next(
+            record for record in project_data["results"] if record["engine"] == "combined"
+        )
+        combined["paths"]["fusion"] = "../outside/fusion.json"
+        project_path.write_text(json.dumps(project_data), encoding="utf-8")
+        with self.assertRaisesRegex(
+            result_catalog.ManifestValidationError,
+            "traversal|result root",
+        ):
+            result_catalog.validate_project_manifest(project_path)
+
+    def test_missing_or_mutated_source_revision_is_rejected(self):
+        for mutation in ("delete", "manifest"):
+            with self.subTest(mutation=mutation):
+                temporary = tempfile.TemporaryDirectory()
+                self.addCleanup(temporary.cleanup)
+                fixture = CombinedStorageFixture(Path(temporary.name))
+                comparison = fixture.comparison()
+                crisper_root = comparison.crisperwhisper.revision.segments_json.parent
+                if mutation == "delete":
+                    shutil.rmtree(crisper_root)
+                else:
+                    manifest_path = crisper_root / "result.json"
+                    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    data["model"] = "substituted-model"
+                    manifest_path.write_text(json.dumps(data), encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "changed after the draft"):
+                    fixture.save(comparison)
+                self.assertFalse((fixture.layout.project_root / "combined").exists())
+
+    def test_changed_original_media_is_rejected_before_staging(self):
+        comparison = self.fixture.comparison()
+        self.fixture.source.write_bytes(b"replacement media")
+        with self.assertRaisesRegex(RuntimeError, "original media changed"):
+            self.fixture.save(comparison)
+        self.assertFalse((self.fixture.layout.project_root / "combined").exists())
+
+    def test_unresolved_crisper_speaker_mapping_is_rejected(self):
+        comparison = self.fixture.comparison(
+            [self.fixture.segment("before", 0.0, 1.0)],
+            [
+                self.fixture.segment("before", 0.0, 1.0),
+                self.fixture.segment("crisper addition", 2.0, 3.0),
+            ],
+        )
+        plan = result_fusion.create_fusion_plan(comparison)
+        region = next(
+            item
+            for item in plan.regions
+            if item.classification == result_comparison.CRISPERWHISPER_ONLY
+        )
+        plan = result_fusion.apply_decision(
+            plan,
+            region.region_id,
+            result_fusion.INCLUDE_ENGINE_ONLY,
+        )
+        preview = result_fusion.build_combined_preview(plan)
+        with self.assertRaisesRegex(RuntimeError, "requires a verified mapping"):
+            self.fixture.save(
+                comparison,
+                plan=plan,
+                preview=preview,
+                map_crisper=False,
+                mapping_audit={
+                    "canonical_speakers": [],
+                    "crisperwhisper_to_combined": [],
+                    "region_overrides": [],
+                },
+            )
+        self.assertFalse((self.fixture.layout.project_root / "combined").exists())
+
+    def test_timestamp_outside_authoritative_duration_is_rejected(self):
+        comparison = self.fixture.comparison()
+        plan = result_fusion.create_fusion_plan(comparison)
+        preview = result_fusion.build_combined_preview(plan)
+        candidate = preview.candidates[0]
+        words = list(candidate.words)
+        words[-1] = replace(words[-1], end=12.5)
+        candidate = replace(candidate, words=tuple(words), end=12.5)
+        invalid = replace(preview, candidates=(candidate,), words=tuple(words))
+        with self.assertRaisesRegex(RuntimeError, "authoritative media duration"):
+            self.fixture.save(comparison, plan=plan, preview=invalid)
+        self.assertFalse((self.fixture.layout.project_root / "combined").exists())
+
+    def test_optional_outputs_are_indexed_and_validated(self):
+        comparison = self.fixture.comparison()
+
+        def all_outputs(root, title, segments, names):
+            outputs = CombinedStorageFixture.writer(root, title, segments, names)
+            for key, name in (
+                ("word_vtt", f"{title}.words.vtt"),
+                ("word_ass", f"{title}.words.ass"),
+                ("plain_ass", f"{title}.plain.ass"),
+                ("word_html", "word_player.html"),
+                ("word_lrc", f"{title}.lrc"),
+            ):
+                path = root / name
+                path.write_text(f"{key}\n", encoding="utf-8")
+                outputs[key] = path
+            return outputs
+
+        committed = self.fixture.save(comparison, write_exports=all_outputs)
+        manifest = result_catalog.validate_result_manifest(
+            committed.result_root / "result.json"
+        )
+        self.assertEqual(
+            {name for name, _path, _digest in manifest.output_files},
+            {
+                "srt",
+                "txt",
+                "word_vtt",
+                "word_ass",
+                "plain_ass",
+                "word_html",
+                "word_lrc",
+            },
+        )
+
+    def test_apply_manifest_updates_preserve_fusion_and_add_optional_output(self):
+        comparison = self.fixture.comparison()
+        committed = self.fixture.save(comparison)
+        manifest_before = json.loads(
+            (committed.result_root / "result.json").read_text(encoding="utf-8")
+        )
+        with tempfile.TemporaryDirectory() as staging_name:
+            staging = Path(staging_name)
+            staged_speakers = staging / "speakers.json"
+            staged_segments = staging / "segments.json"
+            staged_ass = staging / "words.ass"
+            staged_speakers.write_bytes(committed.speakers_json.read_bytes())
+            staged_segments.write_bytes(committed.segments_json.read_bytes())
+            staged_ass.write_text("[Script Info]\n[Events]\n", encoding="utf-8")
+            target_ass = committed.result_root / "Fusion fixture.words.ass"
+            updates = result_storage.build_apply_manifest_updates(
+                committed.result_root,
+                staged_speakers,
+                staged_segments,
+                combined_output_files={
+                    "word_ass": (target_ass, staged_ass),
+                },
+            )
+        result_update = next(
+            data for path, data in updates if path.name == "result.json"
+        )
+        self.assertEqual(
+            result_update["fingerprint"]["fusion"],
+            manifest_before["fingerprint"]["fusion"],
+        )
+        self.assertEqual(
+            result_update["combined"],
+            manifest_before["combined"],
+        )
+        self.assertEqual(
+            result_update["outputs"]["word_ass"]["path"],
+            target_ass.name,
+        )
+
+    def test_combined_apply_updates_names_outputs_and_manifests_without_touching_fusion(self):
+        comparison = self.fixture.comparison()
+        committed = self.fixture.save(comparison)
+        fusion_before = committed.fusion_json.read_bytes()
+        manifest_path = committed.result_root / "result.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        srt_target = committed.result_root / manifest["outputs"]["srt"]["path"]
+        txt_target = committed.result_root / manifest["outputs"]["txt"]["path"]
+
+        with tempfile.TemporaryDirectory() as staging_name:
+            staging = Path(staging_name)
+            speakers_data = json.loads(committed.speakers_json.read_text(encoding="utf-8"))
+            speakers_data["names"]["SPEAKER_00"] = "Old Gregg"
+            staged_speakers = staging / "speakers.json"
+            staged_segments = staging / "segments.json"
+            staged_srt = staging / "combined.srt"
+            staged_txt = staging / "combined.txt"
+            staged_speakers.write_text(json.dumps(speakers_data), encoding="utf-8")
+            staged_segments.write_bytes(committed.segments_json.read_bytes())
+            staged_srt.write_text("Old Gregg: Hello world.\n", encoding="utf-8")
+            staged_txt.write_text("Old Gregg: Hello world.\n", encoding="utf-8")
+            staged_files = {
+                committed.speakers_json: staged_speakers,
+                committed.segments_json: staged_segments,
+                srt_target: staged_srt,
+                txt_target: staged_txt,
+            }
+            updates = result_storage.build_apply_manifest_updates(
+                committed.result_root,
+                staged_speakers,
+                staged_segments,
+                staged_output_files=staged_files,
+                combined_output_files={
+                    "srt": (srt_target, staged_srt),
+                    "txt": (txt_target, staged_txt),
+                },
+            )
+            for target, staged in staged_files.items():
+                target.write_bytes(staged.read_bytes())
+            for target, data in updates:
+                target.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+        reopened = result_catalog.descriptor_from_json_pair(
+            committed.speakers_json,
+            committed.segments_json,
+        )
+        self.assertEqual(reopened.engine, "combined")
+        self.assertEqual(reopened.status, "complete")
+        self.assertEqual(committed.fusion_json.read_bytes(), fusion_before)
+        saved_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved_manifest["combined"], manifest["combined"])
+        self.assertEqual(
+            json.loads(committed.speakers_json.read_text(encoding="utf-8"))["names"],
+            {"SPEAKER_00": "Old Gregg"},
+        )
+
+    def test_export_writer_exception_cleans_staging_and_keeps_source_revisions(self):
+        comparison = self.fixture.comparison()
+        source_roots = (
+            comparison.whisperx.revision.speakers_json.parent,
+            comparison.crisperwhisper.revision.speakers_json.parent,
+        )
+        before = tuple(self.file_hashes(root) for root in source_roots)
+
+        def fail_after_partial_output(root, title, segments, names):
+            (root / f"{title}.srt").write_text("partial", encoding="utf-8")
+            raise OSError("forced exporter failure")
+
+        with self.assertRaisesRegex(OSError, "forced exporter failure"):
+            self.fixture.save(comparison, write_exports=fail_after_partial_output)
+        self.assertFalse((self.fixture.layout.project_root / "combined").exists())
+        self.assertEqual(list(self.fixture.layout.project_root.glob(".staging-*")), [])
+        self.assertEqual(tuple(self.file_hashes(root) for root in source_roots), before)
+
+    def test_decisions_history_omissions_inclusions_and_warnings_round_trip(self):
+        shared = "do you love me"
+        addition = "beneath the water"
+        shifted = "nice spread"
+        comparison = self.fixture.comparison(
+            [
+                self.fixture.segment(shared, 1.0, 2.0),
+                self.fixture.segment(shifted, 8.0, 9.0),
+            ],
+            [
+                self.fixture.segment(shared, 1.0, 2.0),
+                self.fixture.segment(shared, 4.0, 5.0),
+                self.fixture.segment(addition, 6.0, 7.0),
+                self.fixture.segment(shifted, 10.5, 11.5),
+            ],
+        )
+        plan = result_fusion.create_fusion_plan(comparison)
+        duplicate = next(
+            item
+            for item in plan.regions
+            if item.classification == result_comparison.POSSIBLE_DUPLICATE
+        )
+        engine_only = next(
+            item
+            for item in plan.regions
+            if item.classification == result_comparison.CRISPERWHISPER_ONLY
+        )
+        timing = next(
+            item
+            for item in plan.regions
+            if item.classification == result_comparison.TIMING_CONFLICT
+        )
+        plan = result_fusion.apply_decision(
+            plan, duplicate.region_id, result_fusion.OMIT_BOTH
+        )
+        plan = result_fusion.apply_decision(
+            plan, engine_only.region_id, result_fusion.INCLUDE_ENGINE_ONLY
+        )
+        plan = result_fusion.apply_decision(
+            plan, timing.region_id, result_fusion.USE_CRISPERWHISPER_TIMING
+        )
+        plan = result_fusion.reset_decision(plan, timing.region_id)
+        plan = result_fusion.apply_decision(
+            plan, timing.region_id, result_fusion.USE_CRISPERWHISPER_TIMING
+        )
+        plan = replace(plan, warnings=("Source coverage warning retained.",))
+        preview = result_fusion.build_combined_preview(plan)
+        committed = self.fixture.save(comparison, plan=plan, preview=preview)
+        fusion_data = json.loads(committed.fusion_json.read_text(encoding="utf-8"))
+        manifest = json.loads(
+            (committed.result_root / "result.json").read_text(encoding="utf-8")
+        )
+
+        self.assertIn(duplicate.region_id, fusion_data["omitted_region_ids"])
+        self.assertIn(
+            engine_only.region_id,
+            fusion_data["included_engine_only_region_ids"],
+        )
+        self.assertGreaterEqual(len(fusion_data["decision_history"]), 5)
+        self.assertEqual(
+            fusion_data["source_coverage_warnings"],
+            ["Source coverage warning retained."],
+        )
+        self.assertEqual(manifest["status"], "complete")
+        self.assertEqual(
+            manifest["combined"]["source_coverage_warnings"],
+            ["Source coverage warning retained."],
+        )
+
+    def test_revision_collision_keeps_existing_combined_revision_unchanged(self):
+        comparison = self.fixture.comparison()
+        result_id = "20260826T130000000000Z-deadbeef"
+        committed = self.fixture.save(comparison, result_id=result_id)
+        before = self.file_hashes(committed.result_root)
+        with self.assertRaises(FileExistsError):
+            self.fixture.save(comparison, result_id=result_id)
+        self.assertEqual(self.file_hashes(committed.result_root), before)
+        self.assertEqual(list(self.fixture.layout.project_root.glob(".staging-*")), [])
+
+    def test_validation_and_preview_alone_write_no_combined_files(self):
+        comparison = self.fixture.comparison()
+        plan = result_fusion.create_fusion_plan(comparison)
+        preview = result_fusion.build_combined_preview(plan)
+        self.assertTrue(preview.final_ready)
+        self.assertFalse((self.fixture.layout.project_root / "combined").exists())
+
+    def test_saved_combined_reopens_when_media_changes(self):
+        comparison = self.fixture.comparison()
+        committed = self.fixture.save(comparison)
+        self.fixture.source.write_bytes(b"changed after Combined save")
+        descriptor = result_catalog.descriptor_from_json_pair(
+            committed.speakers_json,
+            committed.segments_json,
+        )
+        self.assertEqual(descriptor.engine, "combined")
+        self.assertEqual(descriptor.source_state, "changed")
 
 
 if __name__ == "__main__":

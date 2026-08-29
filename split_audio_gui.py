@@ -2287,7 +2287,7 @@ def review_result_display(descriptor):
 
     if descriptor is None:
         return ReviewResultDisplay(
-            "Result metadata unavailable | ",
+            "Result metadata unavailable • ",
             "Status unknown",
             "",
             "secondary",
@@ -2319,9 +2319,10 @@ def review_result_display(descriptor):
     timestamp = _review_result_timestamp(
         descriptor.created_at or descriptor.modified_at
     )
-    trailing_text = f" | {timestamp}" if timestamp else ""
+    separator = " | " if descriptor.engine == "combined" else " • "
+    trailing_text = f"{separator}{timestamp}" if timestamp else ""
     return ReviewResultDisplay(
-        " | ".join(leading_parts) + " | ",
+        separator.join(leading_parts) + separator,
         status_text,
         trailing_text,
         status_style,
@@ -5928,6 +5929,7 @@ class NamingWorkspace(ttk.Frame):
         with tempfile.TemporaryDirectory(prefix=".ats-apply-", dir=out_dir) as staging_name:
             staging_dir = Path(staging_name)
             staged_files = []
+            result_output_targets = {}
 
             if self.manual_corrections_pending:
                 backup_path = self.segments_json.with_name(
@@ -5965,14 +5967,14 @@ class NamingWorkspace(ttk.Frame):
                     lambda path: self._write_apply_json(path, seg_data),
                     expected_data=seg_data,
                 )
-            self._stage_apply_file(
+            result_output_targets["srt"] = self._stage_apply_file(
                 staging_dir,
                 staged_files,
                 srt_tmp,
                 "srt",
                 lambda path: self._write_apply_srt(path, segments, mapping),
             )
-            self._stage_apply_file(
+            result_output_targets["txt"] = self._stage_apply_file(
                 staging_dir,
                 staged_files,
                 txt_tmp,
@@ -5983,7 +5985,7 @@ class NamingWorkspace(ttk.Frame):
             if _has_word_level(segments):
                 if self.var_export_vtt.get():
                     vp = out_dir / f"{title}.words.vtt"
-                    self._stage_apply_file(
+                    result_output_targets["word_vtt"] = self._stage_apply_file(
                         staging_dir,
                         staged_files,
                         vp,
@@ -5993,7 +5995,7 @@ class NamingWorkspace(ttk.Frame):
                     export_created.append(vp.name)
                 if self.var_export_ass.get():
                     ap = out_dir / f"{title}.words.ass"
-                    self._stage_apply_file(
+                    result_output_targets["word_ass"] = self._stage_apply_file(
                         staging_dir,
                         staged_files,
                         ap,
@@ -6004,7 +6006,7 @@ class NamingWorkspace(ttk.Frame):
                 if self.var_export_html.get():
                     sps = sorted({mapping.get(seg.get("speaker"), seg.get("speaker")) for seg in segments if seg.get("speaker")})
                     hp = out_dir / "word_player.html"
-                    self._stage_apply_file(
+                    result_output_targets["word_html"] = self._stage_apply_file(
                         staging_dir,
                         staged_files,
                         hp,
@@ -6014,7 +6016,7 @@ class NamingWorkspace(ttk.Frame):
                     export_created.append(hp.name)
             if self.var_export_lrc.get():
                 lp = out_dir / f"{title}.lrc"
-                self._stage_apply_file(
+                result_output_targets["word_lrc"] = self._stage_apply_file(
                     staging_dir,
                     staged_files,
                     lp,
@@ -6024,7 +6026,7 @@ class NamingWorkspace(ttk.Frame):
                 export_created.append(lp.name)
             if self.var_export_ass_plain.get():
                 pp = out_dir / f"{title}.plain.ass"
-                self._stage_apply_file(
+                result_output_targets["plain_ass"] = self._stage_apply_file(
                     staging_dir,
                     staged_files,
                     pp,
@@ -6065,6 +6067,13 @@ class NamingWorkspace(ttk.Frame):
                 staged_speakers,
                 staged_segments,
                 staged_output_files=staged_by_target,
+                combined_output_files={
+                    name: (
+                        target,
+                        staged_by_target[target.resolve()],
+                    )
+                    for name, target in result_output_targets.items()
+                },
             ):
                 self._stage_apply_file(
                     staging_dir,
@@ -9390,13 +9399,19 @@ class ReviewNamePage(ttk.Frame):
             justify="left",
         )
         self.lbl_incomplete_warning.grid(row=0, column=0, sticky="ew")
-        tb.Button(
+        self.btn_incomplete_ranges = tb.Button(
             self.incomplete_banner,
             text="Show missing ranges",
             command=self._show_incomplete_ranges,
             bootstyle="warning-outline",
             padding=(12, 4),
-        ).grid(row=0, column=1, sticky="e", padx=(10, 0))
+        )
+        self.btn_incomplete_ranges.grid(
+            row=0,
+            column=1,
+            sticky="e",
+            padx=(10, 0),
+        )
 
         self.empty_state = ttk.Frame(
             self,
@@ -9444,6 +9459,39 @@ class ReviewNamePage(ttk.Frame):
     def _set_incomplete_warning(self, descriptor):
         if not hasattr(self, "incomplete_banner"):
             return
+        provenance_states = dict(
+            descriptor.provenance_source_states
+            if isinstance(descriptor, ResultDescriptor)
+            else ()
+        )
+        unavailable_provenance = {
+            engine: state
+            for engine, state in provenance_states.items()
+            if state != "available"
+        }
+        if (
+            isinstance(descriptor, ResultDescriptor)
+            and descriptor.engine == "combined"
+            and unavailable_provenance
+        ):
+            labels = {
+                "whisperx": "WhisperX",
+                "crisperwhisper": "CrisperWhisper",
+            }
+            details = ", ".join(
+                f"{labels.get(engine, engine)}: {state}"
+                for engine, state in unavailable_provenance.items()
+            )
+            self.lbl_incomplete_warning.configure(
+                text=(
+                    "Combined provenance source revisions are unavailable or changed "
+                    f"({details}). The saved Combined transcript remains reviewable."
+                )
+            )
+            if hasattr(self, "btn_incomplete_ranges"):
+                self.btn_incomplete_ranges.grid_remove()
+            self.incomplete_banner.grid(row=1, column=0, sticky="ew")
+            return
         coverage = (
             descriptor.coverage
             if isinstance(descriptor, ResultDescriptor)
@@ -9453,6 +9501,8 @@ class ReviewNamePage(ttk.Frame):
         if coverage is None:
             self.incomplete_banner.grid_remove()
             return
+        if hasattr(self, "btn_incomplete_ranges"):
+            self.btn_incomplete_ranges.grid()
         count = coverage.remaining_speech_active_gap_count
         duration = coverage.remaining_speech_active_gap_duration
         self.lbl_incomplete_warning.configure(
@@ -9750,6 +9800,7 @@ class ReviewNamePage(ttk.Frame):
         return self.load_result(
             descriptor,
             confirm_replacement=False,
+            protect_unsaved=True,
         )
 
     def _open_comparison_result(self, descriptor):
@@ -9843,6 +9894,7 @@ class ReviewNamePage(ttk.Frame):
         segments_json=None,
         *,
         confirm_replacement=True,
+        protect_unsaved=False,
         result_descriptor=None,
     ):
         requested_descriptor = (
@@ -9910,7 +9962,7 @@ class ReviewNamePage(ttk.Frame):
             and self._result_path_key(result_identity)
             == self._result_path_key(self.current_result_identity)
         )
-        if self.workspace is not None and confirm_replacement:
+        if self.workspace is not None and (confirm_replacement or protect_unsaved):
             if not self._confirm_fusion_discard_for_replacement():
                 return False
             if self.workspace.has_unsaved_changes():
@@ -9926,7 +9978,7 @@ class ReviewNamePage(ttk.Frame):
                     return False
                 if decision and not self.workspace.apply_changes():
                     return False
-            elif not same_paths_changed:
+            elif confirm_replacement and not same_paths_changed:
                 replace = messagebox.askyesno(
                     "Replace review result",
                     "Another result is already open. Replace it with the selected result?",
@@ -12208,6 +12260,7 @@ class App(ttk.Frame):
             if self.review_page.load_result(
                 pending,
                 confirm_replacement=False,
+                protect_unsaved=True,
             ):
                 self.pending_review_result = None
                 self.show_page("review")

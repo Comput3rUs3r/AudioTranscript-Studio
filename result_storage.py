@@ -669,9 +669,20 @@ class ResultRevision:
             rollback_error = None
             if revision_moved and self.final_root.exists():
                 try:
-                    shutil.rmtree(self.final_root)
+                    # First move the failed revision back under the hidden staging
+                    # root.  Once this succeeds catalog discovery cannot observe it,
+                    # even if recursive cleanup is interrupted afterward.
+                    self.output_root.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(self.final_root, self.output_root)
+                    shutil.rmtree(self.output_root)
                 except Exception as exc:
-                    rollback_error = exc
+                    try:
+                        shutil.rmtree(self.final_root)
+                    except Exception as fallback_exc:
+                        rollback_error = RuntimeError(
+                            f"hidden rollback failed: {exc}; "
+                            f"direct cleanup failed: {fallback_exc}"
+                        )
             self._cleanup_staging()
             self._cleanup_empty_parents()
             if rollback_error is not None:
@@ -790,7 +801,8 @@ def _revalidate_combined_sources(
             )
         except Exception as exc:
             raise RuntimeError(
-                f"The {revision.engine} source revision is unavailable or invalid: {exc}"
+                f"The {revision.engine} source revision is unavailable, invalid, "
+                f"or changed after the draft was built: {exc}"
             ) from exc
         current = (
             descriptor.engine,
@@ -800,6 +812,11 @@ def _revalidate_combined_sources(
             descriptor.segments_sha256,
             descriptor.comparison_job_id,
             descriptor.status,
+            descriptor.model,
+            descriptor.mode,
+            descriptor.execution_backend,
+            descriptor.created_at,
+            descriptor.modified_at,
         )
         retained = (
             expected.engine,
@@ -809,6 +826,11 @@ def _revalidate_combined_sources(
             expected.segments_sha256,
             expected.comparison_job_id,
             expected.status,
+            revision.model,
+            revision.mode,
+            revision.execution_backend,
+            revision.created_at,
+            revision.modified_at,
         )
         if current != retained:
             raise RuntimeError(
@@ -841,6 +863,7 @@ def _revalidate_combined_sources(
 
 
 _CLOSING_PUNCTUATION = frozenset(",.!?;:%)]}\u2019'\"")
+_UNASSIGNED_CRISPER_SPEAKER = "__UNASSIGNED_CRISPER__"
 
 
 def _join_combined_words(words: Iterable[Any]) -> str:
@@ -856,6 +879,150 @@ def _join_combined_words(words: Iterable[Any]) -> str:
         else:
             text += " " + value
     return text.strip()
+
+
+def _provenance_data(item: Any) -> dict[str, Any]:
+    return {
+        "engine": item.source_engine,
+        "revision_id": item.revision_id,
+        "speakers_sha256": item.speakers_sha256,
+        "segments_sha256": item.segments_sha256,
+        "segment_index": item.segment_index,
+        "word_index": item.word_index,
+        "ordinal": item.ordinal,
+        "text": item.original_text,
+        "start": item.original_start,
+        "end": item.original_end,
+        "speaker_id": item.original_speaker_id,
+        "speaker_name": item.original_speaker_name,
+        "classification": item.comparison_classification,
+        "decision_source": item.decision_source,
+        "source_roles": list(item.source_roles),
+    }
+
+
+def _fusion_word_data(word: Any) -> dict[str, Any]:
+    return {
+        "text": word.text,
+        "start": word.start,
+        "end": word.end,
+        "speaker_id": word.speaker_id,
+        "speaker_name": word.speaker_name,
+        "text_source": word.text_source_engine,
+        "timing_source": word.timing_source_engine,
+        "speaker_source": word.speaker_source_engine,
+        "speaker_decision_source": word.speaker_decision_source,
+        "timing": {
+            "kind": "derived" if word.timing_is_derived else "native",
+            "transformation": word.timing_transformation,
+        },
+        "source_word_references": [
+            _provenance_data(item) for item in word.provenance
+        ],
+    }
+
+
+def _validate_combined_speaker_mappings(
+    preview: FusionPreview,
+    canonical_speakers: Sequence[Mapping[str, Any]],
+    mapping_audit: Mapping[str, Any],
+) -> None:
+    """Reject any selected CrisperWhisper speaker without an audited mapping."""
+
+    if not isinstance(mapping_audit, Mapping):
+        raise RuntimeError("Combined speaker mapping metadata is malformed.")
+    canonical_by_id: dict[str, str] = {}
+    for record in canonical_speakers:
+        if not isinstance(record, Mapping):
+            raise RuntimeError("Combined canonical speaker metadata is malformed.")
+        speaker_id = str(record.get("speaker_id") or "").strip()
+        if not speaker_id or speaker_id in canonical_by_id:
+            raise RuntimeError("Combined canonical speaker IDs must be unique and non-empty.")
+        canonical_by_id[speaker_id] = str(record.get("name") or "").strip()
+
+    raw_mappings = mapping_audit.get("crisperwhisper_to_combined", ())
+    raw_overrides = mapping_audit.get("region_overrides", ())
+    if not isinstance(raw_mappings, (list, tuple)) or not isinstance(
+        raw_overrides, (list, tuple)
+    ):
+        raise RuntimeError("Combined speaker mapping metadata is malformed.")
+
+    mappings: dict[str, Mapping[str, Any]] = {}
+    for record in raw_mappings:
+        if not isinstance(record, Mapping):
+            raise RuntimeError("Combined speaker mapping metadata is malformed.")
+        source_id = str(record.get("source_speaker_id") or "").strip()
+        target_id = str(record.get("target_speaker_id") or "").strip()
+        decision_source = str(record.get("decision_source") or "").strip()
+        if (
+            not source_id
+            or source_id in mappings
+            or target_id not in canonical_by_id
+            or not decision_source
+        ):
+            raise RuntimeError("Combined speaker mapping metadata is incomplete or ambiguous.")
+        mappings[source_id] = record
+
+    overrides: dict[str, Mapping[str, Any]] = {}
+    for record in raw_overrides:
+        if not isinstance(record, Mapping):
+            raise RuntimeError("Combined region speaker metadata is malformed.")
+        region_id = str(record.get("region_id") or "").strip()
+        target_id = str(record.get("target_speaker_id") or "").strip()
+        decision_source = str(record.get("decision_source") or "").strip()
+        if (
+            not region_id
+            or region_id in overrides
+            or target_id not in canonical_by_id
+            or not decision_source
+        ):
+            raise RuntimeError("Combined region speaker metadata is incomplete or ambiguous.")
+        overrides[region_id] = record
+
+    for candidate in preview.candidates:
+        override = overrides.get(candidate.region_id)
+        for word in candidate.words:
+            speaker_id = str(word.speaker_id or "").strip()
+            if speaker_id and speaker_id not in canonical_by_id:
+                raise RuntimeError(
+                    "A selected Combined word refers to an unknown canonical speaker."
+                )
+            if word.speaker_source_engine != "crisperwhisper":
+                continue
+            source_ids = {
+                str(item.original_speaker_id or "").strip()
+                or _UNASSIGNED_CRISPER_SPEAKER
+                for item in word.provenance
+                if item.source_engine == "crisperwhisper"
+                and (not item.source_roles or "speaker" in item.source_roles)
+            }
+            if len(source_ids) != 1:
+                raise RuntimeError(
+                    "A selected CrisperWhisper word has ambiguous speaker provenance."
+                )
+            source_id = next(iter(source_ids))
+            record = override
+            if record is not None:
+                override_source = str(record.get("source_speaker_id") or "").strip()
+                if override_source and override_source != source_id:
+                    record = None
+            if record is None:
+                record = mappings.get(source_id)
+            if record is None:
+                raise RuntimeError(
+                    "Every selected CrisperWhisper speaker requires a verified mapping."
+                )
+            expected_id = str(record.get("target_speaker_id") or "").strip()
+            expected_name = canonical_by_id[expected_id]
+            expected_source = str(record.get("decision_source") or "").strip()
+            if (
+                speaker_id != expected_id
+                or str(word.speaker_name or "").strip() != expected_name
+                or word.speaker_decision_source != expected_source
+            ):
+                raise RuntimeError(
+                    "The selected CrisperWhisper speaker does not match its verified mapping."
+                )
 
 
 def _combined_segments(
@@ -908,39 +1075,10 @@ def _combined_segments(
             audit_words.append(
                 {
                     "combined_word_ordinal": combined_ordinal,
-                    "text": word.text,
+                    **_fusion_word_data(word),
                     "start": start,
                     "end": end,
                     "speaker_id": speaker_id,
-                    "speaker_name": word.speaker_name,
-                    "text_source": word.text_source_engine,
-                    "timing_source": word.timing_source_engine,
-                    "speaker_source": word.speaker_source_engine,
-                    "speaker_decision_source": word.speaker_decision_source,
-                    "timing": {
-                        "kind": "derived" if word.timing_is_derived else "native",
-                        "transformation": word.timing_transformation,
-                    },
-                    "source_word_references": [
-                        {
-                            "engine": item.source_engine,
-                            "revision_id": item.revision_id,
-                            "speakers_sha256": item.speakers_sha256,
-                            "segments_sha256": item.segments_sha256,
-                            "segment_index": item.segment_index,
-                            "word_index": item.word_index,
-                            "ordinal": item.ordinal,
-                            "text": item.original_text,
-                            "start": item.original_start,
-                            "end": item.original_end,
-                            "speaker_id": item.original_speaker_id,
-                            "speaker_name": item.original_speaker_name,
-                            "classification": item.comparison_classification,
-                            "decision_source": item.decision_source,
-                            "source_roles": list(item.source_roles),
-                        }
-                        for item in word.provenance
-                    ],
                 }
             )
             combined_ordinal += 1
@@ -1042,6 +1180,17 @@ def _fusion_audit_data(
                         "text_source": candidate.text_source_engine,
                         "timing_source": candidate.timing_source_engine,
                         "speaker_source": candidate.speaker_source_engine,
+                        "timing": {
+                            "kind": (
+                                "derived"
+                                if candidate.timing_is_derived
+                                else "native"
+                            ),
+                            "transformation": candidate.timing_transformation,
+                        },
+                        "words": [
+                            _fusion_word_data(word) for word in candidate.words
+                        ],
                     }
                     for candidate in region.candidates
                 ],
@@ -1166,6 +1315,11 @@ def save_combined_revision(
         comparison,
         plan,
     )
+    _validate_combined_speaker_mappings(
+        preview,
+        canonical_speakers,
+        mapping_audit,
+    )
     source_path = whisper_descriptor.source_path or crisper_descriptor.source_path
     title = comparison.whisperx.revision.display_title
     layout = project_layout_for_source(output_root, title, source_path)
@@ -1288,6 +1442,7 @@ def save_combined_revision(
         }
         summary = _fusion_summary(plan, preview)
         manifest_extras = {
+            "revision_id": revision.result_id,
             "paths": {"fusion": "fusion.json"},
             "fingerprint": {
                 "fusion": _sha256_file(revision.output_root / "fusion.json")
@@ -1298,6 +1453,10 @@ def save_combined_revision(
                 "comparison_pair_id": plan.pair_identity.comparison_pair_id,
                 "comparison_job_id": plan.pair_identity.comparison_job_id,
                 "source_revisions": source_revisions,
+                "original_media": {
+                    "path": str(layout.source_path),
+                    "source_state_at_save": whisper_descriptor.source_state,
+                },
                 "source_state_at_save": {
                     "whisperx": whisper_descriptor.source_state,
                     "crisperwhisper": crisper_descriptor.source_state,
@@ -1452,6 +1611,9 @@ def build_apply_manifest_updates(
     staged_speakers_json: Path | str,
     staged_segments_json: Path | str,
     staged_output_files: Optional[Mapping[Path | str, Path | str]] = None,
+    combined_output_files: Optional[
+        Mapping[str, tuple[Path | str, Path | str]]
+    ] = None,
 ) -> tuple[tuple[Path, dict[str, Any]], ...]:
     """Build fingerprint updates for a transactional Review Apply."""
 
@@ -1476,7 +1638,9 @@ def build_apply_manifest_updates(
         }
     )
     result_data["fingerprint"] = fingerprints
-    if current.engine == "combined" and staged_output_files:
+    if current.engine == "combined" and (
+        staged_output_files or combined_output_files
+    ):
         outputs = result_data.get("outputs")
         if not isinstance(outputs, dict):
             raise ManifestValidationError(
@@ -1484,7 +1648,7 @@ def build_apply_manifest_updates(
             )
         staged_by_target = {
             Path(target).resolve(): Path(staged).resolve()
-            for target, staged in staged_output_files.items()
+            for target, staged in (staged_output_files or {}).items()
         }
         for output_record in outputs.values():
             if not isinstance(output_record, dict):
@@ -1500,6 +1664,29 @@ def build_apply_manifest_updates(
             staged = staged_by_target.get(target)
             if staged is not None:
                 output_record["sha256"] = _sha256_file(staged)
+        for output_name, paths in (combined_output_files or {}).items():
+            if not isinstance(output_name, str) or not output_name.strip():
+                raise ManifestValidationError(
+                    "Combined result output names must be non-empty strings."
+                )
+            if not isinstance(paths, tuple) or len(paths) != 2:
+                raise ManifestValidationError(
+                    "Combined result output updates are malformed."
+                )
+            target = Path(paths[0]).resolve()
+            staged = Path(paths[1]).resolve()
+            if target.parent != result_root or not staged.is_file():
+                raise ManifestValidationError(
+                    "Combined result output updates must stay inside the result revision."
+                )
+            outputs[output_name] = {
+                "path": target.name,
+                "sha256": _sha256_file(staged),
+            }
+        if not {"srt", "txt"}.issubset(outputs):
+            raise ManifestValidationError(
+                "Combined result output updates must retain SRT and TXT."
+            )
     result_data["updated_at"] = timestamp
     updates = [(result_path, result_data)]
 
