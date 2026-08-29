@@ -4,14 +4,17 @@ from dataclasses import replace
 import json
 import os
 from pathlib import Path
+import shutil
 from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest import mock
 
 import result_catalog as catalog
+import result_comparison
 import split_audio_gui as gui
 from tests.test_result_catalog import ResultFixture, incomplete_coverage
+from tests.test_combined_result_storage import CombinedStorageFixture
 
 
 class _FakeDialog:
@@ -188,6 +191,119 @@ class OpenResultBrowserTests(unittest.TestCase):
             [item.status for item in model.visible()],
             ["complete", "incomplete"],
         )
+
+    def test_combined_result_is_discovered_filtered_and_opened_without_player_creation(self):
+        case_root = self.root / "combined-case"
+        case_root.mkdir()
+        combined_fixture = CombinedStorageFixture(case_root)
+        comparison = combined_fixture.comparison()
+        committed = combined_fixture.save(comparison)
+        output = combined_fixture.output
+
+        with mock.patch.object(gui, "get_embedded_vlc_status") as vlc_status, mock.patch.object(
+            gui, "NamingWorkspace"
+        ) as workspace:
+            discovery = catalog.discover_results(output)
+            model = gui._ResultBrowserModel(discovery.results)
+            combined = model.visible(engine="Combined")
+        self.assertEqual(len(combined), 1)
+        self.assertEqual(combined[0].model, "large-v3 + large")
+        self.assertEqual(combined[0].mode, "User-reviewed fusion")
+        self.assertEqual(combined[0].status, "complete")
+        self.assertEqual(combined[0].segments_json, committed.segments_json)
+        self.assertEqual(
+            result_comparison.compatible_counterparts(
+                combined[0], discovery.results
+            ),
+            (),
+        )
+        vlc_status.assert_not_called()
+        workspace.assert_not_called()
+
+        app = self._app_harness()
+        dialog_type = self._dialog_returning(
+            lambda descriptors: next(
+                item for item in descriptors if item.engine == "combined"
+            )
+        )
+        with mock.patch.object(gui, "output_root", return_value=output), mock.patch.object(
+            gui, "_OpenResultDialog", dialog_type
+        ):
+            self.assertTrue(app.on_open_result_browser())
+        app.review_page.load_result.assert_called_once_with(
+            committed.speakers_json,
+            committed.segments_json,
+            result_descriptor=mock.ANY,
+        )
+
+        page = object.__new__(gui.ReviewNamePage)
+        page.workspace = None
+        page.current_result_identity = None
+        page.current_result_paths = None
+        page.current_result_descriptor = None
+        page._report_callback = mock.Mock()
+        page._back_to_transcribe_callback = mock.Mock()
+        page._apply_complete_callback = mock.Mock()
+        page.winfo_toplevel = lambda: None
+        page.winfo_children = lambda: []
+        page.empty_state = mock.Mock()
+        prepared_workspace = mock.Mock()
+        with mock.patch.object(
+            gui,
+            "NamingWorkspace",
+            return_value=prepared_workspace,
+        ) as constructor:
+            self.assertTrue(
+                page.load_result(
+                    combined[0],
+                    confirm_replacement=False,
+                )
+            )
+        constructor.assert_called_once()
+        self.assertEqual(
+            constructor.call_args.kwargs["result_descriptor"].engine,
+            "combined",
+        )
+        prepared_workspace.start.assert_called_once_with()
+        self.assertIs(page.workspace, prepared_workspace)
+        self.assertEqual(page.current_result_descriptor.engine, "combined")
+
+        app = object.__new__(gui.App)
+        app.pending_review_result = None
+        app.log = mock.Mock()
+        app.review_page = mock.Mock()
+        app.review_page.load_result.return_value = True
+        app.show_page = mock.Mock()
+        app.after_idle = lambda callback: callback()
+        app._validated_pending_review_result = lambda: app.pending_review_result
+        self.assertTrue(app._on_combined_result_saved(combined[0]))
+        app.review_page.load_result.assert_called_once_with(
+            mock.ANY,
+            confirm_replacement=False,
+            protect_unsaved=True,
+        )
+        self.assertIsNone(app.pending_review_result)
+        app.show_page.assert_called_once_with("review")
+
+        for source_snapshot in (comparison.whisperx, comparison.crisperwhisper):
+            source_root = source_snapshot.revision.speakers_json.parent
+            if source_root.exists():
+                shutil.rmtree(source_root)
+        reopened = catalog.descriptor_from_json_pair(
+            committed.speakers_json,
+            committed.segments_json,
+        )
+        warning_page = object.__new__(gui.ReviewNamePage)
+        warning_page.incomplete_banner = mock.Mock()
+        warning_page.lbl_incomplete_warning = mock.Mock()
+        warning_page.btn_incomplete_ranges = mock.Mock()
+        warning_page._set_incomplete_warning(reopened)
+        warning_text = warning_page.lbl_incomplete_warning.configure.call_args.kwargs[
+            "text"
+        ]
+        self.assertIn("remains reviewable", warning_text)
+        self.assertIn("WhisperX: missing", warning_text)
+        self.assertIn("CrisperWhisper: missing", warning_text)
 
     def test_browser_opens_video_audio_and_missing_source_results(self):
         for folder, suffix, exists in (
@@ -381,6 +497,24 @@ class ReviewReplacementProtectionTests(unittest.TestCase):
         constructor.assert_not_called()
         old_workspace._suspend_embedded_player_for_replacement.assert_not_called()
         old_workspace.shutdown.assert_not_called()
+
+    def test_automatic_saved_result_replacement_still_protects_unsaved_review(self):
+        page, old_workspace = self._page()
+        with mock.patch.object(
+            gui.messagebox,
+            "askyesnocancel",
+            return_value=None,
+        ), mock.patch.object(gui, "NamingWorkspace") as constructor:
+            self.assertFalse(
+                page.load_result(
+                    self.new_descriptor,
+                    confirm_replacement=False,
+                    protect_unsaved=True,
+                )
+            )
+        constructor.assert_not_called()
+        old_workspace.shutdown.assert_not_called()
+        self.assertIs(page.workspace, old_workspace)
 
 
 class SavedResultNamesTests(unittest.TestCase):

@@ -70,7 +70,11 @@ from result_fusion import (
     reset_decision as reset_fusion_decision,
     valid_decision_actions,
 )
-from result_storage import build_apply_manifest_updates, cleanup_process_staging
+from result_storage import (
+    build_apply_manifest_updates,
+    cleanup_process_staging,
+    save_combined_revision,
+)
 
 
 MIDNIGHTSTUDIO_THEME_NAME = "midnightstudio"
@@ -2288,15 +2292,16 @@ def review_result_display(descriptor):
             "",
             "secondary",
         )
-    engine = (
-        "CrisperWhisper"
-        if descriptor.engine == "crisperwhisper"
-        else "WhisperX" if descriptor.engine == "whisperx" else "Engine unknown"
-    )
+    engine = {
+        "whisperx": "WhisperX",
+        "crisperwhisper": "CrisperWhisper",
+        "combined": "Combined",
+    }.get(descriptor.engine, "Engine unknown")
     model = descriptor.model or "Model unknown"
     leading_parts = [engine, model]
-    if descriptor.engine == "crisperwhisper" and descriptor.mode:
-        leading_parts.append(str(descriptor.mode).strip().title())
+    if descriptor.engine in {"crisperwhisper", "combined"} and descriptor.mode:
+        mode = str(descriptor.mode).strip()
+        leading_parts.append(mode if descriptor.engine == "combined" else mode.title())
 
     if descriptor.layout == "legacy":
         status_text = "Legacy result"
@@ -2314,9 +2319,10 @@ def review_result_display(descriptor):
     timestamp = _review_result_timestamp(
         descriptor.created_at or descriptor.modified_at
     )
-    trailing_text = f" • {timestamp}" if timestamp else ""
+    separator = " | " if descriptor.engine == "combined" else " • "
+    trailing_text = f"{separator}{timestamp}" if timestamp else ""
     return ReviewResultDisplay(
-        " • ".join(leading_parts) + " • ",
+        separator.join(leading_parts) + separator,
         status_text,
         trailing_text,
         status_style,
@@ -5923,6 +5929,7 @@ class NamingWorkspace(ttk.Frame):
         with tempfile.TemporaryDirectory(prefix=".ats-apply-", dir=out_dir) as staging_name:
             staging_dir = Path(staging_name)
             staged_files = []
+            result_output_targets = {}
 
             if self.manual_corrections_pending:
                 backup_path = self.segments_json.with_name(
@@ -5960,14 +5967,14 @@ class NamingWorkspace(ttk.Frame):
                     lambda path: self._write_apply_json(path, seg_data),
                     expected_data=seg_data,
                 )
-            self._stage_apply_file(
+            result_output_targets["srt"] = self._stage_apply_file(
                 staging_dir,
                 staged_files,
                 srt_tmp,
                 "srt",
                 lambda path: self._write_apply_srt(path, segments, mapping),
             )
-            self._stage_apply_file(
+            result_output_targets["txt"] = self._stage_apply_file(
                 staging_dir,
                 staged_files,
                 txt_tmp,
@@ -5978,7 +5985,7 @@ class NamingWorkspace(ttk.Frame):
             if _has_word_level(segments):
                 if self.var_export_vtt.get():
                     vp = out_dir / f"{title}.words.vtt"
-                    self._stage_apply_file(
+                    result_output_targets["word_vtt"] = self._stage_apply_file(
                         staging_dir,
                         staged_files,
                         vp,
@@ -5988,7 +5995,7 @@ class NamingWorkspace(ttk.Frame):
                     export_created.append(vp.name)
                 if self.var_export_ass.get():
                     ap = out_dir / f"{title}.words.ass"
-                    self._stage_apply_file(
+                    result_output_targets["word_ass"] = self._stage_apply_file(
                         staging_dir,
                         staged_files,
                         ap,
@@ -5999,7 +6006,7 @@ class NamingWorkspace(ttk.Frame):
                 if self.var_export_html.get():
                     sps = sorted({mapping.get(seg.get("speaker"), seg.get("speaker")) for seg in segments if seg.get("speaker")})
                     hp = out_dir / "word_player.html"
-                    self._stage_apply_file(
+                    result_output_targets["word_html"] = self._stage_apply_file(
                         staging_dir,
                         staged_files,
                         hp,
@@ -6009,7 +6016,7 @@ class NamingWorkspace(ttk.Frame):
                     export_created.append(hp.name)
             if self.var_export_lrc.get():
                 lp = out_dir / f"{title}.lrc"
-                self._stage_apply_file(
+                result_output_targets["word_lrc"] = self._stage_apply_file(
                     staging_dir,
                     staged_files,
                     lp,
@@ -6019,7 +6026,7 @@ class NamingWorkspace(ttk.Frame):
                 export_created.append(lp.name)
             if self.var_export_ass_plain.get():
                 pp = out_dir / f"{title}.plain.ass"
-                self._stage_apply_file(
+                result_output_targets["plain_ass"] = self._stage_apply_file(
                     staging_dir,
                     staged_files,
                     pp,
@@ -6059,6 +6066,14 @@ class NamingWorkspace(ttk.Frame):
                 out_dir,
                 staged_speakers,
                 staged_segments,
+                staged_output_files=staged_by_target,
+                combined_output_files={
+                    name: (
+                        target,
+                        staged_by_target[target.resolve()],
+                    )
+                    for name, target in result_output_targets.items()
+                },
             ):
                 self._stage_apply_file(
                     staging_dir,
@@ -6292,7 +6307,7 @@ class _OpenResultDialog(tk.Toplevel):
         ttk.Combobox(
             filters,
             textvariable=self.var_engine,
-            values=("All", "WhisperX", "CrisperWhisper"),
+            values=("All", "WhisperX", "CrisperWhisper", "Combined"),
             state="readonly",
             width=16,
         ).grid(row=0, column=3, sticky="w", padx=(0, 12))
@@ -6424,7 +6439,11 @@ class _OpenResultDialog(tk.Toplevel):
 
     @staticmethod
     def _format_engine(engine):
-        return "CrisperWhisper" if engine == "crisperwhisper" else "WhisperX"
+        return {
+            "whisperx": "WhisperX",
+            "crisperwhisper": "CrisperWhisper",
+            "combined": "Combined",
+        }.get(engine, "Unknown")
 
     @staticmethod
     def _format_modified(value):
@@ -6769,6 +6788,12 @@ class _FusionDraftSession:
         return bool(self._undo)
 
     @property
+    def state_token(self):
+        """Return the exact immutable draft state used for final validation."""
+
+        return self._state
+
+    @property
     def final_ready(self):
         return (
             self.plan.ready_for_final_generation
@@ -7044,7 +7069,11 @@ class _FusionDraftSession:
             source_speaker_id,
             speaker.speaker_id,
             speaker.name,
-            "explicit_new_combined_speaker",
+            (
+                "explicitly_unnamed"
+                if explicit_unnamed and not speaker.name
+                else "explicit_new_combined_speaker"
+            ),
         )
         mappings = tuple(
             item for item in self.mappings if item.source_speaker_id != source_speaker_id
@@ -7056,6 +7085,53 @@ class _FusionDraftSession:
         )
         self._replace_state(state)
         return speaker
+
+    def canonical_speaker_records(self):
+        mapping_sources = {
+            mapping.target_speaker_id: mapping.decision_source
+            for mapping in self.mappings
+        }
+        return tuple(
+            {
+                "speaker_id": speaker.speaker_id,
+                "name": speaker.name,
+                "created_for_combined": speaker.created_for_combined,
+                "decision_source": (
+                    mapping_sources.get(speaker.speaker_id)
+                    if speaker.created_for_combined
+                    else "whisperx_canonical"
+                ),
+            }
+            for speaker in self.all_canonical_speakers()
+        )
+
+    def mapping_audit(self):
+        return {
+            "canonical_speakers": list(self.canonical_speaker_records()),
+            "crisperwhisper_to_combined": [
+                {
+                    "source_speaker_id": mapping.source_speaker_id,
+                    "target_speaker_id": mapping.target_speaker_id,
+                    "target_name": mapping.target_name,
+                    "decision_source": mapping.decision_source,
+                }
+                for mapping in self.mappings
+            ],
+            "region_overrides": [
+                {
+                    "region_id": item.region_id,
+                    "source_speaker_id": item.source_speaker_id,
+                    "target_speaker_id": item.target_speaker_id,
+                    "target_name": item.target_name,
+                    "decision_source": item.decision_source,
+                }
+                for item in self.region_speakers
+            ],
+        }
+
+    def mark_saved(self):
+        self._initial_state = self._state
+        self._undo.clear()
 
     def _set_mapping(self, mapping):
         if not any(
@@ -7449,7 +7525,7 @@ class _FusionPreviewDialog(tk.Toplevel):
 
 
 class _FusionDraftWorkspace(ttk.Frame):
-    """In-page, write-free editor for one in-memory Combined Draft plan."""
+    """In-page editor for one exact in-memory Combined Draft plan."""
 
     def __init__(
         self,
@@ -7460,6 +7536,8 @@ class _FusionDraftWorkspace(ttk.Frame):
         preview_available=False,
         preview_unavailable_reason=None,
         report_callback=None,
+        save_callback=None,
+        saved_callback=None,
         back_to_compare_callback=None,
         back_to_review_callback=None,
     ):
@@ -7468,8 +7546,14 @@ class _FusionDraftWorkspace(ttk.Frame):
         self._preview_available = bool(preview_available)
         self._preview_unavailable_reason = preview_unavailable_reason
         self._report_callback = report_callback
+        self._save_callback = save_callback
+        self._saved_callback = saved_callback
         self._back_to_compare_callback = back_to_compare_callback
         self._back_to_review_callback = back_to_review_callback
+        self._saving = False
+        self._validated_state = None
+        self._validated_preview = None
+        self._saved_descriptor = None
         self.session = _FusionDraftSession(comparison)
         self._comparison_regions = {
             region.region_id: region for region in comparison.regions
@@ -7818,6 +7902,32 @@ class _FusionDraftWorkspace(ttk.Frame):
             bootstyle="success",
         )
         self.btn_validate.grid(row=1, column=3, padx=(8, 0), pady=(6, 0))
+        self.lbl_save_reason = ttk.Label(
+            bottom,
+            text="Validate the final draft before saving.",
+            style=MIDNIGHTSTUDIO_STYLES["secondary"],
+            justify="right",
+        )
+        self.lbl_save_reason.grid(
+            row=2,
+            column=1,
+            columnspan=2,
+            sticky="e",
+            pady=(6, 0),
+        )
+        self.btn_save_combined = tb.Button(
+            bottom,
+            text="Save Combined Result",
+            command=self._save_combined_result,
+            bootstyle="success-outline",
+            state="disabled",
+        )
+        self.btn_save_combined.grid(
+            row=2,
+            column=3,
+            padx=(8, 0),
+            pady=(6, 0),
+        )
 
         self.var_filter.trace_add("write", self._filter_changed)
         self.cmb_source_speaker.bind(
@@ -7905,6 +8015,52 @@ class _FusionDraftWorkspace(ttk.Frame):
         )
         self.btn_provisional.configure(state="normal")
         self.btn_undo.configure(state="normal" if self.session.can_undo else "disabled")
+        self._refresh_save_state()
+
+    def _refresh_save_state(self):
+        if not hasattr(self, "btn_save_combined"):
+            return
+        if self._saving:
+            self.btn_save_combined.configure(state="disabled")
+            self.lbl_save_reason.configure(text="Saving Combined result...")
+            return
+        if self._saved_descriptor is not None:
+            self.btn_save_combined.configure(state="disabled")
+            self.lbl_save_reason.configure(
+                text=f"Saved revision {self._saved_descriptor.result_id}."
+            )
+            return
+        if not self.session.final_ready:
+            self._validated_state = None
+            self._validated_preview = None
+            self.btn_save_combined.configure(state="disabled")
+            missing = self.session.unresolved_speaker_ids()
+            self.lbl_save_reason.configure(
+                text=(
+                    "Resolve required speaker mappings before saving."
+                    if missing
+                    else "Resolve every fusion region before saving."
+                )
+            )
+            return
+        if self._validated_state != self.session.state_token:
+            self._validated_state = None
+            self._validated_preview = None
+            self.btn_save_combined.configure(state="disabled")
+            self.lbl_save_reason.configure(
+                text="Validate the current final draft before saving."
+            )
+            return
+        self.btn_save_combined.configure(
+            state="normal" if self._save_callback is not None else "disabled"
+        )
+        self.lbl_save_reason.configure(
+            text=(
+                "Ready to save as a new immutable Combined revision."
+                if self._save_callback is not None
+                else "Combined storage is unavailable."
+            )
+        )
 
     def _render_regions(self, *, selected_region_id=None):
         current = self._current_region()
@@ -8449,15 +8605,89 @@ class _FusionDraftWorkspace(ttk.Frame):
 
     def _validate_final(self):
         try:
-            self.session.validate_final()
+            preview = self.session.validate_final()
         except (FusionNotReadyError, FusionValidationError) as exc:
+            self._validated_state = None
+            self._validated_preview = None
             self.lbl_final.configure(text=f"Validation failed: {exc}")
             self._report(f"[fusion] Final validation failed: {exc}")
+            self._refresh_save_state()
             return False
+        self._validated_state = self.session.state_token
+        self._validated_preview = preview
         self.lbl_final.configure(
             text="Final-ready Combined Draft. No files have been written."
         )
         self._report("[fusion] Final-ready Combined Draft. No files have been written.")
+        self._refresh_save_state()
+        return True
+
+    def _save_combined_result(self):
+        if self._saving:
+            return False
+        if (
+            self._save_callback is None
+            or self._validated_state != self.session.state_token
+            or self._validated_preview is None
+        ):
+            self._refresh_save_state()
+            messagebox.showinfo(
+                "Combined result is not ready",
+                str(self.lbl_save_reason.cget("text")),
+                parent=self.winfo_toplevel(),
+            )
+            return False
+        try:
+            current_preview = self.session.validate_final()
+            if current_preview != self._validated_preview:
+                raise FusionValidationError(
+                    "The Combined Draft changed after final validation. Validate it again."
+                )
+        except (FusionNotReadyError, FusionValidationError) as exc:
+            self._validated_state = None
+            self._validated_preview = None
+            self.lbl_final.configure(text=f"Save unavailable: {exc}")
+            self._refresh_save_state()
+            return False
+
+        self._saving = True
+        self._refresh_save_state()
+        try:
+            descriptor = self._save_callback(
+                self.session,
+                current_preview,
+            )
+            if not isinstance(descriptor, ResultDescriptor):
+                raise RuntimeError("Combined storage did not return a valid result descriptor.")
+        except Exception as exc:
+            self._report(f"[fusion] Could not save the Combined result: {exc}")
+            messagebox.showerror(
+                "Could not save Combined result",
+                "The Combined Draft could not be saved. No partial revision was kept.\n\n"
+                f"{exc}",
+                parent=self.winfo_toplevel(),
+            )
+            return False
+        finally:
+            self._saving = False
+            self._refresh_save_state()
+
+        self._saved_descriptor = descriptor
+        self.session.mark_saved()
+        self._validated_state = self.session.state_token
+        self._validated_preview = current_preview
+        self.lbl_final.configure(text="Combined result saved successfully.")
+        self._report(
+            f"[fusion] Saved Combined revision {descriptor.result_id}."
+        )
+        self._refresh_save_state()
+        messagebox.showinfo(
+            "Combined result saved",
+            "The validated Combined transcript was saved as a new result revision.",
+            parent=self.winfo_toplevel(),
+        )
+        if self._saved_callback is not None:
+            self.after_idle(lambda value=descriptor: self._saved_callback(value))
         return True
 
     def _close(self, _event=None):
@@ -9089,6 +9319,7 @@ class ReviewNamePage(ttk.Frame):
         back_to_transcribe_callback,
         compare_results_callback=None,
         comparison_available_callback=None,
+        combined_saved_callback=None,
         apply_complete_callback=None,
         report_callback=None,
     ):
@@ -9098,6 +9329,7 @@ class ReviewNamePage(ttk.Frame):
         self._back_to_transcribe_callback = back_to_transcribe_callback
         self._compare_results_callback = compare_results_callback
         self._comparison_available_callback = comparison_available_callback
+        self._combined_saved_callback = combined_saved_callback
         self._apply_complete_callback = apply_complete_callback
         self._report_callback = report_callback
         self.workspace = None
@@ -9167,13 +9399,19 @@ class ReviewNamePage(ttk.Frame):
             justify="left",
         )
         self.lbl_incomplete_warning.grid(row=0, column=0, sticky="ew")
-        tb.Button(
+        self.btn_incomplete_ranges = tb.Button(
             self.incomplete_banner,
             text="Show missing ranges",
             command=self._show_incomplete_ranges,
             bootstyle="warning-outline",
             padding=(12, 4),
-        ).grid(row=0, column=1, sticky="e", padx=(10, 0))
+        )
+        self.btn_incomplete_ranges.grid(
+            row=0,
+            column=1,
+            sticky="e",
+            padx=(10, 0),
+        )
 
         self.empty_state = ttk.Frame(
             self,
@@ -9221,6 +9459,39 @@ class ReviewNamePage(ttk.Frame):
     def _set_incomplete_warning(self, descriptor):
         if not hasattr(self, "incomplete_banner"):
             return
+        provenance_states = dict(
+            descriptor.provenance_source_states
+            if isinstance(descriptor, ResultDescriptor)
+            else ()
+        )
+        unavailable_provenance = {
+            engine: state
+            for engine, state in provenance_states.items()
+            if state != "available"
+        }
+        if (
+            isinstance(descriptor, ResultDescriptor)
+            and descriptor.engine == "combined"
+            and unavailable_provenance
+        ):
+            labels = {
+                "whisperx": "WhisperX",
+                "crisperwhisper": "CrisperWhisper",
+            }
+            details = ", ".join(
+                f"{labels.get(engine, engine)}: {state}"
+                for engine, state in unavailable_provenance.items()
+            )
+            self.lbl_incomplete_warning.configure(
+                text=(
+                    "Combined provenance source revisions are unavailable or changed "
+                    f"({details}). The saved Combined transcript remains reviewable."
+                )
+            )
+            if hasattr(self, "btn_incomplete_ranges"):
+                self.btn_incomplete_ranges.grid_remove()
+            self.incomplete_banner.grid(row=1, column=0, sticky="ew")
+            return
         coverage = (
             descriptor.coverage
             if isinstance(descriptor, ResultDescriptor)
@@ -9230,6 +9501,8 @@ class ReviewNamePage(ttk.Frame):
         if coverage is None:
             self.incomplete_banner.grid_remove()
             return
+        if hasattr(self, "btn_incomplete_ranges"):
+            self.btn_incomplete_ranges.grid()
         count = coverage.remaining_speech_active_gap_count
         duration = coverage.remaining_speech_active_gap_duration
         self.lbl_incomplete_warning.configure(
@@ -9426,6 +9699,8 @@ class ReviewNamePage(ttk.Frame):
                 preview_available=preview_available,
                 preview_unavailable_reason=preview_reason,
                 report_callback=self._report,
+                save_callback=self._save_combined_session,
+                saved_callback=self._on_combined_revision_saved,
                 back_to_compare_callback=self.show_comparison_mode,
                 back_to_review_callback=self.show_review_mode,
             )
@@ -9448,6 +9723,85 @@ class ReviewNamePage(ttk.Frame):
         self._update_mode_navigation()
         self.workspace.on_host_activated()
         return True
+
+    def _write_combined_exports(self, result_root, title, segments, mapping):
+        if self.workspace is None:
+            raise RuntimeError("The Review workspace is no longer available.")
+        result_root = Path(result_root)
+        outputs = {}
+
+        srt_path = result_root / f"{title}.srt"
+        self.workspace._write_apply_srt(srt_path, segments, mapping)
+        self.workspace._validate_staged_apply_file(srt_path, "srt")
+        outputs["srt"] = srt_path
+
+        txt_path = result_root / f"{title}.txt"
+        self.workspace._write_apply_txt(txt_path, segments, mapping)
+        self.workspace._validate_staged_apply_file(txt_path, "txt")
+        outputs["txt"] = txt_path
+
+        if _has_word_level(segments):
+            if self.workspace.var_export_vtt.get():
+                path = result_root / f"{title}.words.vtt"
+                write_word_vtt(path, segments, mapping)
+                self.workspace._validate_staged_apply_file(path, "vtt")
+                outputs["word_vtt"] = path
+            if self.workspace.var_export_ass.get():
+                path = result_root / f"{title}.words.ass"
+                write_word_ass(path, segments, mapping)
+                self.workspace._validate_staged_apply_file(path, "ass")
+                outputs["word_ass"] = path
+            if self.workspace.var_export_html.get():
+                display_speakers = sorted(
+                    {
+                        mapping.get(segment.get("speaker"), segment.get("speaker"))
+                        for segment in segments
+                        if segment.get("speaker")
+                    }
+                )
+                path = result_root / "word_player.html"
+                write_word_player_html(path, display_speakers)
+                self.workspace._validate_staged_apply_file(path, "html")
+                outputs["word_html"] = path
+        if self.workspace.var_export_lrc.get():
+            path = result_root / f"{title}.lrc"
+            write_lrc(path, segments, mapping)
+            self.workspace._validate_staged_apply_file(path, "lrc")
+            outputs["word_lrc"] = path
+        if self.workspace.var_export_ass_plain.get():
+            path = result_root / f"{title}.plain.ass"
+            write_ass_plain(path, segments, mapping)
+            self.workspace._validate_staged_apply_file(path, "ass")
+            outputs["plain_ass"] = path
+        return outputs
+
+    def _save_combined_session(self, session, preview):
+        commit = save_combined_revision(
+            output_root=output_root(),
+            comparison=session.comparison,
+            plan=session.plan,
+            preview=preview,
+            canonical_speakers=session.canonical_speaker_records(),
+            mapping_audit=session.mapping_audit(),
+            write_exports=self._write_combined_exports,
+        )
+        descriptor = descriptor_from_json_pair(
+            commit.speakers_json,
+            commit.segments_json,
+            pending=True,
+        )
+        if descriptor.engine != "combined" or descriptor.status != "complete":
+            raise RuntimeError("The committed Combined revision failed catalog validation.")
+        return descriptor
+
+    def _on_combined_revision_saved(self, descriptor):
+        if self._combined_saved_callback is not None:
+            return self._combined_saved_callback(descriptor)
+        return self.load_result(
+            descriptor,
+            confirm_replacement=False,
+            protect_unsaved=True,
+        )
 
     def _open_comparison_result(self, descriptor):
         return self.load_result(descriptor)
@@ -9540,6 +9894,7 @@ class ReviewNamePage(ttk.Frame):
         segments_json=None,
         *,
         confirm_replacement=True,
+        protect_unsaved=False,
         result_descriptor=None,
     ):
         requested_descriptor = (
@@ -9607,7 +9962,7 @@ class ReviewNamePage(ttk.Frame):
             and self._result_path_key(result_identity)
             == self._result_path_key(self.current_result_identity)
         )
-        if self.workspace is not None and confirm_replacement:
+        if self.workspace is not None and (confirm_replacement or protect_unsaved):
             if not self._confirm_fusion_discard_for_replacement():
                 return False
             if self.workspace.has_unsaved_changes():
@@ -9623,7 +9978,7 @@ class ReviewNamePage(ttk.Frame):
                     return False
                 if decision and not self.workspace.apply_changes():
                     return False
-            elif not same_paths_changed:
+            elif confirm_replacement and not same_paths_changed:
                 replace = messagebox.askyesno(
                     "Replace review result",
                     "Another result is already open. Replace it with the selected result?",
@@ -9910,6 +10265,7 @@ class App(ttk.Frame):
             back_to_transcribe_callback=lambda: self.show_page("transcribe"),
             compare_results_callback=self.on_compare_results,
             comparison_available_callback=self._comparison_available,
+            combined_saved_callback=self._on_combined_result_saved,
             apply_complete_callback=lambda: self.show_page("review"),
             report_callback=self.log,
         )
@@ -11883,6 +12239,38 @@ class App(ttk.Frame):
         ):
             return False
         self.show_page("review")
+        return True
+
+    def _on_combined_result_saved(self, descriptor):
+        if not isinstance(descriptor, ResultDescriptor) or descriptor.engine != "combined":
+            self.log("[fusion] Saved result registration failed: invalid Combined descriptor.")
+            return False
+        self.pending_review_result = replace(descriptor, pending=True)
+        self.log(
+            f"[fusion] Combined revision {descriptor.result_id} is available in Open Result."
+        )
+
+        def open_saved_result():
+            pending = self._validated_pending_review_result()
+            if pending is None:
+                self.log(
+                    "[fusion] The saved Combined revision could not be revalidated for opening."
+                )
+                return
+            if self.review_page.load_result(
+                pending,
+                confirm_replacement=False,
+                protect_unsaved=True,
+            ):
+                self.pending_review_result = None
+                self.show_page("review")
+                self.log("[fusion] Opened the saved Combined result in Review & Name.")
+            else:
+                self.log(
+                    "[fusion] The saved Combined result remains available in Open Result."
+                )
+
+        self.after_idle(open_saved_result)
         return True
 
     def _comparison_descriptors(self, loaded_descriptor, *, log_issues=False):

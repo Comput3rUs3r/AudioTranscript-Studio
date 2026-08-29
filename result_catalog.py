@@ -21,7 +21,7 @@ from typing import Any, Iterable, Mapping, Optional
 PROJECT_SCHEMA_VERSION = 1
 RESULT_SCHEMA_VERSION = 1
 SOURCE_IDENTITY_FIELDS = ("path", "size", "mtime_ns", "st_dev", "st_ino")
-SUPPORTED_ENGINES = frozenset({"whisperx", "crisperwhisper"})
+SUPPORTED_ENGINES = frozenset({"whisperx", "crisperwhisper", "combined"})
 SUPPORTED_LAYOUTS = frozenset({"project", "legacy"})
 SUPPORTED_SOURCE_STATES = frozenset({"available", "missing", "changed", "unverified"})
 SUPPORTED_RESULT_STATUSES = frozenset({"complete", "failed", "incomplete", "processing"})
@@ -100,6 +100,7 @@ class ResultDescriptor:
     comparison_job_id: Optional[str]
     coverage: Optional[ResultCoverage] = None
     pending: bool = False
+    provenance_source_states: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if self.layout not in SUPPORTED_LAYOUTS:
@@ -116,6 +117,13 @@ class ResultDescriptor:
             raise ValueError("display_title must not be empty")
         if not _is_sha256(self.speakers_sha256) or not _is_sha256(self.segments_sha256):
             raise ValueError("Result fingerprints must be lowercase SHA-256 hex strings")
+        provenance_states = dict(self.provenance_source_states)
+        if len(provenance_states) != len(self.provenance_source_states) or any(
+            engine not in {"whisperx", "crisperwhisper"}
+            or state not in {"available", "missing", "changed"}
+            for engine, state in self.provenance_source_states
+        ):
+            raise ValueError("Combined provenance source states are malformed")
         if self.source_identity is not None:
             if not is_valid_source_identity(self.source_identity):
                 raise ValueError("source_identity is malformed")
@@ -172,6 +180,8 @@ class ProjectResultRecord:
     speakers_sha256: str
     segments_sha256: str
     comparison_job_id: Optional[str]
+    fusion_json: Optional[Path] = None
+    fusion_sha256: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -210,6 +220,10 @@ class ResultManifest:
     speakers_sha256: str
     segments_sha256: str
     comparison_job_id: Optional[str]
+    fusion_json: Optional[Path] = None
+    fusion_sha256: Optional[str] = None
+    output_files: tuple[tuple[str, Path, str], ...] = ()
+    provenance_source_states: tuple[tuple[str, str], ...] = ()
 
 
 def _is_sha256(value: Any) -> bool:
@@ -409,7 +423,7 @@ def _validate_engine(value: Any, label: str) -> str:
     engine = _required_string(value, label).lower()
     if engine not in SUPPORTED_ENGINES:
         raise ManifestValidationError(
-            f"{label} must be 'whisperx' or 'crisperwhisper'."
+            f"{label} must be 'whisperx', 'crisperwhisper', or 'combined'."
         )
     return engine
 
@@ -468,6 +482,205 @@ def _manifest_fingerprints(data: Any, label: str) -> tuple[str, str]:
     if not _is_sha256(speakers_hash) or not _is_sha256(segments_hash):
         raise ManifestValidationError(f"{label} contains an invalid SHA-256 fingerprint.")
     return speakers_hash, segments_hash
+
+
+def _validate_combined_source_revisions(value: Any, label: str) -> None:
+    if not isinstance(value, dict) or set(value) != {"whisperx", "crisperwhisper"}:
+        raise ManifestValidationError(
+            f"{label} must identify the exact WhisperX and CrisperWhisper revisions."
+        )
+    for expected_engine, record in value.items():
+        record_label = f"{label}.{expected_engine}"
+        if not isinstance(record, dict):
+            raise ManifestValidationError(f"{record_label} must be an object.")
+        if record.get("engine") != expected_engine:
+            raise ManifestValidationError(f"{record_label}.engine is invalid.")
+        _required_string(record.get("revision_id"), f"{record_label}.revision_id")
+        _validate_status(record.get("status"), f"{record_label}.status")
+        fingerprints = record.get("fingerprints")
+        if not isinstance(fingerprints, dict) or fingerprints.get("algorithm") != "sha256":
+            raise ManifestValidationError(f"{record_label}.fingerprints is invalid.")
+        if not _is_sha256(fingerprints.get("speakers")) or not _is_sha256(
+            fingerprints.get("segments")
+        ):
+            raise ManifestValidationError(
+                f"{record_label}.fingerprints contains an invalid source fingerprint."
+            )
+        manifest_fingerprint = fingerprints.get("result_manifest")
+        if manifest_fingerprint is not None and not _is_sha256(manifest_fingerprint):
+            raise ManifestValidationError(
+                f"{record_label}.fingerprints.result_manifest is invalid."
+            )
+
+
+def _validate_combined_payloads(
+    *,
+    result_id: str,
+    pair_id: str,
+    source_revisions: Mapping[str, Any],
+    fusion_json: Path,
+    speakers_json: Path,
+    segments_json: Path,
+) -> None:
+    fusion_data, _fusion_digest = _read_json_object(
+        fusion_json,
+        "fusion.json",
+        ManifestValidationError,
+    )
+    if (
+        fusion_data.get("schema_version") != 1
+        or fusion_data.get("result_id") != result_id
+        or fusion_data.get("engine") != "combined"
+        or fusion_data.get("comparison_pair_id") != pair_id
+        or fusion_data.get("source_revisions") != source_revisions
+    ):
+        raise ManifestValidationError(
+            "fusion.json does not identify the exact Combined result and source pair."
+        )
+    validation = fusion_data.get("validation")
+    if (
+        not isinstance(validation, dict)
+        or validation.get("final_ready") is not True
+        or validation.get("provisional") is not False
+        or validation.get("chronology_valid") is not True
+        or validation.get("unresolved_count") != 0
+    ):
+        raise ManifestValidationError("fusion.json is not a final-ready fusion audit.")
+    regions = fusion_data.get("regions")
+    history = fusion_data.get("decision_history")
+    mappings = fusion_data.get("speaker_mappings")
+    provenance = fusion_data.get("per_word_provenance")
+    if (
+        not isinstance(regions, list)
+        or not isinstance(history, list)
+        or not isinstance(mappings, dict)
+        or not isinstance(provenance, list)
+    ):
+        raise ManifestValidationError("fusion.json audit collections are malformed.")
+    for index, region in enumerate(regions):
+        if not isinstance(region, dict):
+            raise ManifestValidationError("fusion.json contains an invalid region audit.")
+        if not region.get("automatically_resolved") and not isinstance(
+            region.get("final_decision"), dict
+        ):
+            raise ManifestValidationError(
+                f"fusion.json region {index + 1} is missing its final decision."
+            )
+
+    speakers_data, _speakers_digest = _read_json_object(
+        speakers_json,
+        "speakers.json",
+        ManifestValidationError,
+    )
+    segments_data, _segments_digest = _read_json_object(
+        segments_json,
+        "segments.json",
+        ManifestValidationError,
+    )
+    transcription = segments_data.get("transcription")
+    if (
+        speakers_data.get("engine") != "combined"
+        or speakers_data.get("fusion_manifest") != "fusion.json"
+        or not isinstance(transcription, dict)
+        or transcription.get("engine") != "combined"
+        or transcription.get("fusion_manifest") != "fusion.json"
+        or transcription.get("comparison_pair_id") != pair_id
+    ):
+        raise ManifestValidationError(
+            "Combined speakers.json or segments.json metadata is inconsistent."
+        )
+
+    stored_words = []
+    for segment in segments_data.get("segments", ()):
+        words = segment.get("words", ()) if isinstance(segment, dict) else ()
+        if not isinstance(words, list):
+            raise ManifestValidationError("Combined segments contain invalid word data.")
+        stored_words.extend(words)
+    if len(stored_words) != len(provenance) or validation.get("word_count") != len(
+        stored_words
+    ):
+        raise ManifestValidationError(
+            "Combined transcript and per-word provenance counts differ."
+        )
+    previous_end = None
+    for ordinal, (stored, audit) in enumerate(zip(stored_words, provenance)):
+        if not isinstance(stored, dict) or not isinstance(audit, dict):
+            raise ManifestValidationError("Combined word provenance is malformed.")
+        if audit.get("combined_word_ordinal") != ordinal:
+            raise ManifestValidationError("Combined word ordinals are not contiguous.")
+        if stored.get("word") != audit.get("text"):
+            raise ManifestValidationError(
+                "Combined transcript text differs from fusion word provenance."
+            )
+        start = stored.get("start")
+        end = stored.get("end")
+        audit_start = audit.get("start")
+        audit_end = audit.get("end")
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            for value in (start, end, audit_start, audit_end)
+        ):
+            raise ManifestValidationError("Combined word timestamps are invalid.")
+        start = float(start)
+        end = float(end)
+        if (
+            start < 0.0
+            or end <= start
+            or not math.isclose(start, float(audit_start), abs_tol=1e-9)
+            or not math.isclose(end, float(audit_end), abs_tol=1e-9)
+            or (previous_end is not None and start < previous_end - 1e-9)
+        ):
+            raise ManifestValidationError(
+                "Combined word timestamps differ from the validated fusion timeline."
+            )
+        previous_end = end
+
+
+def _combined_provenance_source_states(
+    result_root: Path,
+    source_revisions: Mapping[str, Any],
+) -> tuple[tuple[str, str], ...]:
+    project_root = result_root.parent.parent
+    states = []
+    for engine in ("whisperx", "crisperwhisper"):
+        record = source_revisions[engine]
+        revision_id = record["revision_id"]
+        manifest_path = project_root / engine / revision_id / "result.json"
+        if not manifest_path.is_file():
+            states.append((engine, "missing"))
+            continue
+        try:
+            manifest = validate_result_manifest(
+                manifest_path,
+                project_root=project_root,
+            )
+            recorded = record["fingerprints"]
+            current_manifest_sha256 = hashlib.sha256(
+                manifest_path.read_bytes()
+            ).hexdigest()
+            expected_manifest_sha256 = recorded.get("result_manifest")
+            exact = (
+                manifest.engine == engine
+                and manifest.result_id == revision_id
+                and manifest.project_id == record.get("project_id")
+                and manifest.model == record.get("model")
+                and manifest.mode == record.get("mode")
+                and manifest.execution_backend == record.get("execution_backend")
+                and manifest.status == record.get("status")
+                and manifest.comparison_job_id == record.get("comparison_job_id")
+                and manifest.speakers_sha256 == recorded.get("speakers")
+                and manifest.segments_sha256 == recorded.get("segments")
+                and (
+                    expected_manifest_sha256 is None
+                    or current_manifest_sha256 == expected_manifest_sha256
+                )
+            )
+        except Exception:
+            exact = False
+        states.append((engine, "available" if exact else "changed"))
+    return tuple(states)
 
 
 def _validate_result_coverage(value: Any, status: str, label: str) -> Optional[ResultCoverage]:
@@ -640,6 +853,29 @@ def validate_project_manifest(path: Path | str) -> ProjectManifest:
         speakers_sha256, segments_sha256 = _manifest_fingerprints(
             raw_record.get("fingerprint"), f"{label}.fingerprint"
         )
+        fusion_json = None
+        fusion_sha256 = None
+        if engine == "combined":
+            fusion_json = _safe_relative_path(
+                project_root,
+                paths.get("fusion"),
+                project_root,
+                f"{label}.paths.fusion",
+            )
+            if fusion_json.parent != root or fusion_json.name != "fusion.json":
+                raise ManifestValidationError(
+                    f"{label}.paths.fusion must name fusion.json in the result root."
+                )
+            fingerprints = raw_record.get("fingerprint")
+            fusion_sha256 = (
+                fingerprints.get("fusion")
+                if isinstance(fingerprints, dict)
+                else None
+            )
+            if not _is_sha256(fusion_sha256):
+                raise ManifestValidationError(
+                    f"{label}.fingerprint.fusion is invalid."
+                )
         records.append(
             ProjectResultRecord(
                 result_id=result_id,
@@ -657,18 +893,25 @@ def validate_project_manifest(path: Path | str) -> ProjectManifest:
                 speakers_sha256=speakers_sha256,
                 segments_sha256=segments_sha256,
                 comparison_job_id=comparison_job_id,
+                fusion_json=fusion_json,
+                fusion_sha256=fusion_sha256,
             )
         )
 
     active_results = data.get("active_results", {})
     if not isinstance(active_results, dict):
         raise ManifestValidationError("project.json active_results must be an object.")
+    result_engines = {record.result_id: record.engine for record in records}
     for engine, result_id in active_results.items():
         if engine not in SUPPORTED_ENGINES or not isinstance(result_id, str):
             raise ManifestValidationError("project.json active_results contains an invalid entry.")
         if result_id not in result_ids:
             raise ManifestValidationError(
                 f"project.json active result {result_id!r} is not present in results."
+            )
+        if result_engines[result_id] != engine:
+            raise ManifestValidationError(
+                f"project.json active result {result_id!r} belongs to a different engine."
             )
 
     return ProjectManifest(
@@ -763,6 +1006,125 @@ def validate_result_manifest(
     speakers_sha256, segments_sha256 = _manifest_fingerprints(
         data.get("fingerprint"), "result.json fingerprint"
     )
+    fusion_json = None
+    fusion_sha256 = None
+    output_files = ()
+    provenance_source_states = ()
+    if engine == "combined":
+        if status != "complete":
+            raise ManifestValidationError(
+                "A Combined result must have Complete status."
+            )
+        if data.get("revision_id") != result_id:
+            raise ManifestValidationError(
+                "result.json revision_id must match its Combined result_id."
+            )
+        fusion_json = _safe_relative_path(
+            result_root,
+            paths.get("fusion"),
+            resolved_project_root,
+            "result.json paths.fusion",
+        )
+        if fusion_json.parent != result_root or fusion_json.name != "fusion.json":
+            raise ManifestValidationError(
+                "result.json paths.fusion must name fusion.json in the result directory."
+            )
+        fingerprint_data = data.get("fingerprint")
+        fusion_sha256 = (
+            fingerprint_data.get("fusion")
+            if isinstance(fingerprint_data, dict)
+            else None
+        )
+        if not _is_sha256(fusion_sha256):
+            raise ManifestValidationError(
+                "result.json fingerprint.fusion must be a SHA-256 fingerprint."
+            )
+        if not fusion_json.is_file():
+            raise ManifestValidationError("Combined result is missing fusion.json.")
+        _fusion_data, current_fusion_sha256 = _read_json_object(
+            fusion_json,
+            "fusion.json",
+            ManifestValidationError,
+        )
+        if current_fusion_sha256 != fusion_sha256:
+            raise ManifestValidationError(
+                "result.json fusion fingerprint does not match fusion.json."
+            )
+        combined_data = data.get("combined")
+        if not isinstance(combined_data, dict):
+            raise ManifestValidationError(
+                "A Combined result must contain combined metadata."
+            )
+        if combined_data.get("schema_version") != 1:
+            raise ManifestValidationError(
+                "result.json combined.schema_version must be 1."
+            )
+        pair_id = combined_data.get("comparison_pair_id")
+        if not _is_sha256(pair_id):
+            raise ManifestValidationError(
+                "result.json combined.comparison_pair_id is invalid."
+            )
+        source_revisions = combined_data.get("source_revisions")
+        _validate_combined_source_revisions(
+            source_revisions,
+            "result.json combined.source_revisions",
+        )
+        original_media = combined_data.get("original_media")
+        if (
+            not isinstance(original_media, dict)
+            or original_media.get("path") != str(source_path)
+            or original_media.get("source_state_at_save")
+            not in SUPPORTED_SOURCE_STATES
+        ):
+            raise ManifestValidationError(
+                "result.json combined.original_media is invalid."
+            )
+        outputs = data.get("outputs")
+        if not isinstance(outputs, dict) or not {"srt", "txt"}.issubset(outputs):
+            raise ManifestValidationError(
+                "A Combined result must index SRT and TXT outputs."
+            )
+        validated_outputs = []
+        for output_name, output_record in outputs.items():
+            label = f"result.json outputs.{output_name}"
+            if not isinstance(output_name, str) or not output_name.strip():
+                raise ManifestValidationError("result.json output names are invalid.")
+            if not isinstance(output_record, dict):
+                raise ManifestValidationError(f"{label} must be an object.")
+            output_path = _safe_relative_path(
+                result_root,
+                output_record.get("path"),
+                resolved_project_root,
+                f"{label}.path",
+            )
+            output_sha256 = output_record.get("sha256")
+            if output_path.parent != result_root or not _is_sha256(output_sha256):
+                raise ManifestValidationError(f"{label} is invalid.")
+            if not output_path.is_file():
+                raise ManifestValidationError(f"{label} is missing.")
+            try:
+                with output_path.open("rb") as output_file:
+                    digest = hashlib.sha256()
+                    for block in iter(lambda: output_file.read(1024 * 1024), b""):
+                        digest.update(block)
+            except OSError as exc:
+                raise ManifestValidationError(f"Could not read {label}: {exc}") from exc
+            if digest.hexdigest() != output_sha256:
+                raise ManifestValidationError(f"{label} fingerprint does not match.")
+            validated_outputs.append((output_name, output_path, output_sha256))
+        output_files = tuple(validated_outputs)
+        _validate_combined_payloads(
+            result_id=result_id,
+            pair_id=pair_id,
+            source_revisions=source_revisions,
+            fusion_json=fusion_json,
+            speakers_json=speakers_json,
+            segments_json=segments_json,
+        )
+        provenance_source_states = _combined_provenance_source_states(
+            result_root,
+            source_revisions,
+        )
     return ResultManifest(
         path=manifest_path,
         project_root=resolved_project_root,
@@ -789,6 +1151,10 @@ def validate_result_manifest(
         comparison_job_id=_optional_string(
             data.get("comparison_job_id"), "result.json comparison_job_id"
         ),
+        fusion_json=fusion_json,
+        fusion_sha256=fusion_sha256,
+        output_files=output_files,
+        provenance_source_states=provenance_source_states,
     )
 
 
@@ -943,6 +1309,8 @@ def _project_descriptor(
                 (record.segments_json, result_manifest.segments_json, "segments path"),
                 (record.speakers_sha256, result_manifest.speakers_sha256, "speakers fingerprint"),
                 (record.segments_sha256, result_manifest.segments_sha256, "segments fingerprint"),
+                (record.fusion_json, result_manifest.fusion_json, "fusion path"),
+                (record.fusion_sha256, result_manifest.fusion_sha256, "fusion fingerprint"),
             )
             for indexed, local, label in comparisons:
                 if indexed != local:
@@ -975,6 +1343,7 @@ def _project_descriptor(
         modified_at=result_manifest.modified_at,
         comparison_job_id=result_manifest.comparison_job_id,
         pending=pending,
+        provenance_source_states=result_manifest.provenance_source_states,
     )
 
 

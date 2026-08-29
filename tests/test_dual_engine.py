@@ -253,6 +253,24 @@ class DualEngineGuiTests(unittest.TestCase):
         )
         self.assertEqual(display.status_style, "secondary")
 
+    def test_combined_result_display_uses_exact_descriptor_metadata(self):
+        descriptor = SimpleNamespace(
+            engine="combined",
+            model="large-v3 + large",
+            mode="User-reviewed fusion",
+            status="complete",
+            layout="project",
+            created_at=datetime.datetime(2026, 8, 23, 16, 26),
+            modified_at=None,
+        )
+        display = gui.review_result_display(descriptor)
+        self.assertEqual(
+            display.text,
+            "Combined | large-v3 + large | User-reviewed fusion | Complete | "
+            "Aug 23, 2026 4:26 PM",
+        )
+        self.assertEqual(display.status_style, "success")
+
     def test_workspace_metadata_switch_reuse_apply_and_revert_are_descriptor_bound(self):
         whisper_identity = SimpleNamespace(value="whisper-result")
         crisper_identity = SimpleNamespace(value="crisper-result")

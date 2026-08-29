@@ -707,6 +707,31 @@ class FusionDraftDialogContractTests(unittest.TestCase):
         self.fixture = FusionGuiFixture()
         self.comparison = self.fixture.standard()
 
+    @staticmethod
+    def _save_harness(save_callback):
+        dialog = object.__new__(gui._FusionDraftWorkspace)
+        token = object()
+        preview = object()
+        session = mock.Mock()
+        session.state_token = token
+        session.final_ready = True
+        session.validate_final.return_value = preview
+        dialog.session = session
+        dialog._saving = False
+        dialog._save_callback = save_callback
+        dialog._saved_callback = mock.Mock()
+        dialog._validated_state = token
+        dialog._validated_preview = preview
+        dialog._saved_descriptor = None
+        dialog.btn_save_combined = mock.Mock()
+        dialog.lbl_save_reason = mock.Mock()
+        dialog.lbl_save_reason.cget.return_value = "Ready"
+        dialog.lbl_final = mock.Mock()
+        dialog._report = mock.Mock()
+        dialog.winfo_toplevel = lambda: None
+        dialog.after_idle = lambda callback: callback()
+        return dialog, session
+
     def test_exact_selected_pair_is_revalidated_before_in_page_fusion(self):
         whisper_descriptor = object()
         crisper_descriptor = object()
@@ -776,6 +801,104 @@ class FusionDraftDialogContractTests(unittest.TestCase):
                 session.preview_presentation()
             self.assertEqual(sentinel.read_bytes(), before)
             vlc.assert_not_called()
+
+    def test_save_is_reentrant_safe_and_marks_session_saved_once(self):
+        descriptor = SimpleNamespace(result_id="combined-revision")
+        nested_results = []
+        save_calls = []
+        dialog = None
+
+        def save_callback(_session, _preview):
+            save_calls.append("called")
+            nested_results.append(dialog._save_combined_result())
+            return descriptor
+
+        dialog, session = self._save_harness(save_callback)
+        with mock.patch.object(gui, "ResultDescriptor", SimpleNamespace), mock.patch.object(
+            gui.messagebox, "showinfo"
+        ), mock.patch.object(gui.messagebox, "showerror"):
+            self.assertTrue(dialog._save_combined_result())
+        self.assertEqual(save_calls, ["called"])
+        self.assertEqual(nested_results, [False])
+        session.mark_saved.assert_called_once_with()
+        dialog._saved_callback.assert_called_once_with(descriptor)
+        self.assertIs(dialog._saved_descriptor, descriptor)
+
+    def test_failed_save_preserves_validated_unsaved_session(self):
+        def fail(_session, _preview):
+            raise OSError("forced storage failure")
+
+        dialog, session = self._save_harness(fail)
+        original_token = dialog._validated_state
+        original_preview = dialog._validated_preview
+        with mock.patch.object(gui.messagebox, "showerror") as showerror:
+            self.assertFalse(dialog._save_combined_result())
+        self.assertIsNone(dialog._saved_descriptor)
+        self.assertIs(dialog._validated_state, original_token)
+        self.assertIs(dialog._validated_preview, original_preview)
+        session.mark_saved.assert_not_called()
+        dialog._saved_callback.assert_not_called()
+        showerror.assert_called_once()
+
+    def test_combined_export_callback_uses_all_existing_exporters(self):
+        workspace = object.__new__(gui.NamingWorkspace)
+        for attribute in (
+            "var_export_vtt",
+            "var_export_ass",
+            "var_export_html",
+            "var_export_lrc",
+            "var_export_ass_plain",
+        ):
+            variable = mock.Mock()
+            variable.get.return_value = True
+            setattr(workspace, attribute, variable)
+        page = object.__new__(gui.ReviewNamePage)
+        page.workspace = workspace
+        segments = [
+            {
+                "start": 0.0,
+                "end": 1.0,
+                "text": "Hello world.",
+                "speaker": "SPEAKER_00",
+                "words": [
+                    {
+                        "word": "Hello",
+                        "start": 0.0,
+                        "end": 0.5,
+                        "speaker": "SPEAKER_00",
+                    },
+                    {
+                        "word": "world.",
+                        "start": 0.5,
+                        "end": 1.0,
+                        "speaker": "SPEAKER_00",
+                    },
+                ],
+            }
+        ]
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            gui, "get_embedded_vlc_status"
+        ) as vlc_status:
+            outputs = page._write_combined_exports(
+                Path(temporary),
+                "Combined fixture",
+                segments,
+                {"SPEAKER_00": "Howard"},
+            )
+            self.assertEqual(
+                set(outputs),
+                {
+                    "srt",
+                    "txt",
+                    "word_vtt",
+                    "word_ass",
+                    "word_html",
+                    "word_lrc",
+                    "plain_ass",
+                },
+            )
+            self.assertTrue(all(Path(path).is_file() for path in outputs.values()))
+        vlc_status.assert_not_called()
 
 
 class OptionalFusionDraftLayoutTests(unittest.TestCase):
